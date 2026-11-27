@@ -299,7 +299,7 @@ fun ItemRow(s: ItemSummary, onClick: (() -> Unit)? = null) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun KindPicker(onDismiss: () -> Unit, onPick: (String) -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Text("New item", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = P.fg, modifier = Modifier.padding(horizontal = 24.dp))
         LazyVerticalGrid(GridCells.Adaptive(96.dp), Modifier.navigationBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(itemKinds(), key = { it.id }) { k ->

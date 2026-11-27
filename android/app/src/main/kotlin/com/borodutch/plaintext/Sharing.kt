@@ -247,7 +247,7 @@ private fun ShareVaultSheet(account: String, vault: String, onDismiss: () -> Uni
             } catch (e: Exception) { error = errorText(e); found = null }
         }
     }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding().padding(horizontal = 20.dp).padding(bottom = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("Share vault", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = P.fg)
             Field("Their username", username, { username = it.lowercase(); found = null }, kind = Input.Username, onDone = { find(username.trim()) },
@@ -378,7 +378,7 @@ fun ShareItemSheet(ref: ItemRef, title: String, onDismiss: () -> Unit) {
     var link by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding().padding(horizontal = 20.dp).padding(bottom = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("Share $title", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = P.fg)
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {

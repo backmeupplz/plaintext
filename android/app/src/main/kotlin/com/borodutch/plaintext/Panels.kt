@@ -185,7 +185,7 @@ private fun InboxRow(account: String, e: InboxEntry) {
 private fun PickItemSheet(account: String, to: String, onDismiss: () -> Unit) {
     val model = LocalContext.current.model
     var query by remember { mutableStateOf("") }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = P.bg, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding()) {
             Text("Send to $to", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = P.fg, modifier = Modifier.padding(horizontal = 20.dp))
             Field("Search", query, { query = it }, modifier = Modifier.padding(16.dp))
@@ -266,7 +266,7 @@ private fun NewAgentSheet(account: String, onDismiss: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var vaultMenu by remember { mutableStateOf(false) }
     val server = model.account(account)?.server ?: ""
-    ModalBottomSheet(onDismissRequest = { if (key == null) onDismiss() }, containerColor = P.bg) {
+    ModalBottomSheet(onDismissRequest = { if (key == null) onDismiss() }, containerColor = P.bg, sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding().padding(horizontal = 20.dp).padding(bottom = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("New agent", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, color = P.fg)
             val k = key

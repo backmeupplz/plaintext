@@ -91,7 +91,7 @@ fun safeName(name: String): String {
 fun ItemDetail(ref: ItemRef) {
     val context = LocalContext.current
     val model = context.model
-    val data = remember(ref, model.items, model.vaults) { runCatching { model.core.item(ref.account, ref.vault, ref.item) }.getOrNull() }
+    val data = remember(ref, model.version) { runCatching { model.core.item(ref.account, ref.vault, ref.item) }.getOrNull() }
     if (data == null) {
         Screen("Item", onBack = { model.pop() }) { m -> Box(m) { EmptyState(Icons.Rounded.Archive, "This item is no longer here.") } }
         return
@@ -132,7 +132,7 @@ fun ItemDetail(ref: ItemRef) {
             }
             if (watch != null || model.breached[ref.key] != null) WatchNotes(watch, model.breached[ref.key])
 
-            Group {
+            if (data.username.isNotEmpty() || data.password.isNotEmpty() || data.totp.isNotEmpty() || data.urls.isNotEmpty()) Group {
                 if (data.username.isNotEmpty()) FieldRow("Username", data.username, secret = false, onLarge = null)
                 if (data.password.isNotEmpty()) FieldRow("Password", data.password, secret = true, onLarge = { large = data.password })
                 if (data.totp.isNotEmpty()) TotpRow(data.totp)

@@ -109,6 +109,9 @@ class Model(val context: Context) {
     var toast by mutableStateOf<Toast?>(null)
     var banner by mutableStateOf<String?>(null)
     var syncing by mutableStateOf(false)
+    /** Bumped on every reload, so screens reading Rust directly (item detail) re-read too. */
+    var version by mutableStateOf(0)
+        private set
     /** Hidden from lists while their undo toast is up. */
     private val deleting = mutableSetOf<String>()
 
@@ -293,6 +296,7 @@ class Model(val context: Context) {
         }
         if (vault.sortRecent) list = list.sortedByDescending { it.updated }
         items = list.filter { it.ref.key !in deleting }
+        version++
     }
 
     fun syncAll() {
