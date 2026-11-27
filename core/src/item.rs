@@ -116,6 +116,9 @@ pub struct Passkey {
     pub counter: u32,
     #[serde(default)]
     pub created: u64,
+    /// `rp_name`, `user_display_name`, `discoverable`, and anything newer.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

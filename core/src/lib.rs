@@ -81,6 +81,42 @@ pub(crate) fn pad(json: &mut Vec<u8>) {
     json.resize(padded, b' ');
 }
 
+/// The largest sealed attachment a server stores (its `MAX_FILE`).
+pub const MAX_FILE: usize = 64 << 20;
+const SEAL_OVERHEAD: usize = 1 + 24 + 16;
+
+/// An attachment's length after padding: Padmé (under 1/16 bigger, and only
+/// O(log log n) bits of the size show), at least `PAD` bytes, and never past
+/// what the server stores.
+pub fn padded_file_len(len: usize) -> usize {
+    if len >= MAX_FILE - SEAL_OVERHEAD {
+        return len; // and no overflow for a hostile FileRef.size
+    }
+    let l = len.max(PAD);
+    let e = l.ilog2();
+    let mask = (1usize << (e - e.ilog2() - 1)) - 1;
+    ((l + mask) & !mask).min(MAX_FILE - SEAL_OVERHEAD).max(len)
+}
+
+/// Seal an attachment zero-padded to `padded_file_len`. Its real size travels
+/// in the item (`FileRef::size`), which `open_file` cuts it back to.
+pub fn seal_file(key: &Key, vault: &Id, file: &Id, data: &[u8]) -> Vec<u8> {
+    let mut padded = Zeroizing::new(Vec::with_capacity(padded_file_len(data.len())));
+    padded.extend_from_slice(data);
+    padded.resize(padded_file_len(data.len()), 0);
+    seal(key, &ad("file", &[vault, file]), &padded)
+}
+
+/// Open an attachment and drop its padding: whatever follows `size` bytes. Files
+/// sealed before padding existed are exactly `size` long and open the same way.
+pub fn open_file(key: &Key, vault: &Id, file: &Id, size: u64, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut data = open(key, &ad("file", &[vault, file]), blob)?;
+    // Not checked against padded_file_len: other clients may pad differently.
+    let size = usize::try_from(size).ok().filter(|&s| s <= data.len()).ok_or(Error::Tampered)?;
+    data.truncate(size);
+    Ok(data)
+}
+
 pub(crate) fn seal_json<T: Serialize>(key: &Key, ad: &[u8], v: &T) -> Vec<u8> {
     let mut json = Zeroizing::new(serde_json::to_vec(v).expect("serializable"));
     pad(&mut json);

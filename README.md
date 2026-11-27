@@ -55,7 +55,7 @@ Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Wi
 
 - **Per terminal.** Unlocking lasts 12 hours, and only in the terminal you unlocked in, like `sudo`. A command with no terminal, such as a script, a background job, or anything an AI tool runs, can't use it and should use an agent key.
 - **Locking.** `plaintext lock` ends the session on the server too.
-- **Secrets stay out of arguments.** Pass `--password` with no value to be asked (or to read it from stdin), because other users of the computer can see arguments. `plaintext` refuses plain `http://` except on your own machine and private networks.
+- **Secrets stay out of arguments.** `--password`, `--totp` and `--concealed LABEL` (without `=value`) ask for the secret, or, when stdin is piped, read one line each in that order. An empty answer to `--totp` removes the one-time code. Other users of the computer can see arguments. `plaintext` refuses plain `http://` except on your own machine and private networks.
 
 ## Agents
 

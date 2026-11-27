@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use plaintext_core::item::{Field, Item, OldPassword, Section, safe_file_name};
+use base64::Engine;
+use plaintext_core::api::B64;
+use plaintext_core::item::{Field, Item, OldPassword, Passkey, Section, safe_file_name};
 use serde_json::{Value, json};
 
 /// One vault's worth of imported items, with attachment bytes to upload.
@@ -83,6 +85,24 @@ pub fn days_to_date(days: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Unix milliseconds of an ISO 8601 UTC time such as `2026-04-21T14:03:33.011Z`.
+fn iso_ms(t: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>, max: i64| t.get(r).filter(|x| x.bytes().all(|b| b.is_ascii_digit()))?.parse::<i64>().ok().filter(|&v| v <= max);
+    let (y, m, d) = (n(0..4, 9999)?, n(5..7, 12).filter(|&m| m > 0)?, n(8..10, 31).filter(|&d| d > 0)?);
+    let secs = n(11..13, 23)? * 3600 + n(14..16, 59)? * 60 + n(17..19, 60)?;
+    let ms = match t.get(19..).and_then(|f| f.strip_prefix('.')) {
+        Some(f) => f.get(..f.find(|c: char| !c.is_ascii_digit()).unwrap_or(f.len()).min(3)).and_then(|f| format!("{f:0<3}").parse::<i64>().ok())?,
+        None => 0,
+    };
+    // Days-from-civil (Howard Hinnant), the inverse of days_to_date.
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from((days * 86_400 + secs) * 1000 + ms).ok()
 }
 
 /// A 1PUX field value (`{"concealed": "…"}`, `{"email": {"email_address": …}}`, …)
@@ -267,6 +287,8 @@ pub fn bitwarden(bytes: &[u8]) -> Result<Vec<Imported>, ImportError> {
             title: s(b, "name"),
             notes: s(b, "notes"),
             favorite: b.get("favorite").and_then(Value::as_bool).unwrap_or(false),
+            created: iso_ms(&s(b, "creationDate")).unwrap_or_default(),
+            updated: iso_ms(&s(b, "revisionDate")).unwrap_or_default(),
             ..Default::default()
         };
         if let Some(f) = b.get("folderId").and_then(Value::as_str).and_then(|id| folders.get(id)) {
@@ -287,6 +309,18 @@ pub fn bitwarden(bytes: &[u8]) -> Result<Vec<Imported>, ImportError> {
                 it.password = s(l, "password");
                 it.totp = s(l, "totp");
                 it.urls = l.get("uris").and_then(Value::as_array).map(|u| u.iter().map(|x| s(x, "uri")).filter(|u| !u.is_empty()).collect()).unwrap_or_default();
+                let mut unreadable = Vec::new();
+                for c in l.get("fido2Credentials").and_then(Value::as_array).into_iter().flatten() {
+                    match bitwarden_passkey(c) {
+                        Some(p) => it.passkeys.push(p),
+                        None => unreadable.push(c.clone()),
+                    }
+                }
+                // Kept as they were rather than lost (the export gets deleted after
+                // importing), and in `extra`, which share links leave out.
+                if !unreadable.is_empty() {
+                    it.extra.insert("bitwarden_passkeys".into(), Value::Array(unreadable));
+                }
             }
             2 => it.kind = "note".into(),
             3 => {
@@ -344,6 +378,61 @@ pub fn bitwarden(bytes: &[u8]) -> Result<Vec<Imported>, ImportError> {
         items.push((it, vec![]));
     }
     Ok(vec![Imported { name: String::new(), items }])
+}
+
+/// Bitwarden's base64url (it also reads standard base64, padded or not).
+fn b64url(v: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v.trim_end_matches('=').replace('+', "-").replace('/', "_")).ok()
+}
+
+/// One of Bitwarden's `login.fido2Credentials`: a credential id that is a UUID
+/// or `b64.` + base64url, a base64url PKCS#8 key and user handle, and the
+/// counter as a string.
+fn bitwarden_passkey(c: &Value) -> Option<Passkey> {
+    let id = s(c, "credentialId");
+    let credential_id = match id.strip_prefix("b64.") {
+        Some(b) => b64url(b)?,
+        None if id.len() == 36 && [8, 13, 18, 23].iter().all(|&i| id.as_bytes()[i] == b'-') => {
+            hex::decode(id.replace('-', "")).ok().filter(|b| b.len() == 16)?
+        }
+        None => return None,
+    };
+    let rp_id = s(c, "rpId");
+    let private_key = b64url(&s(c, "keyValue"))?;
+    if rp_id.is_empty() || credential_id.is_empty() || private_key.is_empty() {
+        return None;
+    }
+    let counter = match c.get("counter") {
+        Some(Value::String(n)) if !n.is_empty() => n.parse().ok()?,
+        Some(Value::Number(n)) => u32::try_from(n.as_u64()?).ok()?,
+        _ => 0,
+    };
+    Some(Passkey {
+        rp_id,
+        credential_id: B64(credential_id),
+        user_handle: B64(b64url(&s(c, "userHandle"))?),
+        user_name: s(c, "userName"),
+        private_key: B64(private_key),
+        counter,
+        created: iso_ms(&s(c, "creationDate")).unwrap_or_default(),
+        // Everything else (rpName, userDisplayName, discoverable, keyType, …), in our naming.
+        extra: c
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| {
+                let snake: String = k.chars().flat_map(|c| if c.is_ascii_uppercase() { vec!['_', c.to_ascii_lowercase()] } else { vec![c] }).collect();
+                let v = match (snake.as_str(), v.as_str()) {
+                    ("discoverable", Some(b)) => Value::Bool(b.eq_ignore_ascii_case("true")),
+                    _ => v.clone(),
+                };
+                (snake, v)
+            })
+            // Mapped above, or a Passkey field: a duplicate key would make the item unreadable.
+            .filter(|(k, _)| !["credential_id", "key_value", "rp_id", "user_handle", "user_name", "private_key", "counter", "created", "creation_date"].contains(&k.as_str()))
+            .collect(),
+    })
 }
 
 /// Items as an unencrypted Bitwarden JSON export, for leaving to any other manager.
@@ -547,6 +636,46 @@ mod tests {
         let back = to_bitwarden(&items);
         assert_eq!(bitwarden(back.to_string().as_bytes()).unwrap()[0].items[0].0.password, "pw");
         assert!(bitwarden(br#"{"encrypted":true}"#).is_err());
+    }
+
+    /// The fixture is a real Bitwarden export with passkeys from webauthn.io
+    /// (SpecterOps/pass-the-passkey's sample), unedited. Its MIT notice is in
+    /// tests/fixtures/bitwarden-passkeys.LICENSE.
+    #[test]
+    fn bitwarden_passkeys() {
+        let v = bitwarden(include_bytes!("../tests/fixtures/bitwarden-passkeys.json")).unwrap();
+        let (it, _) = &v[0].items[0];
+        assert_eq!(it.username, "johndoe");
+        let p = &it.passkeys[0];
+        assert_eq!((p.rp_id.as_str(), p.user_name.as_str(), p.counter), ("webauthn.io", "johndoe", 3));
+        assert_eq!(hex::encode(&p.credential_id.0), "76c3b5c8d88046e69f57ced060607557");
+        assert_eq!(p.user_handle.0, b"rq3h\xd1\xd6q\x82\xb7r\x85\x99\x8e\xfa\x1aWQ\xe3\xf6\t\xc8\xd7i\x8a{gK\xd8vU\x16V");
+        assert_eq!((p.private_key.0.len(), &p.private_key.0[..2]), (138, &[0x30, 0x81][..]), "PKCS#8 DER");
+        assert_eq!(v[0].items[1].0.passkeys[0].user_handle.0, b"janeSmithUserHandle");
+        assert_eq!((p.created, it.created, it.updated), (1_776_780_213_011, 1_776_780_212_740, 1_776_780_213_030));
+        assert_eq!((p.extra["rp_name"].as_str(), p.extra["user_display_name"].as_str(), p.extra["key_curve"].as_str()), (Some("webauthn.io"), Some("John Doe"), Some("P-256")));
+        assert_eq!(p.extra["discoverable"], Value::Bool(true));
+        assert_eq!((iso_ms("1999-12-31T23:59:59Z"), iso_ms("1970-01-01T00:00:00.5Z"), iso_ms("2024-03-01T00:00:00.123456+00:00")), (Some(946_684_799_000), Some(500), Some(1_709_251_200_123)));
+        for bad in ["soon", "2024-13-01T00:00:00Z", "2024-01-01T24:00:00Z", "2024-+1-01T00:00:00Z", "2024-00-10T00:00:00Z", "1969-12-31T23:59:59Z"] {
+            assert_eq!(iso_ms(bad), None, "{bad}");
+        }
+        // A `b64.` credential id and a numeric counter; ones that can't be read
+        // are kept in the item's extra map instead of being dropped.
+        let json = r#"{"items":[{"type":1,"name":"x","login":{"fido2Credentials":[
+          {"credentialId":"b64.AQID","keyValue":"MIGHAgEA","rpId":"a.example","userHandle":"YWxpY2U","counter":7},
+          {"credentialId":"not-an-id","keyValue":"MIGHAgEA","rpId":"b.example"},
+          {"credentialId":"76c3b5c8-d880-46e6-9f57-ced06060755-","keyValue":"MIGHAgEA","rpId":"c.example"},
+          {"credentialId":"b64.AQID","keyValue":"MIGHAgEA","rpId":"d.example","counter":"abc"},
+          {"credentialId":"b64.AQID","keyValue":"MIGHAgEA","rpId":"e.example","created":5,"privateKey":"x","rp_id":"y","userDisplayName":"false"}]}}]}"#;
+        let it = &bitwarden(json.as_bytes()).unwrap()[0].items[0].0;
+        assert_eq!((it.passkeys.len(), &it.passkeys[0].credential_id.0[..], it.passkeys[0].counter), (2, &[1u8, 2, 3][..], 7));
+        let odd = &it.passkeys[1];
+        assert_eq!((odd.rp_id.as_str(), odd.created, odd.extra.len(), odd.extra["user_display_name"].as_str()), ("e.example", 0, 1, Some("false")));
+        let kept: Vec<&str> = it.extra["bitwarden_passkeys"].as_array().unwrap().iter().map(|c| c["rpId"].as_str().unwrap()).collect();
+        assert_eq!(kept, ["b.example", "c.example", "d.example"]);
+        assert!(it.sections.is_empty() && it.shareable().extra.is_empty(), "never in share links");
+        let json = serde_json::to_string(it).unwrap();
+        assert_eq!(&serde_json::from_str::<Item>(&json).unwrap(), it, "the item reads back");
     }
 
     pub fn onepux_fixture() -> Vec<u8> {

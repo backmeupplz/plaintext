@@ -676,7 +676,7 @@ impl<T: Transport> Session<T> {
     pub fn upload_file(&self, vault: &Hex, name: &str, data: &[u8]) -> Result<FileRef> {
         let id = plaintext_core::new_item_id();
         let key = plaintext_core::crypto::random_key();
-        let blob = plaintext_core::crypto::seal(&key, &plaintext_core::crypto::ad("file", &[&vault.0, &id.0]), data);
+        let blob = plaintext_core::seal_file(&key, &vault.0, &id.0, data);
         raw(&self.t, "PUT", &format!("/v1/vaults/{vault}/files/{id}"), Some(&self.token), Some(blob.clone()))?;
         Ok(FileRef {
             id,
@@ -699,7 +699,7 @@ impl<T: Transport> Session<T> {
         }
         let key: plaintext_core::crypto::Key =
             zeroize_key(&f.key.0).ok_or(Error::Core(plaintext_core::Error::Tampered))?;
-        Ok(plaintext_core::crypto::open(&key, &plaintext_core::crypto::ad("file", &[&vault.0, &f.id.0]), &blob)?.to_vec())
+        Ok(plaintext_core::open_file(&key, &vault.0, &f.id.0, f.size, &blob)?.to_vec())
     }
 
     // ---------- Sharing one item ----------

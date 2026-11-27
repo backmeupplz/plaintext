@@ -357,6 +357,7 @@ fn links_carry_only_the_current_item() {
         private_key: B64(b"passkey-private".to_vec()),
         counter: 0,
         created: 0,
+        extra: Default::default(),
     });
     item.files.push(FileRef { id: new_item_id(), name: "f".into(), size: 1, key: B64(b"file-key-bytes".to_vec()), hash: B64(vec![3]) });
     item.extra.insert("future".into(), "future-secret".into());
@@ -748,4 +749,33 @@ fn attachment_names_are_never_paths() {
     ] {
         assert_eq!(safe_file_name(name), safe, "{name:?}");
     }
+}
+
+#[test]
+fn attachments_are_padded() {
+    let (key, vault, file) = (random_key(), random::<16>(), random::<16>());
+    for (len, want) in [(0, 256), (1, 256), (300, 304), (5000, 5120), (1_000_000, 1_015_808), (40_000_000, 40_894_464)] {
+        assert_eq!(padded_file_len(len), want, "{len}");
+    }
+    let mut last = 0;
+    for len in (0..MAX_FILE).step_by(9973).chain([MAX_FILE - SEAL_OVERHEAD]) {
+        let p = padded_file_len(len);
+        assert!(p >= len && p >= last && p + SEAL_OVERHEAD <= MAX_FILE.max(len + SEAL_OVERHEAD), "{len}");
+        assert!(len < PAD || p - len <= len / 8, "{len}: at most 12.5% bigger");
+        last = p;
+    }
+    assert_eq!(padded_file_len(MAX_FILE - SEAL_OVERHEAD) + SEAL_OVERHEAD, MAX_FILE, "the biggest file the server takes still fits");
+    assert_eq!(padded_file_len(usize::MAX), usize::MAX);
+    let blob = seal_file(&key, &vault, &file, b"%PDF scan");
+    assert_eq!(blob.len(), 256 + SEAL_OVERHEAD);
+    assert_eq!(&open_file(&key, &vault, &file, 9, &blob).unwrap()[..], b"%PDF scan");
+    assert_eq!(open_file(&key, &vault, &file, 257, &blob), Err(Error::Tampered), "a size past the blob");
+    let big = seal_file(&key, &vault, &file, &[7; 5000]);
+    assert_eq!(open_file(&key, &vault, &file, 5000, &big).unwrap().len(), 5000);
+    let raw = open(&key, &ad("file", &[&vault, &file]), &big).unwrap();
+    assert_eq!((raw.len(), raw[5000..].iter().all(|&b| b == 0)), (5120, true), "zero padding");
+    assert_eq!(open_file(&key, &vault, &file, u64::MAX, &blob), Err(Error::Tampered));
+    // Files uploaded before padding are exactly their size.
+    let old = seal(&key, &ad("file", &[&vault, &file]), b"old file");
+    assert_eq!(&open_file(&key, &vault, &file, 8, &old).unwrap()[..], b"old file");
 }

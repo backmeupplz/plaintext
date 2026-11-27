@@ -64,7 +64,7 @@ The item `kind` is a free string (`core/src/item.rs`). The 1PUX importer maps al
 | Feature | 1Password | Plaintext status | Tier | Notes |
 |---|---|---|---|---|
 | Field types (app UI) | Text, URL, email, address, date, month/year, OTP, password, phone, "Sign in with", security questions | Protocol ready, needs app UI | v1 | `Field.type` covers `text`, `concealed`, `url`, `email`, `phone`, `date`, `month_year`, `otp`, `address`, `menu`, `card_number`, `card_type`, `ssh_key` and `boolean`. "Sign in with" isn't modelled (section 6). |
-| Field types (CLI) | password, text, email, url, date, monthYear, phone, otp, file | Done (core/server/CLI) | v1 | The CLI creates only `text` (`--field`) and `concealed` (`--concealed`) fields, plus `--totp` and files through `attach`. Other types arrive only through import. |
+| Field types (CLI) | password, text, email, url, date, monthYear, phone, otp, file | Done (core/server/CLI) | v1 | The CLI creates only `text` (`--field`) and `concealed` (`--concealed`) fields, plus `--totp` (asked for, never an argument; an empty answer removes it) and files through `attach`. Other types arrive only through import. |
 | Field types (SDK enum) | Includes Reference (a link to another item) | Planned | v2 | All types exist except Reference. That needs an item-schema field type holding an item id (see Related items). |
 | SDK-supported field kinds | API keys, SSH keys, OTP, files, passkeys, references | Done (core/server/CLI) | v1 | `Item` holds every kind except item references. Files are `FileRef`s and passkeys are `Passkey` entries. |
 | Sections | Named sections, reordered by drag | Protocol ready, needs app UI | v1 | `sections` is an ordered list, so reordering is a list edit. The CLI puts every field it adds in one section. |
@@ -156,7 +156,7 @@ None of this needs server work. It is app and extension work on top of the core 
 
 ## 7. Passkeys
 
-`Item.passkeys` stores `rp_id`, `credential_id`, `user_handle`, `user_name`, a PKCS#8 `private_key`, `counter` and `created`. Core has no WebAuthn code yet: no key generation, no authenticatorData or attestation building, and no assertion signing.
+`Item.passkeys` stores `rp_id`, `credential_id`, `user_handle`, `user_name`, a PKCS#8 `private_key`, `counter`, `created`, and anything else in `extra` (such as `rp_name`, `user_display_name` and `discoverable`). The Bitwarden JSON importer brings passkeys over; one it can't read is kept as it was in the item's `extra.bitwarden_passkeys`. Core has no WebAuthn code yet: no key generation, no authenticatorData or attestation building, and no assertion signing.
 
 | Feature | 1Password | Plaintext status | Tier | Notes |
 |---|---|---|---|---|
@@ -275,7 +275,7 @@ None of this needs server work. It is app and extension work on top of the core 
 | Favorites & tags | Favorites; nested tags | Done (core/server/CLI) | v1 | `tags` (`--tag`) are searchable. `favorite` is in the model but has no CLI flag. Nesting with `/` is a display convention for the apps. |
 | Search | Titles, fields and notes; filters by vault, tag, category | Done (core/server/CLI) | v1 | `Item::matches` searches title, username, URLs, tags, notes and non-secret fields, but never concealed values. `plaintext ls QUERY [--vault V]`. Filter syntax is app work. |
 | Multiple accounts | Several accounts in one app | CLI done, apps in v1 | v1 | Accounts on any mix of servers (family, work, Plaintext Cloud). CLI: `plaintext account ls/use/remove`, `--account`. Vaults are shared within one server. |
-| Import | Browsers, Bitwarden, Dashlane, KeePass, Keeper, LastPass, CSV, 1PUX, Credential Exchange | Done (core/server/CLI) | v1 | `plaintext import`: 1PUX (all categories, files, password history, archived and favorite flags), Bitwarden or Vaultwarden unencrypted JSON (folders become tags), and CSV from 1Password, Bitwarden, Chrome, Firefox, Safari or anything with recognisable headers. Dashlane, KeePass, Keeper and LastPass have to go through CSV. Credential Exchange is v2. |
+| Import | Browsers, Bitwarden, Dashlane, KeePass, Keeper, LastPass, CSV, 1PUX, Credential Exchange | Done (core/server/CLI) | v1 | `plaintext import`: 1PUX (all categories, files, password history, archived and favorite flags), Bitwarden or Vaultwarden unencrypted JSON (folders become tags, passkeys come along), and CSV from 1Password, Bitwarden, Chrome, Firefox, Safari or anything with recognisable headers. Dashlane, KeePass, Keeper and LastPass have to go through CSV. Credential Exchange is v2. |
 | Export | 1PUX or CSV; Credential Exchange with passkeys on iOS | Done (core/server/CLI) | v2 | `plaintext export` writes unencrypted Bitwarden JSON only. It drops files, passkeys, tags, password history, item history and kinds other than login and note. A lossless native export (JSON plus files, optionally sealed) is v2. Bitwarden compatibility stays import and export only. |
 | Print | Print items and Wi-Fi QR codes | Protocol ready, needs app UI | v2 | Printing the Emergency Kit is v1. Printing items is v2. |
 | Privacy.com cards | Single-use virtual cards at checkout | Won't do | won't | It is a US-only commercial integration that doesn't fit a self-hosted product. |

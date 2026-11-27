@@ -64,9 +64,27 @@ fn ask_secret(prompt: &str) -> Res<Zeroizing<String>> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Ok(Zeroizing::new(rpassword::prompt_password(prompt)?));
     }
+    read_secret_line(&mut std::io::stdin().lock())
+}
+
+/// One line from piped stdin. An empty line is an answer; nothing left to read
+/// is an error, so a closed stdin never sets or clears a secret.
+fn read_secret_line(r: &mut impl std::io::BufRead) -> Res<Zeroizing<String>> {
     let mut line = Zeroizing::new(String::new());
-    std::io::stdin().read_line(&mut line)?;
+    if r.read_line(&mut line)? == 0 {
+        return Err("standard input ended before the secret".into());
+    }
     Ok(Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+/// An empty answer removes the one-time code; anything else must be valid.
+fn set_totp(item: &mut Item, t: &str) -> Res<()> {
+    let t = t.trim();
+    if !t.is_empty() && tools::totp(t, 0).is_none() {
+        return Err("that isn't a one-time password secret or otpauth://totp/ URI".into());
+    }
+    item.totp = t.to_string();
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -274,9 +292,11 @@ struct Fields {
     url: Vec<String>,
     #[arg(long)]
     notes: Option<String>,
-    /// otpauth:// URI or base32 secret
+    /// Ask for the one-time password's otpauth:// URI or base32 secret (or read
+    /// it from stdin when piped, on the line after --password's). An empty
+    /// answer removes the one-time code
     #[arg(long)]
-    totp: Option<String>,
+    totp: bool,
     #[arg(long)]
     tag: Vec<String>,
     /// label=value
@@ -414,8 +434,8 @@ fn apply_fields(item: &mut Item, f: &Fields) -> Res<()> {
     if let Some(n) = &f.notes {
         item.notes = n.clone();
     }
-    if let Some(t) = &f.totp {
-        item.totp = t.clone();
+    if f.totp {
+        set_totp(item, &ask_secret("One-time password secret or otpauth:// URI (empty removes it): ")?)?;
     }
     if !f.tag.is_empty() {
         item.tags = f.tag.clone();
@@ -474,6 +494,9 @@ fn show(item: &Item, vault: &str) {
     }
     if !item.passkeys.is_empty() {
         row("passkeys", &item.passkeys.iter().map(|p| p.rp_id.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    if let Some(n) = item.extra.get("bitwarden_passkeys").and_then(|v| v.as_array()).map(Vec::len) {
+        row("passkeys", &format!("{n} from Bitwarden that couldn't be imported (see `plaintext get ITEM --json`)"));
     }
     row("notes", &item.notes);
 }
@@ -677,7 +700,7 @@ fn run(cli: Cli) -> Res<()> {
             let (_, _, it) = s.one(&item, None)?;
             let cfg = state::load_config()?;
             say!("{}", s.create_link(&std::env::var("PLAINTEXT_LINK_PAGE").unwrap_or_else(|_| plaintext_client::LINK_PAGE.into()), &cfg.server, &it, now() + duration(&expires)?, views)?);
-            if !it.files.is_empty() || !it.passkeys.is_empty() {
+            if !it.files.is_empty() || !it.passkeys.is_empty() || it.extra.contains_key("bitwarden_passkeys") {
                 note!("Attachments and passkeys aren't included in share links.");
             }
         }
@@ -1016,6 +1039,25 @@ fn user_cmd(u: UserCmd) -> Res<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn totp_is_never_an_argument() {
+        use clap::Parser;
+        let ok = super::Cli::try_parse_from(["plaintext", "edit", "GitHub", "--totp"]);
+        assert!(ok.is_ok());
+        for args in [["plaintext", "edit", "GitHub", "--totp", "JBSWY3DPEHPK3PXP"], ["plaintext", "add", "GitHub", "--totp", "JBSWY3DPEHPK3PXP"]] {
+            assert!(super::Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        let line = |s: &str| super::read_secret_line(&mut s.as_bytes()).map(|l| l.to_string());
+        assert_eq!(line("\n").unwrap(), "");
+        assert_eq!(line("JBSWY3DPEHPK3PXP\r\nnext\n").unwrap(), "JBSWY3DPEHPK3PXP");
+        assert!(line("").is_err(), "a closed stdin is no answer");
+        let mut it = super::Item { totp: "JBSWY3DPEHPK3PXP".into(), ..Default::default() };
+        assert!(super::set_totp(&mut it, "not a secret!").is_err());
+        assert_eq!(it.totp, "JBSWY3DPEHPK3PXP");
+        super::set_totp(&mut it, "").unwrap();
+        assert_eq!(it.totp, "");
+    }
+
     #[test]
     fn terminal_escapes_become_visible() {
         let hostile = "Payroll\u{1b}]52;c;Y3VybA==\u{7}\u{1b}[2K\u{202e}gpj.exe\tok\n";
