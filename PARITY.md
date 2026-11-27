@@ -69,7 +69,7 @@ The item `kind` is a free string (`core/src/item.rs`). The 1PUX importer maps al
 | SDK-supported field kinds | API keys, SSH keys, OTP, files, passkeys, references | Done (core/server/CLI) | v1 | `Item` holds every kind except item references. Files are `FileRef`s and passkeys are `Passkey` entries. |
 | Sections | Named sections, reordered by drag | Protocol ready, needs app UI | v1 | `sections` is an ordered list, so reordering is a list edit. The CLI puts every field it adds in one section. |
 | Security questions | A section; answers generated | Protocol ready, needs app UI | v2 | Store questions as a section of `concealed` fields and generate answers with the existing generator. |
-| File attachments | Any item; 1 to 5 GB per person; 2 GB per file | Done (core/server/CLI) | v1 | Each file is sealed with its own random key, kept in the item's `FileRef`, so changing a vault key needs no re-upload. The server takes up to 64 MiB per file as one request body stored in SQLite, with no per-user quota. Larger files need protocol work (see Gaps). |
+| File attachments | Any item; 1 to 5 GB per person; 2 GB per file | Done (core/server/CLI) | v1 | Each file is sealed with its own random key, kept in the item's `FileRef`, so changing a vault key needs no re-upload. The server takes up to 64 MiB per file as one request body stored in SQLite, and `PLAINTEXT_QUOTA_MB` sets a per-account storage quota. Larger files need protocol work (see Gaps). |
 | Markdown notes | Headings, lists, code, links | Protocol ready, needs app UI | v1 | `notes` is a plain string. Rendering is client-side. |
 | Related items | One-way links within one vault | Planned | v2 | This needs a reference field holding an item id. Item ids are stable within a vault. A move to another vault creates a new id, so links have to be dropped there, as 1Password does. |
 | Private item links | A deep link for people who already have access | Protocol ready, needs app UI | v2 | A `plaintext://vault/<id>/item/<id>` URL scheme needs no server work, since access already depends on holding the vault key. |
@@ -239,7 +239,7 @@ None of this needs server work. It is app and extension work on top of the core 
 | Recovery codes | A self-service, reusable recovery code | Won't do | won't | A code that restores access without the password is another unlock path, and a weaker one. The Secret Key and Emergency Kit are the recovery story. |
 | Unlock with SSO | OIDC unlock with no Secret Key or Emergency Kit | Won't do | won't | Unlocking through an identity provider means the IdP or the server holds key material, which is escrow. |
 | Automated provisioning (SCIM) | Create, suspend and deprovision users from an IdP | Planned | v2 | Suspend and invite map onto existing endpoints. Creating accounts can't be automated, because each user has to generate their own Secret Key. |
-| Policies | Password length, 2FA, lockout, Emergency Kit, auto-lock | Planned | v2 | Only server-side settings make sense, such as invite-only signup (already the case) and login rate limits. The server never sees the password, so a password-length rule can only be enforced by clients. |
+| Policies | Password length, 2FA, lockout, Emergency Kit, auto-lock | Planned | v2 | Only server-side settings make sense, such as invite-only signup (already the case) and the per-address signup and failed-login limits open servers already have. The server never sees the password, so a password-length rule can only be enforced by clients. |
 | Sharing & permissions policies | Sharing, disk scanning, autofill types, file storage, agentic permissions and more | Won't do | won't | There are no organisation policies. Agent access is controlled per vault by owners. |
 | Unlock/auto-lock policy | Presets enforced per platform | Won't do | won't | Each device has its own auto-lock setting (v1 app scope). Admins don't enforce one. |
 | Firewall rules | Allow or deny by country, IP or anonymiser | Won't do | won't | That is the reverse proxy's job on a self-hosted server. |
@@ -362,10 +362,10 @@ The following would need new protocol, schema or server work to match 1Password.
 - **Per-item permissions.** Today permissions are per vault only. Per-item access would need per-item keys and per-item rosters. The cheaper answer is a separate vault or `send`.
 - **Vault deletion.** There is no endpoint.
 - **Atomic cross-vault move.** Today a move is two pushes, and files are stored per vault, so attachments are uploaded again.
-- **Larger attachments.** Chunked or streaming uploads instead of one 64 MiB body held in memory, storage outside SQLite, and per-user quotas.
+- **Larger attachments.** Chunked or streaming uploads instead of one 64 MiB body held in memory, and storage outside SQLite.
 - **Share links.** An endpoint listing a user's links (sharing history), links that carry files (blobs are capped at 1 MiB), and any recipient restriction. Email-verified recipients conflict with the no-email design, but a passphrase-protected link would not.
 - **Travel Mode.** A server-visible list of hidden vault ids per account, enforced on pull, and confirmation that devices purged their local copies.
 - **Audit.** Account-level events (logins, sessions, password changes, invites), a reactivate endpoint for disabled users, and a streaming or exportable feed. Item-level read auditing isn't possible while a sync pulls the whole vault.
 - **Agent limits.** Rate limits per agent, and optional IP allowlists for agent sessions.
-- **Server policies.** Login rate limiting and lockout, and SCIM endpoints for invite and suspend.
+- **Server policies.** Lockout and limits on invite-only servers (open servers already limit signups and failed logins per address), and SCIM endpoints for invite and suspend.
 - **Fork detection.** Devices can be split onto different branches by the server. Detecting this needs devices to compare their manifest heads, for example through gossip inside the vault (a known limit in DESIGN.md).

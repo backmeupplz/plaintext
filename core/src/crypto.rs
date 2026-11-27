@@ -272,6 +272,12 @@ pub fn password_change_message(account_id: &Id, ts: u64, new_auth: &[u8], new_ac
     [b"plaintext/v1/password-change".as_slice(), account_id, &ts.to_be_bytes(), new_auth, &sha256(new_account_key)].concat()
 }
 
+/// Signed by the login key to delete the account, so a stolen session token alone
+/// can't. Names the server's host like a login, so a look-alike can't relay it.
+pub fn account_delete_message(account_id: &Id, ts: u64, host: &str) -> Vec<u8> {
+    [b"plaintext/v1/account-delete".as_slice(), account_id, &ts.to_be_bytes(), host.as_bytes()].concat()
+}
+
 /// A server address reduced to what both sides can agree on: lowercase host and
 /// port, no scheme, path or default port. `https://Vault.Example.com:443/` and the
 /// `Host` header `vault.example.com` both give `vault.example.com`.

@@ -512,14 +512,14 @@ impl Vault {
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: None })
     }
 
-    /// Remove someone: a new vault key, every item re-sealed, so nothing written
+    /// Remove people: a new vault key, every item re-sealed, so nothing written
     /// from now on is readable with the old key. Push pending changes first.
-    pub fn revoke(&self, me: &Me, username: &str, now: u64) -> Result<RosterUpdate, Error> {
+    pub fn revoke(&self, me: &Me, usernames: &[&str], now: u64) -> Result<RosterUpdate, Error> {
         if self.has_changes() {
             return Err(Error::PendingChanges);
         }
         let mut r = self.next_roster(me, now)?;
-        r.members.retain(|m| m.username != username);
+        r.members.retain(|m| !usernames.contains(&m.username.as_str()));
         self.rotate(me, r)
     }
 

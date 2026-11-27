@@ -281,6 +281,18 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
     Ok(s)
 }
 
+/// Syncs, warning about a vault that couldn't push (out of storage, or another
+/// device got there first) instead of failing every command over it.
+fn sync(s: &mut S) -> Result<(), Error> {
+    match s.sync() {
+        Err(e @ Error::Server(409 | 413, _)) => {
+            eprintln!("warning: {e}");
+            Ok(())
+        }
+        r => r,
+    }
+}
+
 /// An unlocked, synced session: an agent from `PLAINTEXT_AGENT_KEY`, or the
 /// signed-in human (asking for the password only once the keychain session lapses).
 pub fn open() -> Res<S> {
@@ -288,7 +300,7 @@ pub fn open() -> Res<S> {
         let server = std::env::var("PLAINTEXT_SERVER").map_err(|_| "set PLAINTEXT_SERVER along with PLAINTEXT_AGENT_KEY")?;
         let key = AgentKey::parse(&key)?;
         let mut s = Session::login(http(&server)?, &derive_agent(&key), "agent")?;
-        s.sync()?;
+        sync(&mut s)?;
         return Ok(s);
     }
     let cfg = load_config()?;
@@ -297,12 +309,12 @@ pub fn open() -> Res<S> {
         None => sign_in(&cfg)?,
     };
     load_snapshots(&mut s);
-    match s.sync() {
+    match sync(&mut s) {
         Err(Error::Server(401, _)) => {
             forget(&cfg);
             s = sign_in(&cfg)?;
             load_snapshots(&mut s);
-            s.sync()?;
+            sync(&mut s)?;
         }
         r => r?,
     }
@@ -313,7 +325,7 @@ pub fn open() -> Res<S> {
     Ok(s)
 }
 
-fn snapshot_dir(s: &S) -> PathBuf {
+pub fn snapshot_dir(s: &S) -> PathBuf {
     home().join("vaults").join(hex::encode(&s.account.id[..8]))
 }
 

@@ -15,6 +15,7 @@ The server is untrusted, not merely the database dump. It can lie in any respons
 | Serve a brand-new device an old but genuine vault; keep two devices on different branches forever (see Known limits) | Swap, drop, add or alter items, roll a device back, or splice two branches, without the client detecting it |
 | Introduce a fake user to someone who hasn't verified anyone yet (trust on first use) | Replace the keys of a user you have pinned or verified; give you a vault key the owner didn't commit to |
 | Let a reader or removed member write on the server side | Make other members accept that write: manifests are signed and checked against the roster |
+| Claim a member's account was deleted, so an owner's device removes them from a shared vault (an owner can add them back) | Add anyone to a vault, or keep a removed member able to read what's written after the new key |
 
 ## Secrets and keys
 
@@ -40,7 +41,7 @@ identity enc key ◄──sealed to── Vault Key (random per vault and epoch)
 
 ## Login and sessions
 
-The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms ‖ host`, where `host` is the server address the user typed, reduced to lowercase host and port (`crypto::server_host`: no scheme, path or default port). The server accepts only its own host: the names in `PLAINTEXT_URL` (comma-separated) when set, otherwise the request's `Host` header. A look-alike server can't relay a login to the real one for a session, since the signature names the look-alike. Set `PLAINTEXT_URL` on any server whose port is also reachable directly, so an attacker can't present a matching `Host` header. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login, and returns a random bearer token, storing only its SHA-256. Sessions can be listed and ended; disabling an account ends them all.
+The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms ‖ host`, where `host` is the server address the user typed, reduced to lowercase host and port (`crypto::server_host`: no scheme, path or default port). The server accepts only its own host: the names in `PLAINTEXT_URL` (comma-separated). A look-alike server can't relay a login to the real one for a session, since the signature names the look-alike. Without `PLAINTEXT_URL` the server knows its address only from the request's `Host` header, which a relaying server sets to anything, so it then accepts logins only for `localhost`, `127.0.0.1` or `[::1]` (any port) and refuses others with 403, asking the operator to set it. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login, and returns a random bearer token, storing only its SHA-256. A session lasts 30 days, or less if the login asks for it (`ttl` in seconds); after that the server refuses the token. Sessions can be listed and ended; disabling an account ends them all. Disabling a person disables the agents they own too, since they hold those agents' keys. Apps that keep only the Account Key for quick unlock ask for the password again when the session runs out.
 
 ## Servers and accounts
 
@@ -48,9 +49,23 @@ Every server is independent and can sit at any address: a family's own domain, a
 
 `GET /v1/info` (no session) tells an app what to ask for before signup: `{version, open, setup}`. `open` means anyone may sign up; `setup` means the server has no accounts yet and the first one needs the setup code.
 
-A hosted server runs with `PLAINTEXT_SIGNUP=open`. On such a server:
+A hosted server runs with `PLAINTEXT_SIGNUP=open`, and must also set `PLAINTEXT_SETUP_CODE` while it has no accounts (it refuses to start otherwise), so the operator rather than the first stranger becomes the admin. On such a server:
 - anyone may sign up, and any person may create invites, which still verify both sides;
-- the directory doesn't list everyone: `GET /v1/users` returns only the people who joined with your invites (admins see everyone), and people are found by exact username (`GET /v1/users/{name}`). Otherwise a hosted server would hand every customer the list of all the others.
+- the directory doesn't list everyone: `GET /v1/users` returns only the people who joined with your invites (admins see everyone), and people are found by exact username (`GET /v1/users/{name}`). Otherwise a hosted server would hand every customer the list of all the others;
+- signups and failed logins are rate-limited per client address (10 signups and 30 failed logins an hour; IPv6 per /64). Successful logins don't count, since agents sign in on every run, and a correct login works even from an address over its limit, so nobody sharing an address (or a proxy) can lock the others out. Behind a reverse proxy, `PLAINTEXT_TRUST_PROXY=1` takes the address from the last `X-Forwarded-For` entry (in the last header line), the one a single proxy adds. The counts live in memory and reset when the server restarts. At most 100,000 addresses are tracked an hour; past that, new addresses can't sign up but can still log in.
+
+`PLAINTEXT_QUOTA_MB` limits each account's storage on any server: the item blobs and files in the vaults it created, and the share links and inbox messages it and its agents sent. A sent message counts until the recipient deletes it, it expires or the sender deletes it (`DELETE /v1/messages/{id}` works for either end), and stops counting if the sender's account is deleted. Agents never pay for a vault: when one would, its owner does. A vault counts against its creator. If an owner removes the creator, it counts against that owner from then on, and if the creator's account is deleted, against a remaining member, owners first. A write that would take that account past the quota gets 413, including writes by other members of the vault, but a write that doesn't add bytes always goes through, so reading, deleting and replacing a vault key keep working for an account over its quota. A refused change stays on the device and is pushed again once there's room; the account's other vaults keep syncing. Deleting an item deletes its attachments unless another item in the vault refers to them; if another device restores the item with an edit it made meanwhile, those attachments are gone. Unset means unlimited. `GET /v1/account` reports `quota` and `usage` in bytes. Manifests and wrapped keys aren't counted; each one is size-limited, but a member who keeps pushing can grow a vault's manifest history (see "Known limits").
+
+### Deleting an account
+
+`DELETE /v1/account` needs the password again: it carries `{ts, sig}`, a signature by the login key over `"plaintext/v1/account-delete" ‖ account_id ‖ ts ‖ host` (±120 s, and the host as for a login), so a stolen session token can't delete an account. It deletes the account and the agents it owns, with their sessions, inbox, share links and invites, and their vaults:
+
+- A vault nobody else uses (no current, enabled member outside the account and its agents) is deleted with its items and files.
+- In a shared vault the server stops serving them and drops their wrapped keys, as with an expired member. It can't change the signed roster, so pulls list them under `gone` until an owner's device notices and removes them for real with a new key, all in one roster version (a roster that names a deleted account is refused). Their audit entries stay.
+- **The only owner of a vault others use can't delete their account** (an account that is only a reader or writer there may, even if no owner is left). Ownerless vaults could never change key or members again, and deleting them would take the data from everyone else. The client names those vaults; the user makes someone else an owner or removes the others first. The server refuses with 409 as well.
+- The admin can't delete their account while others use the server, since nobody else could invite or disable accounts. The last account may go, and the server is fresh again.
+
+A deleted username is free to sign up again. Whoever pinned the old account gets `KeyChanged` for the new one, so nobody mistakes them for each other.
 
 ## Users, invites and verification
 
@@ -103,7 +118,7 @@ An item is one JSON object: `kind` (login, password, note, card, identity, docum
 
 Each vault has a counter and a **manifest chain**. A manifest is a signed envelope `{vault_id, counter, epoch, roster (version), prev = SHA256(previous manifest's signed body), sealed}`, where `sealed` holds the vault name and `{item_id → SHA256(item blob)}`.
 
-- **Pull** `GET /v1/vaults/{id}?since=N&roster=V` returns every roster after V, every manifest after N, the caller's wrapped key for the current epoch, and every item written after N. The client checks: the roster chain; the key against `key_check`; that the manifests are consecutive, each links to the one before (starting from the last one this device verified), and each is signed by someone who could write; that the latest is under the current epoch; and that every item blob matches the latest manifest's hash. (An expired writer's manifest is still accepted until an owner's device rotates the key, which it does on its next sync: refusing it would leave the vault unreadable for everyone until then.) Any failure rejects the whole response and changes nothing. A vault that fails is reported and keeps its last verified state (or isn't listed, if it never verified); the other vaults still sync, so nobody can jam a sync by sharing a bad vault.
+- **Pull** `GET /v1/vaults/{id}?since=N&roster=V` returns every roster after V, every manifest after N, the caller's wrapped key for the current epoch, every item written after N, and the members whose accounts were deleted (`gone`). The client checks: the roster chain; the key against `key_check`; that the manifests are consecutive, each links to the one before (starting from the last one this device verified), and each is signed by someone who could write; that the latest is under the current epoch; and that every item blob matches the latest manifest's hash. (An expired writer's manifest is still accepted until an owner's device rotates the key, which it does on its next sync: refusing it would leave the vault unreadable for everyone until then.) Any failure rejects the whole response and changes nothing. A vault that fails is reported and keeps its last verified state (or isn't listed, if it never verified); the other vaults still sync, so nobody can jam a sync by sharing a bad vault.
 - **Push** `PUT /v1/vaults/{id}` carries `expected_counter`, a new signed manifest, upserts and deletes. The server applies it only if the counter matches and the manifest extends its chain; otherwise 409, and the client pulls, merges and retries.
 - **Merge.** Local unpushed edits win. If the server's copy of an item also changed since the local edit began, it is kept as a conflict copy ("… (conflict)") so nothing is lost; the server must send that copy's blob, or the pull is rejected. A blob that was only re-sealed (a key rotation) with unchanged content doesn't count as a change, so it can't undo a pending delete.
 - **Rollback guard.** Each device persists its last verified counter and manifest hash (in its sealed snapshot). The server can't serve an older state, or a different branch, to a device that has seen a newer one: the hash chain won't link. A vault the server stops listing keeps its verified state on the device, so it can't come back older. A device with no state starts from the latest manifest (`latest=true`) instead of replaying the whole chain.
@@ -132,10 +147,11 @@ Agents are first-class accounts owned by a human, built for automation and AI to
 |---|---|
 | `POST /v1/signup` | `SignupRequest`; first account free, then an invite proof |
 | `POST /v1/agents` | `SignupRequest` for an agent, by its owner's session |
-| `POST /v1/login`, `/v1/logout` | |
-| `GET /v1/account` | username, admin, sealed Account Key and keyring, vault ids |
+| `POST /v1/login`, `/v1/logout` | signed for the server's host; optional `ttl` (seconds, at most 30 days) |
+| `GET /v1/account` | username, admin, sealed Account Key and keyring, vault ids, storage quota and usage |
 | `PUT /v1/account/keyring` | compare-and-swap on the keyring counter |
 | `POST /v1/account/password` | signed by the current login key |
+| `DELETE /v1/account` | signed by the current login key (see "Deleting an account") |
 | `GET /v1/sessions`, `DELETE /v1/sessions/{id}` | |
 | `GET /v1/info` | public: version, open signup, setup code needed |
 | `GET /v1/users`, `GET /v1/users/{name}` | directory (limited on open servers, see "Servers and accounts"); exact lookup |
@@ -149,6 +165,10 @@ Agents are first-class accounts owned by a human, built for automation and AI to
 | `POST /v1/links`, `GET`/`DELETE /v1/links/{id}` | share links (GET is public, CORS open) |
 
 Types are in `core/src/api.rs`; ids are hex, blobs base64.
+
+Signed documents are limited as a whole, before anything in them is parsed: identities 2 KiB, rosters 512 KiB and 1000 members (each listed once), messages and manifests their sealed part in base64 plus 4 KiB. `GET /v1/messages` returns the oldest messages up to 32 MiB (at least one); the rest come once those are deleted. `HEAD` on a share link gets 405, so checking a link doesn't use up a view, and every response carries `Cache-Control: no-store`. Expired links, messages and sessions are never served, and are deleted every ten minutes.
+
+Request bodies are limited to 64 KiB, except: the keyring, inbox messages and share links take 2 MiB; vault create, push and roster changes take 32 MiB; files take 64 MB. Those larger requests need a valid session, which the server checks before it reads the body. Removing a member re-seals every item in one request, so a vault whose items come to more than about 24 MB (32 MiB after base64) can't change its key until rotations are split.
 
 ## Code layout
 
@@ -192,4 +212,4 @@ Vaultwarden (read at `dbd7829`) is a faithful Bitwarden server, so it inherits t
 - **Forks between devices.** The server can keep device A's writes from device B indefinitely. Each device's own history is consistent and can never be spliced with the other branch, but they stay split until the server reunites them. Detecting a permanent split needs devices to compare state out of band (comparing a vault's latest manifest hash, which the apps can show).
 - **A new device trusts its first sync,** and a user who hasn't verified anyone trusts the directory on first use. Invites and fingerprints close the second gap. Roster checkpoints in the keyring stop a server from showing a new device a vault from before a removal, unless it also serves that device an old keyring, which nothing on a brand-new device can detect. Agents keep no state, so they are always in this position.
 - **Metadata** (usernames, memberships, sizes, timing) is visible to the server. Items, messages and the keyring are padded to 256-byte steps; attachments are not, so their sizes are exact.
-- **Manifest history** is kept in full so any device can verify the chain from where it left off. Signed checkpoints can trim it if it ever gets large.
+- **Manifest history** is kept in full so any device can verify the chain from where it left off. Signed checkpoints can trim it if it ever gets large. A pull returns every manifest since the device's last one in one response, so a device that was away while a vault had many large pushes can exceed the client's response cap; pulls need paging before that happens.

@@ -163,7 +163,7 @@ pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup
 
 /// `host` is `crypto::server_host` of the address the client connects to.
 pub fn login_request(d: &Derived, ts_ms: u64, device: &str, host: &str) -> LoginRequest {
-    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms, host).to_vec()), device: device.into() }
+    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms, host).to_vec()), device: device.into(), ttl: None }
 }
 
 /// Decrypt the Account Key and keyring. Fails on a wrong password or Secret Key.
@@ -186,6 +186,12 @@ pub fn change_password(old: &Derived, account: &Account, sk: &SecretKey, new_pas
     let msg = password_change_message(&account.id, ts_ms, &auth_key, &account_key);
     use ed25519_dalek::Signer;
     PasswordChange { ts: ts_ms, auth_key: B64(auth_key), account_key: B64(account_key), sig: B64(old.auth.sign(&msg).to_bytes().to_vec()) }
+}
+
+/// Proof for `DELETE /v1/account` that whoever asks knows the password (or agent key).
+pub fn delete_account(d: &Derived, ts_ms: u64, host: &str) -> AccountDelete {
+    use ed25519_dalek::Signer;
+    AccountDelete { ts: ts_ms, sig: B64(d.auth.sign(&account_delete_message(&d.account_id, ts_ms, host)).to_bytes().to_vec()) }
 }
 
 // ---------- Messages: items shared with one user, agent access requests ----------

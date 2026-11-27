@@ -295,6 +295,8 @@ enum AccountCmd {
     Use { account: String },
     /// Sign out and forget this account's Secret Key on this computer
     Remove { account: String },
+    /// Delete the account you're signed in to from its server, for good
+    Delete,
 }
 
 #[derive(Subcommand)]
@@ -767,8 +769,13 @@ fn run(cli: Cli) -> Res<()> {
             let data = std::fs::read(&file)?;
             let name = std::path::Path::new(&file).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
             let f = s.upload_file(&vid, &name, &data)?;
+            let fid = f.id;
             it.files.push(f);
-            s.put_item(&vid, id, it)?;
+            if let Err(e) = s.put_item(&vid, id, it) {
+                // Don't leave a file behind that no item lists.
+                let _ = s.delete_file(&vid, &fid);
+                return Err(e.into());
+            }
             state::save(&s)?;
             say!("Attached {name}.");
         }
@@ -867,6 +874,25 @@ fn account_cmd(a: AccountCmd) -> Res<()> {
             let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
             state::remove_account(&c)?;
             say!("Signed out of {} and forgot its Secret Key on this computer. Your data on the server is untouched.", c.name());
+        }
+        AccountCmd::Delete => {
+            let mut s = state::open()?;
+            let cfg = state::load_config()?;
+            let sk = state::secret_key(&cfg)?;
+            println!("This deletes {} for good, with its agents, inbox and share links, and every vault nobody else uses.", cfg.name());
+            println!("Vaults you share stay with the other members. Nobody can undo this or recover the data.");
+            let pw = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+            print!("Type your username ({}) to confirm: ", s.username());
+            std::io::stdout().flush()?;
+            let mut typed = String::new();
+            std::io::stdin().read_line(&mut typed)?;
+            if typed.trim() != s.username() {
+                return Err("that's not your username; nothing was deleted".into());
+            }
+            s.delete_account(&plaintext_client::plaintext_core::crypto::derive(&pw, &sk))?;
+            let _ = std::fs::remove_dir_all(state::snapshot_dir(&s));
+            state::remove_account(&cfg)?;
+            println!("Deleted {} and forgot it on this computer.", cfg.name());
         }
     }
     Ok(())

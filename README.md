@@ -8,16 +8,19 @@ Site: https://getplaintext.org. Status: the protocol, server, command line and M
 
 ```sh
 docker build -t plaintext .
-docker run -d --name plaintext -v plaintext:/data -p 8080:8080 plaintext
+docker run -d --name plaintext -v plaintext:/data -p 8080:8080 \
+  -e PLAINTEXT_URL=https://vault.example.com -e PLAINTEXT_SETUP_CODE=pick-a-random-string plaintext
 ```
 
-Put it behind HTTPS at any address you like: your own domain, a LAN address or a Tailscale name. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). Settings, all optional:
+Put it behind HTTPS at any address you like: your own domain, a LAN address or a Tailscale name, and set `PLAINTEXT_URL` to that address. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). Settings:
 
 | Variable | |
 |---|---|
 | `PLAINTEXT_SETUP_CODE` | On a server reachable from the internet, set it to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account. |
-| `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Set it whenever the server's port is reachable without going through your proxy. |
-| `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, and nobody but admins can list everyone. |
+| `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Without it, only `localhost` can sign in. |
+| `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, nobody but admins can list everyone, and each address gets at most 10 signups and 30 failed logins an hour. Needs `PLAINTEXT_SETUP_CODE` too. |
+| `PLAINTEXT_TRUST_PROXY=1` | The server sits behind one reverse proxy that sets `X-Forwarded-For`, so rate limits count the address the proxy saw rather than the proxy's own. Leave it unset if clients can reach the server directly, or they could pick their own address. |
+| `PLAINTEXT_QUOTA_MB` | How much each account may store: items and attachments in the vaults it created, and the share links and messages it and its agents sent. Writes past it are refused, while reading and deleting keep working. Unset means unlimited. |
 | `PLAINTEXT_ADDR`, `PLAINTEXT_DB` | Listen address (`0.0.0.0:8080`) and database path (`plaintext.db`). |
 
 Share links open on a static page at getplaintext.org that decrypts in the browser; your server never sees the key. To use your own domain for that too, host a copy of `docs/s/` anywhere except the vault server itself and set `PLAINTEXT_LINK_PAGE=https://your.page/s/`. Keep the trailing `/`, since the page loads its files from next to itself.
@@ -46,7 +49,7 @@ plaintext vault create Family && plaintext vault share Family bob --role writer
 plaintext import 1pux ~/Downloads/export.1pux    # also: bitwarden, csv
 ```
 
-You can have accounts on several servers, such as your family's and a work one. Each `signup` or `signin` adds an account and makes it the default. `plaintext account ls` lists them, `plaintext account use NAME` switches, and `--account alice@vault.example.com` (or `PLAINTEXT_ACCOUNT`) picks one for a single command.
+You can have accounts on several servers, such as your family's and a work one. Each `signup` or `signin` adds an account and makes it the default. `plaintext account ls` lists them, `plaintext account use NAME` switches, and `--account alice@vault.example.com` (or `PLAINTEXT_ACCOUNT`) picks one for a single command. `plaintext account delete` deletes the account from its server for good, after asking for your password and username; vaults you share stay with the others.
 
 Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
 

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS messages(
   expires INTEGER,
   created INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_to ON messages(to_user);
+CREATE INDEX IF NOT EXISTS messages_expires ON messages(expires);
 
 CREATE TABLE IF NOT EXISTS links(
   id BLOB PRIMARY KEY,
@@ -97,6 +98,8 @@ CREATE TABLE IF NOT EXISTS links(
   blob BLOB NOT NULL,
   expires INTEGER NOT NULL,
   views_left INTEGER);
+CREATE INDEX IF NOT EXISTS links_expires ON links(expires);
+CREATE INDEX IF NOT EXISTS links_creator ON links(creator);
 
 CREATE TABLE IF NOT EXISTS audit(
   vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,

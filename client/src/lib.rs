@@ -25,6 +25,8 @@ pub enum Error {
     Server(u16, String),
     Network(String),
     NotFound(String),
+    /// The client won't do it; the message says why.
+    Refused(String),
 }
 
 impl std::fmt::Display for Error {
@@ -34,6 +36,7 @@ impl std::fmt::Display for Error {
             Error::Server(code, msg) => write!(f, "server said {code}: {}", msg.chars().take(300).collect::<String>()),
             Error::Network(e) => write!(f, "couldn't reach the server: {e}"),
             Error::NotFound(what) => write!(f, "{what} not found"),
+            Error::Refused(why) => f.write_str(why),
         }
     }
 }
@@ -166,6 +169,8 @@ pub struct Session<T: Transport> {
     /// Vaults the server stopped listing. Their verified state is kept, so if
     /// they come back the server can't hand us an older copy as if new.
     pub hidden: BTreeMap<Hex, Vault>,
+    /// Per vault, members whose accounts the server says were deleted.
+    gone: BTreeMap<Hex, Vec<String>>,
     /// What the last `sync` couldn't do, for the user to see: vaults that didn't
     /// verify (kept as last verified, or left out if never verified) and invite
     /// conflicts. One bad vault doesn't stop the rest from syncing.
@@ -237,6 +242,7 @@ impl<T: Transport> Session<T> {
             admin: acct.admin,
             vaults: BTreeMap::new(),
             hidden: BTreeMap::new(),
+            gone: BTreeMap::new(),
             problems: Vec::new(),
         })
     }
@@ -246,7 +252,7 @@ impl<T: Transport> Session<T> {
     pub fn resume(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&token), NONE)?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), problems: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
     }
 
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -271,11 +277,16 @@ impl<T: Transport> Session<T> {
             self.hidden.insert(id, v);
         }
         self.problems.clear();
+        // A vault whose account is out of storage keeps its unpushed changes and
+        // reports the error at the end, without holding up the other vaults. So does
+        // a member removal another device raced, or one too big to send; the next sync retries.
+        let mut full = None;
         for id in &acct.vaults {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
-            match self.sync_vault(id).and_then(|_| self.revoke_expired(id)) {
+            match self.sync_vault(id).and_then(|_| self.remove_members(id, None)) {
                 Ok(()) => {}
+                Err(e @ Error::Server(409 | 413, _)) => full = Some(e),
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
@@ -299,7 +310,8 @@ impl<T: Transport> Session<T> {
                 ));
             }
         }
-        self.save_keyring()
+        self.save_keyring()?;
+        full.map_or(Ok(()), Err)
     }
 
     fn pull(&mut self, id: &Hex) -> Result<()> {
@@ -307,6 +319,7 @@ impl<T: Transport> Session<T> {
         let resp: VaultResponse = self.call("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE)?;
         let v = self.vaults.get_mut(id).expect("checked above");
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
+        self.gone.insert(*id, resp.gone);
         Ok(())
     }
 
@@ -332,25 +345,31 @@ impl<T: Transport> Session<T> {
         Err(Error::Server(409, "the vault kept changing; try again".into()))
     }
 
-    /// Members whose access expired get removed for real (new vault key) by
-    /// whichever owner's device notices first.
-    fn revoke_expired(&mut self, id: &Hex) -> Result<()> {
+    /// Removes `who` (if given) with a new vault key. Members whose access expired,
+    /// or whose accounts were deleted, go in the same roster version (the server
+    /// refuses a roster naming a deleted account); without `who` that happens only
+    /// on an owner's device with nothing unpushed, whichever notices first.
+    fn remove_members(&mut self, id: &Hex, who: Option<&str>) -> Result<()> {
         let me = self.username().to_string();
         let Some(v) = self.vaults.get(id) else { return Ok(()) };
-        if v.role(&me, now()) != Some(Role::Owner) || v.has_changes() {
+        if who.is_none() && (v.role(&me, now()) != Some(Role::Owner) || v.has_changes()) {
             return Ok(());
         }
-        let expired: Vec<String> = v
+        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut out: Vec<&str> = v
             .roster
             .iter()
             .flat_map(|r| &r.members)
-            .filter(|m| m.expires.is_some_and(|e| now() >= e))
-            .map(|m| m.username.clone())
+            .filter(|m| m.username != me && (m.expires.is_some_and(|e| now() >= e) || gone.contains(&m.username)))
+            .map(|m| m.username.as_str())
             .collect();
-        for name in expired {
-            self.revoke(id, &name)?;
+        out.extend(who.filter(|w| !out.contains(w)));
+        if out.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let update = v.revoke(&self.me(), &out, now())?;
+        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
+        self.pull(id)
     }
 
     /// Fold in this device's own copy of the keyring (saved after the last run):
@@ -477,6 +496,48 @@ impl<T: Transport> Session<T> {
         self.call("POST", "/v1/account/password", Some(&pc))
     }
 
+    /// Delete this account for good, with its agents, inbox and share links.
+    /// Vaults nobody else uses are deleted; shared ones stay with the others,
+    /// whose owners' devices replace the key. Needs the password again (`d`):
+    /// the session token alone can't delete an account. Refused while this
+    /// account is the only owner of a vault others use.
+    pub fn delete_account(&mut self, d: &Derived) -> Result<()> {
+        match self.sync() {
+            Ok(()) | Err(Error::Server(413, _)) => {}
+            Err(e) => return Err(e),
+        }
+        let me = self.username().to_string();
+        let mut blocking = Vec::new();
+        for v in self.vaults.values() {
+            let Some(r) = &v.roster else { continue };
+            if v.role(&me, now()) != Some(Role::Owner) {
+                continue;
+            }
+            // Who keeps the vault, as the server counts them: current members other
+            // than us, our agents, and disabled or deleted accounts.
+            let gone = self.gone.get(&v.id).map(Vec::as_slice).unwrap_or_default();
+            let mut keepers = Vec::new();
+            for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
+                match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
+                    Err(Error::Server(404, _)) => {}
+                    Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
+                    Ok(_) => keepers.push(m.role),
+                    Err(e) => return Err(e),
+                }
+            }
+            if !keepers.is_empty() && !keepers.contains(&Role::Owner) {
+                blocking.push(v.meta.name.clone());
+            }
+        }
+        if !blocking.is_empty() {
+            return Err(Error::Refused(format!(
+                "you're the only owner of {}, which others use: make one of them an owner, or remove them, first",
+                blocking.join(", ")
+            )));
+        }
+        self.call("DELETE", "/v1/account", Some(&plaintext_core::delete_account(d, now_ms(), &self.t.host())))
+    }
+
     pub fn logout(&self) -> Result<()> {
         self.call("POST", "/v1/logout", NONE)
     }
@@ -502,6 +563,7 @@ impl<T: Transport> Session<T> {
             self.pin_user(username)?;
         }
         self.sync_vault(id)?;
+        self.remove_members(id, None)?;
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
         self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
@@ -514,10 +576,8 @@ impl<T: Transport> Session<T> {
     /// Remove someone and replace the vault key.
     pub fn revoke(&mut self, id: &Hex, username: &str) -> Result<()> {
         self.sync_vault(id)?;
-        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        let update = v.revoke(&self.me(), username, now())?;
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
-        self.pull(id)?;
+        self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        self.remove_members(id, Some(username))?;
         self.save_keyring()
     }
 
@@ -596,9 +656,19 @@ impl<T: Transport> Session<T> {
         self.sync_vault(vault)
     }
 
+    /// Delete an item and push. Its attachments are deleted too unless another item
+    /// in the vault refers to them.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.delete(id);
-        self.sync_vault(vault)
+        let v = self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?;
+        let files = v.get(&id).map(file_ids).unwrap_or_default();
+        v.delete(id);
+        self.sync_vault(vault)?;
+        let v = self.vaults.get(vault).ok_or(Error::NotFound("vault".into()))?;
+        let kept: Vec<Hex> = v.items().flat_map(|(_, i)| file_ids(i)).collect();
+        for f in files.iter().filter(|f| !kept.contains(f)) {
+            self.delete_file(vault, f)?;
+        }
+        Ok(())
     }
 
     // ---------- Files ----------
@@ -615,6 +685,11 @@ impl<T: Transport> Session<T> {
             key: B64(key.to_vec()),
             hash: B64(plaintext_core::crypto::sha256(&blob).to_vec()),
         })
+    }
+
+    /// Delete an uploaded file from the server (items that list it can no longer fetch it).
+    pub fn delete_file(&self, vault: &Hex, id: &Hex) -> Result<()> {
+        self.call("DELETE", &format!("/v1/vaults/{vault}/files/{id}"), NONE)
     }
 
     pub fn download_file(&self, vault: &Hex, f: &FileRef) -> Result<Vec<u8>> {
@@ -663,6 +738,13 @@ impl<T: Transport> Session<T> {
         self.call::<()>("POST", "/v1/links", Some(&link))?;
         Ok(format!("{}#{}/{}/{}", page.split('#').next().unwrap_or_default(), server.trim_end_matches('/'), link.id, fragment))
     }
+}
+
+/// The files an item refers to, in its current fields and its earlier versions.
+fn file_ids(item: &Item) -> Vec<Hex> {
+    let earlier = item.history.iter().flat_map(|h| h.get("files").and_then(|f| f.as_array()).into_iter().flatten());
+    let earlier = earlier.filter_map(|f| f.get("id")?.as_str()?.parse().ok());
+    item.files.iter().map(|f| f.id).chain(earlier).collect()
 }
 
 fn zeroize_key(raw: &[u8]) -> Option<plaintext_core::crypto::Key> {

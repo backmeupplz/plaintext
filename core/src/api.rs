@@ -174,6 +174,10 @@ pub struct VaultResponse {
     pub key: Option<B64>,
     /// Items written after `since` (all items when the epoch changed since then).
     pub items: Vec<ItemBlob>,
+    /// Members of the current roster whose accounts were deleted. The server no
+    /// longer serves them; an owner's device removes them for real (new key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gone: Vec<String>,
 }
 
 /// `PUT /v1/vaults/{id}`: applied only if the server is still at `expected_counter`.
@@ -221,6 +225,9 @@ pub struct LoginRequest {
     pub ts: u64,
     pub sig: B64,
     pub device: String,
+    /// Seconds the session should last, at most the server's limit (30 days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -236,6 +243,12 @@ pub struct AccountResponse {
     pub keyring: B64,
     pub keyring_counter: u64,
     pub vaults: Vec<Hex>,
+    /// Storage this account may use, in bytes (`None`: unlimited).
+    #[serde(default)]
+    pub quota: Option<u64>,
+    /// Bytes of items and files in the vaults this account created.
+    #[serde(default)]
+    pub usage: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -250,6 +263,13 @@ pub struct PasswordChange {
     pub auth_key: B64,
     pub account_key: B64,
     /// Signed by the current login key over `password_change_message`.
+    pub sig: B64,
+}
+
+/// `DELETE /v1/account`, signed by the login key over `account_delete_message`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AccountDelete {
+    pub ts: u64,
     pub sig: B64,
 }
 

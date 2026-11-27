@@ -3,17 +3,20 @@
 //! Every rule here is also checked by the clients; the server's checks only stop
 //! honest-but-buggy or unauthorized callers, never the server itself.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::handler::Handler;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use plaintext_core::api::*;
-use plaintext_core::crypto::{login_message, password_change_message, server_host, sha256, verify};
+use plaintext_core::crypto::{account_delete_message, login_message, password_change_message, server_host, sha256, verify};
 use plaintext_core::identity::valid_username;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Deserialize;
@@ -23,11 +26,33 @@ use serde::de::DeserializeOwned;
 // near SQLite's single-writer limit. Pool readers if that ever changes.
 type Db = Arc<Mutex<Connection>>;
 
+/// A panic while holding a lock leaves the data as it was (SQLite rolls back the
+/// open transaction when it drops), so later requests carry on rather than fail.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 type R<T> = Result<T, (StatusCode, &'static str)>;
 
 const MAX_BLOB: usize = 1 << 20;
 const MAX_FILE: usize = 64 << 20;
 const LOGIN_SKEW_MS: u64 = 120_000;
+/// The longest a session lasts, in seconds; a login may ask for less.
+const SESSION_TTL: u64 = 30 * 86400;
+/// A manifest lists every item (~90 bytes each), so it gets more room than an item.
+const MAX_MANIFEST: usize = 16 * MAX_BLOB;
+const MAX_MEMBERS: usize = 1000;
+/// Largest inbox response; the rest waits until these are deleted.
+const INBOX_BYTES: usize = 32 << 20;
+
+/// Request body limits. Most requests are small; the larger ones need a session,
+/// which is checked before the body is read.
+const SMALL_BODY: usize = 64 << 10;
+/// A blob up to MAX_BLOB, base64 (twice inside a signed message), with room for the JSON.
+const BLOB_BODY: usize = 2 << 20;
+// ponytail: a vault push, including the re-seal of every item when a member is
+// removed, is one request; past this a vault can't change key. Split rotations if vaults get that big.
+const VAULT_BODY: usize = 32 << 20;
 
 const BAD: StatusCode = StatusCode::BAD_REQUEST;
 const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
@@ -35,7 +60,58 @@ const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
     c.execute_batch(include_str!("schema.sql"))?;
+    // Who a vault's storage counts against. Added after v1 shipped, so every
+    // database (new ones too) gets it here: roster v0's signer if still a current
+    // member, otherwise one, owners first (as when the creator's account is deleted).
+    if !has_col(&c, "vaults", "creator")? {
+        c.execute_batch(
+            "BEGIN;
+             ALTER TABLE vaults ADD COLUMN creator TEXT;
+             UPDATE vaults SET creator = (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
+               WHERE m.vault_id = vaults.id AND (m.expires IS NULL OR m.expires > unixepoch()) AND a.disabled = 0
+               ORDER BY m.username = (SELECT json_extract(signed, '$.signer') FROM rosters r WHERE r.vault_id = m.vault_id AND r.version = 0) DESC,
+                        m.role = 'owner' DESC, m.username LIMIT 1);
+             CREATE INDEX vaults_creator ON vaults(creator);
+             COMMIT;",
+        )?;
+    }
+    // Sessions end on the server too. Existing ones get the full term from now.
+    if !has_col(&c, "sessions", "expires")? {
+        c.execute_batch(&format!(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN expires INTEGER NOT NULL DEFAULT 0;
+             UPDATE sessions SET expires = unixepoch() + {SESSION_TTL};
+             CREATE INDEX sessions_expires ON sessions(expires);
+             COMMIT;"
+        ))?;
+    }
+    // Messages count against their sender's quota.
+    if !has_col(&c, "messages", "sender")? {
+        c.execute_batch(
+            "BEGIN;
+             ALTER TABLE messages ADD COLUMN sender TEXT;
+             UPDATE messages SET sender = json_extract(signed, '$.signer');
+             CREATE INDEX messages_sender ON messages(sender);
+             COMMIT;",
+        )?;
+    }
+    // A disabled person's agents are disabled with them (databases from before that rule).
+    c.execute("UPDATE accounts SET disabled = 1 WHERE disabled = 0 AND owner IN (SELECT username FROM accounts WHERE disabled = 1)", [])?;
     Ok(c)
+}
+
+fn has_col(c: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    c.query_row("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2", [table, col], |r| r.get(0))
+}
+
+/// Deletes expired links, messages and sessions. Requests skip expired rows
+/// themselves, so this only keeps the tables small.
+fn cleanup(db: &Connection) -> rusqlite::Result<()> {
+    let t = now();
+    db.execute("DELETE FROM links WHERE expires <= ?", [t])?;
+    db.execute("DELETE FROM messages WHERE expires <= ?", [t])?;
+    db.execute("DELETE FROM sessions WHERE expires <= ?", [t])?;
+    Ok(())
 }
 
 /// Writes a consistent copy of the database at `db_path` to `<dir>/backup/<name>`,
@@ -79,17 +155,40 @@ pub struct Config {
     /// signed for any other host are refused. Empty: the request's Host header,
     /// which is weaker if the port is also reachable directly.
     pub hosts: Vec<String>,
+    /// Bytes of items and files each account may keep in the vaults it created.
+    /// `None`: unlimited (the self-hosting default).
+    pub quota: Option<u64>,
+    /// Behind a reverse proxy: rate-limit by the last `X-Forwarded-For` address
+    /// (the one the proxy added) instead of the connection's.
+    pub trust_proxy: bool,
 }
 
-pub fn app(db: Connection, cfg: Config) -> Router {
+/// Serve `app` with each connection's address, which the rate limits need.
+pub async fn serve(listener: tokio::net::TcpListener, db: Connection, cfg: Config) -> std::io::Result<()> {
+    axum::serve(listener, app(db, cfg).into_make_service_with_connect_info::<SocketAddr>()).await
+}
+
+fn app(db: Connection, cfg: Config) -> Router {
     let db: Db = Arc::new(Mutex::new(db));
+    let weak = Arc::downgrade(&db);
+    std::thread::spawn(move || {
+        while let Some(db) = weak.upgrade() {
+            if let Err(e) = cleanup(&lock(&db)) {
+                eprintln!("cleanup failed: {e}");
+            }
+            drop(db);
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        }
+    });
+    let limits = axum::middleware::from_fn(rate_limit);
+    let big = |n: usize| (axum::middleware::from_fn_with_state(db.clone(), signed_in), DefaultBodyLimit::max(n));
     Router::new()
-        .route("/v1/signup", post(signup))
+        .route("/v1/signup", post(signup).layer(limits.clone()))
         .route("/v1/agents", post(create_agent))
-        .route("/v1/login", post(login))
+        .route("/v1/login", post(login).layer(limits))
         .route("/v1/logout", post(logout))
-        .route("/v1/account", get(account))
-        .route("/v1/account/keyring", put(put_keyring))
+        .route("/v1/account", get(account).delete(delete_account))
+        .route("/v1/account/keyring", put(put_keyring.layer(big(BLOB_BODY))))
         .route("/v1/account/password", post(change_password))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", axum::routing::delete(end_session))
@@ -98,19 +197,146 @@ pub fn app(db: Connection, cfg: Config) -> Router {
         .route("/v1/users/{name}", get(user))
         .route("/v1/users/{name}/disable", post(disable_user))
         .route("/v1/invites", post(create_invite))
-        .route("/v1/vaults", post(create_vault))
-        .route("/v1/vaults/{id}", get(get_vault).put(put_vault))
-        .route("/v1/vaults/{id}/roster", post(update_roster))
+        .route("/v1/vaults", post(create_vault.layer(big(VAULT_BODY))))
+        .route("/v1/vaults/{id}", get(get_vault).put(put_vault.layer(big(VAULT_BODY))))
+        .route("/v1/vaults/{id}/roster", post(update_roster.layer(big(VAULT_BODY))))
         .route("/v1/vaults/{id}/audit", get(audit))
-        .route("/v1/vaults/{id}/files/{fid}", get(get_file).put(put_file).delete(delete_file))
-        .route("/v1/messages", get(inbox).post(send_message))
+        .route("/v1/vaults/{id}/files/{fid}", get(get_file).put(put_file.layer(big(MAX_FILE))).delete(delete_file))
+        .route("/v1/messages", get(inbox).post(send_message.layer(big(BLOB_BODY))))
         .route("/v1/messages/{id}", axum::routing::delete(delete_message))
-        .route("/v1/links", post(create_link))
-        .route("/v1/links/{id}", get(open_link).delete(delete_link))
+        .route("/v1/links", post(create_link.layer(big(BLOB_BODY))))
+        // HEAD would otherwise run the GET handler and use up a view.
+        .route("/v1/links/{id}", get(open_link).head(|| async { StatusCode::METHOD_NOT_ALLOWED }).delete(delete_link))
         .route("/health", get(|| async { "ok" }))
-        .layer(DefaultBodyLimit::max(MAX_FILE + (1 << 20)))
+        .layer(DefaultBodyLimit::max(SMALL_BODY))
+        .layer(axum::middleware::map_response(|mut r: Response| async {
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }))
         .layer(axum::Extension(cfg))
+        .layer(axum::Extension(Arc::new(Limiter::default())))
         .with_state(db)
+}
+
+/// Refuses a request without a valid session before its body is read.
+async fn signed_in(State(db): State<Db>, req: Request, next: axum::middleware::Next) -> Response {
+    if let Err(e) = caller(&lock(&db), req.headers()) {
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
+// ---------- Rate limits ----------
+
+/// Signups, and failed logins, per client address and hour on open servers.
+const SIGNUPS_PER_HOUR: u32 = 10;
+const FAILED_LOGINS_PER_HOUR: u32 = 30;
+
+/// Addresses tracked per hour; past this, new addresses are refused until the hour ends.
+const LIMITER_KEYS: usize = 100_000;
+
+// ponytail: in-memory windows per clock hour, so they reset on restart and aren't
+// shared between processes. Move to SQLite or the proxy if the server ever runs as several.
+#[derive(Default)]
+struct Limiter(Mutex<(u64, HashMap<LimitKey, u32>)>);
+
+/// A client address, and whether it's signing up (or else logging in).
+type LimitKey = (IpAddr, bool);
+
+impl Limiter {
+    /// Takes one attempt for `key` if it has any left this hour.
+    fn take(&self, key: LimitKey, max: u32) -> bool {
+        let mut guard = lock(&self.0);
+        let (hour, map) = &mut *guard;
+        if *hour != now() / 3600 {
+            *hour = now() / 3600;
+            map.clear();
+        }
+        // A full table refuses new signups but lets logins through, so nobody can
+        // lock everyone out by filling it (a login needs the Secret Key anyway).
+        if map.len() >= LIMITER_KEYS && !map.contains_key(&key) {
+            return !key.1;
+        }
+        let n = map.entry(key).or_insert(0);
+        if *n >= max {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn give_back(&self, key: LimitKey) {
+        if let Some(n) = lock(&self.0).1.get_mut(&key) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+/// The hosts logins and account deletions must be signed for.
+fn own_hosts(cfg: &Config, h: &HeaderMap) -> R<Vec<String>> {
+    if !cfg.hosts.is_empty() {
+        return Ok(cfg.hosts.clone());
+    }
+    // Without PLAINTEXT_URL the Host header is all we have, and a look-alike
+    // server relaying a login sets it to anything. Only this machine can be trusted.
+    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).map(server_host).filter(|h| loopback(h));
+    Ok(vec![host.ok_or((StatusCode::FORBIDDEN, "this server doesn't know its own address: its operator needs to set PLAINTEXT_URL"))?])
+}
+
+/// `localhost`, a loopback IPv4 address or `[::1]`, optionally with a port, and nothing else.
+fn loopback(host: &str) -> bool {
+    let (name, rest) = match host.strip_prefix('[') {
+        Some(r) => r.split_once(']').unwrap_or(("", "")),
+        None => host.find(':').map_or((host, ""), |i| host.split_at(i)),
+    };
+    let port_ok = rest.is_empty() || rest.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name == "localhost" || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+}
+
+/// The address to rate-limit by. IPv6 counts per /64, since one host usually has the whole block.
+fn client_ip(cfg: &Config, h: &HeaderMap, peer: IpAddr) -> IpAddr {
+    // Proxies append to the header or add another one; either way the last entry is theirs.
+    let forwarded = || {
+        let last = h.get_all("x-forwarded-for").iter().next_back()?.to_str().ok()?.rsplit(',').next()?.trim();
+        // Some proxies add a port (`1.2.3.4:5678`, `[::1]:80`) or brackets.
+        last.parse::<SocketAddr>().map(|a| a.ip()).or_else(|_| last.trim_start_matches('[').trim_end_matches(']').parse()).ok()
+    };
+    let ip = if cfg.trust_proxy { forwarded().unwrap_or(peer) } else { peer }.to_canonical();
+    match ip {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        v4 => v4,
+    }
+}
+
+async fn rate_limit(
+    axum::Extension(cfg): axum::Extension<Config>,
+    axum::Extension(limiter): axum::Extension<Arc<Limiter>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !cfg.open_signup {
+        return next.run(req).await;
+    }
+    let signup = req.uri().path() == "/v1/signup";
+    let key = (client_ip(&cfg, req.headers(), peer.ip()), signup);
+    let allowed = limiter.take(key, if signup { SIGNUPS_PER_HOUR } else { FAILED_LOGINS_PER_HOUR });
+    let too_many = || (StatusCode::TOO_MANY_REQUESTS, "too many attempts from your address; try again in an hour").into_response();
+    if signup {
+        return if allowed { next.run(req).await } else { too_many() };
+    }
+    // A correct login always works, even past the limit: others behind the same
+    // address mustn't be able to lock everyone out, and the login key can't be guessed.
+    // Successful logins don't count either: agents sign in on every run.
+    let resp = next.run(req).await;
+    match (resp.status().is_success(), allowed) {
+        (true, true) => {
+            limiter.give_back(key);
+            resp
+        }
+        (false, false) => too_many(),
+        _ => resp,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -153,6 +379,8 @@ struct Caller {
     human: bool,
     admin: bool,
     token_hash: Vec<u8>,
+    /// Whose quota the caller's links and messages count against: an agent's owner.
+    payer: String,
 }
 
 fn caller(db: &Connection, h: &HeaderMap) -> R<Caller> {
@@ -163,10 +391,10 @@ fn caller(db: &Connection, h: &HeaderMap) -> R<Caller> {
         .ok_or((StatusCode::UNAUTHORIZED, "no token"))?;
     let th = sha256(token.as_bytes()).to_vec();
     db.query_row(
-        "SELECT a.id, a.username, a.kind, a.admin FROM sessions s JOIN accounts a ON a.id = s.account_id
-         WHERE s.token_hash = ? AND a.disabled = 0",
-        [&th],
-        |r| Ok(Caller { id: r.get(0)?, username: r.get(1)?, human: r.get::<_, String>(2)? == "human", admin: r.get(3)?, token_hash: th.clone() }),
+        "SELECT a.id, a.username, a.kind, a.admin, COALESCE(a.owner, a.username) FROM sessions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.token_hash = ? AND s.expires > ? AND a.disabled = 0",
+        params![&th, now()],
+        |r| Ok(Caller { id: r.get(0)?, username: r.get(1)?, human: r.get::<_, String>(2)? == "human", admin: r.get(3)?, token_hash: th.clone(), payer: r.get(4)? }),
     )
     .optional()
     .map_err(db_err)?
@@ -184,9 +412,24 @@ fn sign_pk(db: &Connection, username: &str) -> R<Vec<u8>> {
     Ok(parse::<Identity>(&signed)?.sign_pk.0)
 }
 
+/// The largest signed body of each kind: its sealed part in base64, with room
+/// for the rest. Checked before anything is parsed.
+fn max_body(domain: &str) -> usize {
+    match domain {
+        "identity" => 2 << 10,
+        "roster" => 512 << 10,
+        "message" => MAX_BLOB / 3 * 4 + (4 << 10),
+        "manifest" => MAX_MANIFEST / 3 * 4 + (4 << 10),
+        _ => 0,
+    }
+}
+
 fn verify_signed(db: &Connection, s: &Signed, domain: &str, expected_signer: &str) -> R<()> {
     if s.signer != expected_signer {
         return Err((BAD, "signer must be you"));
+    }
+    if s.body.0.len() > max_body(domain) {
+        return Err((BAD, "document too large"));
     }
     verify(&sign_pk(db, &s.signer)?, domain, &s.body.0, &s.sig.0).map_err(|_| (BAD, "bad signature"))
 }
@@ -223,6 +466,9 @@ fn audit_log(db: &Connection, vault: &[u8], who: &str, action: &str) -> R<()> {
 fn insert_account(tx: &Transaction, req: &SignupRequest, kind: Kind, owner: Option<&str>, admin: bool) -> R<Identity> {
     check_blob(&req.account_key)?;
     check_blob(&req.keyring)?;
+    if req.identity.body.0.len() > max_body("identity") {
+        return Err((BAD, "document too large"));
+    }
     let auth: [u8; 32] = req.auth_key.0.as_slice().try_into().map_err(|_| (BAD, "auth key"))?;
     ed25519_dalek::VerifyingKey::from_bytes(&auth).map_err(|_| (BAD, "auth key"))?;
     let id: Identity = parse(&req.identity)?;
@@ -258,13 +504,13 @@ fn insert_account(tx: &Transaction, req: &SignupRequest, kind: Kind, owner: Opti
 }
 
 async fn info(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>) -> R<Json<ServerInfo>> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let empty = db.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).map_err(db_err)? == 0;
     Ok(Json(ServerInfo { version: env!("CARGO_PKG_VERSION").into(), open: cfg.open_signup, setup: empty && cfg.setup_code.is_some() }))
 }
 
 async fn signup(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, Json(req): Json<SignupRequest>) -> R<StatusCode> {
-    let mut db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let tx = db.transaction().map_err(db_err)?;
     let first = tx.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).map_err(db_err)? == 0;
     if first && let Some(code) = &cfg.setup_code {
@@ -290,7 +536,7 @@ async fn signup(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Conf
 }
 
 async fn create_agent(State(db): State<Db>, h: HeaderMap, Json(req): Json<SignupRequest>) -> R<StatusCode> {
-    let mut db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
     if !c.human || req.vault.is_some() || req.invite.is_some() {
         return Err(DENIED);
@@ -306,7 +552,7 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
     if req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS || req.device.len() > 200 {
         return Err(denied);
     }
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let (auth, last): (Vec<u8>, u64) = db
         .query_row("SELECT auth_key, last_login FROM accounts WHERE id = ? AND disabled = 0", [&req.account_id.0[..]], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -317,8 +563,7 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
     let key = ed25519_dalek::VerifyingKey::from_bytes(&auth.try_into().map_err(|_| denied)?).map_err(|_| denied)?;
     let sig = ed25519_dalek::Signature::from_slice(&req.sig.0).map_err(|_| denied)?;
     // Strictly newer timestamps only: a captured login can't be replayed.
-    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).map(server_host);
-    let hosts = if cfg.hosts.is_empty() { host.into_iter().collect() } else { cfg.hosts.clone() };
+    let hosts = own_hosts(&cfg, &h)?;
     if req.ts <= last || !hosts.iter().any(|host| key.verify_strict(&login_message(&req.account_id.0, req.ts, host), &sig).is_ok()) {
         return Err(denied);
     }
@@ -327,22 +572,22 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
     let token = hex::encode(raw);
     db.execute("UPDATE accounts SET last_login = ? WHERE id = ?", params![req.ts, &req.account_id.0[..]]).map_err(db_err)?;
     db.execute(
-        "INSERT INTO sessions(token_hash, account_id, device, created) VALUES(?,?,?,?)",
-        params![&sha256(token.as_bytes())[..], &req.account_id.0[..], req.device, now()],
+        "INSERT INTO sessions(token_hash, account_id, device, created, expires) VALUES(?,?,?,?,?)",
+        params![&sha256(token.as_bytes())[..], &req.account_id.0[..], req.device, now(), now() + req.ttl.unwrap_or(SESSION_TTL).min(SESSION_TTL)],
     )
     .map_err(db_err)?;
     Ok(Json(LoginResponse { token }))
 }
 
 async fn logout(State(db): State<Db>, h: HeaderMap) -> R<StatusCode> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     db.execute("DELETE FROM sessions WHERE token_hash = ?", [&c.token_hash]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn account(State(db): State<Db>, h: HeaderMap) -> R<Json<AccountResponse>> {
-    let db = db.lock().expect("db lock");
+async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap) -> R<Json<AccountResponse>> {
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let (account_key, keyring, keyring_counter) = db
         .query_row("SELECT account_key, keyring, keyring_counter FROM accounts WHERE id = ?", [&c.id], |r| {
@@ -357,12 +602,22 @@ async fn account(State(db): State<Db>, h: HeaderMap) -> R<Json<AccountResponse>>
         .map_err(db_err)?
         .filter_map(|v| v.ok()?.try_into().ok().map(Hex))
         .collect();
-    Ok(Json(AccountResponse { username: c.username, admin: c.admin, account_key: B64(account_key), keyring: B64(keyring), keyring_counter, vaults }))
+    let usage = usage(&db, Some(&c.username))?;
+    Ok(Json(AccountResponse {
+        username: c.username,
+        admin: c.admin,
+        account_key: B64(account_key),
+        keyring: B64(keyring),
+        keyring_counter,
+        vaults,
+        quota: cfg.quota,
+        usage,
+    }))
 }
 
 async fn put_keyring(State(db): State<Db>, h: HeaderMap, Json(req): Json<KeyringPut>) -> R<StatusCode> {
     check_blob(&req.keyring)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let n = db
         .execute(
@@ -378,7 +633,7 @@ async fn put_keyring(State(db): State<Db>, h: HeaderMap, Json(req): Json<Keyring
 
 async fn change_password(State(db): State<Db>, h: HeaderMap, Json(req): Json<PasswordChange>) -> R<StatusCode> {
     check_blob(&req.account_key)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let auth: Vec<u8> = db.query_row("SELECT auth_key FROM accounts WHERE id = ?", [&c.id], |r| r.get(0)).map_err(db_err)?;
     let id: [u8; 16] = c.id.as_slice().try_into().map_err(db_err)?;
@@ -396,8 +651,105 @@ async fn change_password(State(db): State<Db>, h: HeaderMap, Json(req): Json<Pas
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `col` names the account being deleted or one of its agents (`?1` is its username).
+fn in_set(col: &str) -> String {
+    format!("({col} = ?1 OR {col} IN (SELECT username FROM accounts WHERE owner = ?1))")
+}
+
+/// Deletes the caller's account and its agents. Their vaults that nobody else
+/// uses go too; shared vaults stop serving them, and the remaining owners'
+/// devices replace the key (`gone` in the vault response). Refused while they
+/// are the only owner of a vault others use, or the admin of a server others use.
+async fn delete_account(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Json(req): Json<AccountDelete>,
+) -> R<StatusCode> {
+    let hosts = own_hosts(&cfg, &h)?;
+    let mut db = lock(&db);
+    let c = caller(&db, &h)?;
+    let auth: Vec<u8> = db.query_row("SELECT auth_key FROM accounts WHERE id = ?", [&c.id], |r| r.get(0)).map_err(db_err)?;
+    let id: [u8; 16] = c.id.as_slice().try_into().map_err(db_err)?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&auth.try_into().map_err(db_err)?).map_err(db_err)?;
+    let sig = ed25519_dalek::Signature::from_slice(&req.sig.0).map_err(|_| (BAD, "bad signature"))?;
+    if req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS || !hosts.iter().any(|host| key.verify_strict(&account_delete_message(&id, req.ts, host), &sig).is_ok()) {
+        return Err((StatusCode::UNAUTHORIZED, "re-enter your password"));
+    }
+    let tx = db.transaction().map_err(db_err)?;
+    let others = format!("SELECT COUNT(*) FROM accounts WHERE NOT {}", in_set("username"));
+    if c.admin && tx.query_row(&format!("{others} AND admin = 0"), [&c.username], |r| r.get::<_, i64>(0)).map_err(db_err)? > 0
+        && tx.query_row(&format!("{others} AND admin = 1"), [&c.username], |r| r.get::<_, i64>(0)).map_err(db_err)? == 0
+    {
+        return Err((StatusCode::CONFLICT, "you're this server's admin, and others still use it"));
+    }
+    let vaults: Vec<Vec<u8>> = tx
+        .prepare(&format!("SELECT DISTINCT vault_id FROM members WHERE {}", in_set("username")))
+        .map_err(db_err)?
+        .query_map([&c.username], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    for v in vaults {
+        // Members who keep the vault: current, not disabled, not being deleted.
+        let rest: Vec<(String, String)> = tx
+            .prepare(&format!(
+                "SELECT m.username, m.role FROM members m JOIN accounts a ON a.username = m.username
+                 WHERE m.vault_id = ?2 AND (m.expires IS NULL OR m.expires > ?3) AND a.disabled = 0 AND NOT {}
+                 ORDER BY m.username",
+                in_set("m.username")
+            ))
+            .map_err(db_err)?
+            .query_map(params![c.username, v, now()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
+        if rest.is_empty() {
+            tx.execute("DELETE FROM vaults WHERE id = ?", [&v]).map_err(db_err)?;
+            continue;
+        }
+        let owns: bool = tx
+            .query_row(
+                &format!("SELECT COUNT(*) FROM members WHERE vault_id = ?2 AND role = 'owner' AND (expires IS NULL OR expires > ?3) AND {}", in_set("username")),
+                params![c.username, v, now()],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if owns && !rest.iter().any(|(_, role)| role == "owner") {
+            return Err((StatusCode::CONFLICT, "you're the only owner of a vault others use: make one of them an owner, or remove them, first"));
+        }
+        tx.execute(&format!("DELETE FROM members WHERE vault_id = ?2 AND {}", in_set("username")), params![c.username, v])
+            .map_err(db_err)?;
+        audit_log(&tx, &v, &c.username, "account deleted")?;
+    }
+    // Including keys from vaults they were removed from earlier.
+    tx.execute(&format!("DELETE FROM vault_keys WHERE {}", in_set("username")), [&c.username]).map_err(db_err)?;
+    // Vaults they created that live on count against a remaining member, owners first.
+    tx.execute(
+        &format!(
+            "UPDATE vaults SET creator = (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
+               WHERE m.vault_id = vaults.id AND (m.expires IS NULL OR m.expires > ?2) AND a.disabled = 0
+               ORDER BY m.role = 'owner' DESC, a.owner IS NOT NULL, m.username LIMIT 1)
+             WHERE {}",
+            in_set("creator")
+        ),
+        params![c.username, now()],
+    )
+    .map_err(db_err)?;
+    // Messages they sent stay with the recipients, but no longer count against the username.
+    tx.execute(&format!("UPDATE messages SET sender = NULL WHERE {}", in_set("sender")), [&c.username]).map_err(db_err)?;
+    for (table, col) in [("messages", "to_user"), ("links", "creator"), ("invites", "created_by")] {
+        tx.execute(&format!("DELETE FROM {table} WHERE {}", in_set(col)), [&c.username]).map_err(db_err)?;
+    }
+    tx.execute(&format!("DELETE FROM sessions WHERE account_id IN (SELECT id FROM accounts WHERE {})", in_set("username")), [&c.username])
+        .map_err(db_err)?;
+    tx.execute("DELETE FROM accounts WHERE owner = ?1 OR username = ?1", [&c.username]).map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn sessions(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<DeviceSession>>> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let mut q = db.prepare("SELECT token_hash, device, created FROM sessions WHERE account_id = ? ORDER BY created").map_err(db_err)?;
     let list = q
@@ -412,7 +764,7 @@ async fn sessions(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<DeviceSessio
 }
 
 async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let prefix = hex::decode(&id).map_err(|_| (BAD, "bad id"))?;
     if prefix.len() != 8 {
@@ -427,7 +779,7 @@ const USER_COLS: &str = "SELECT identity, admin, disabled, invite_id, invite_pro
 /// The directory. On an open (hosted) server only admins see everyone; others
 /// see the people who joined with their invites, so their devices can verify them.
 async fn users(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap) -> R<Json<Vec<UserInfo>>> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     let (filter, who) = if cfg.open_signup && !c.admin {
         (" WHERE invite_id IN (SELECT id FROM invites WHERE created_by = ?1)", c.username)
@@ -439,7 +791,7 @@ async fn users(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
 
 /// One person by exact username, on any server.
 async fn user(State(db): State<Db>, h: HeaderMap, Path(name): Path<String>) -> R<Json<UserInfo>> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     caller(&db, &h)?;
     user_rows(&db, &format!("{USER_COLS} WHERE username = ?1"), &name)?.pop().map(Json).ok_or((StatusCode::NOT_FOUND, "no such user"))
 }
@@ -464,7 +816,7 @@ fn user_rows(db: &Connection, sql: &str, arg: &str) -> R<Vec<UserInfo>> {
 }
 
 async fn disable_user(State(db): State<Db>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     // Admins disable anyone but themselves; humans disable the agents they own.
     let owner: Option<Option<String>> =
@@ -473,13 +825,15 @@ async fn disable_user(State(db): State<Db>, h: HeaderMap, Path(name): Path<Strin
     if name == c.username || !(c.admin || owner.as_deref() == Some(c.username.as_str())) {
         return Err(DENIED);
     }
-    db.execute("UPDATE accounts SET disabled = 1 WHERE username = ?", [&name]).map_err(db_err)?;
-    db.execute("DELETE FROM sessions WHERE account_id = (SELECT id FROM accounts WHERE username = ?)", [&name]).map_err(db_err)?;
+    // Their agents go with them: the person still holds the agents' keys.
+    db.execute(&format!("UPDATE accounts SET disabled = 1 WHERE {}", in_set("username")), [&name]).map_err(db_err)?;
+    db.execute(&format!("DELETE FROM sessions WHERE account_id IN (SELECT id FROM accounts WHERE {})", in_set("username")), [&name])
+        .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap, Json(req): Json<NewInvite>) -> R<StatusCode> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     // Anyone may invite on an open server: signup needs no invite there, and an
     // invite still verifies both people.
@@ -496,8 +850,49 @@ async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extensi
 
 // ---------- Vaults ----------
 
+/// Bytes `account` stores: items and files in the vaults it created, and the
+/// share links and messages it and its agents sent.
+fn usage(db: &Connection, account: Option<&str>) -> R<u64> {
+    db.query_row(
+        &format!(
+            "SELECT (SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
+                  + (SELECT COALESCE(SUM(length(blob)), 0) FROM files WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
+                  + (SELECT COALESCE(SUM(length(blob)), 0) FROM links WHERE {})
+                  + (SELECT COALESCE(SUM(octet_length(signed)), 0) FROM messages WHERE {})",
+            in_set("creator"),
+            in_set("sender")
+        ),
+        [account],
+        |r| r.get(0),
+    )
+    .map_err(db_err)
+}
+
+/// Who a vault's storage counts against.
+fn creator(db: &Connection, vault: &[u8]) -> R<Option<String>> {
+    db.query_row("SELECT creator FROM vaults WHERE id = ?", [vault], |r| r.get(0)).map_err(db_err)
+}
+
+/// Runs a write and keeps it only if `account` stays within the quota or the
+/// write doesn't add anything, so deleting and re-sealing always work.
+// ponytail: sums the account's storage on every write; keep a running total if accounts get big.
+fn within_quota<T>(tx: &Transaction, cfg: &Config, account: Option<&str>, write: impl FnOnce() -> R<T>) -> R<T> {
+    let Some(quota) = cfg.quota else { return write() };
+    let before = usage(tx, account)?;
+    let out = write()?;
+    let after = usage(tx, account)?;
+    if after > quota && after > before {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "the account this counts against is out of storage: delete items, files or share links to make room"));
+    }
+    Ok(out)
+}
+
 /// Store a roster version and refresh the members table from it.
 fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()> {
+    let names: std::collections::HashSet<&str> = r.members.iter().map(|m| m.username.as_str()).collect();
+    if r.members.len() > MAX_MEMBERS || names.len() != r.members.len() {
+        return Err((BAD, "a roster lists up to 1000 different members"));
+    }
     for m in &r.members {
         let id: Identity = parse(&serde_json::from_str::<Signed>(
             // Disabled accounts may stay listed (they can't sign in); revoke them to change the key.
@@ -527,12 +922,25 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
         params![r.version, &sha256(&s.body.0)[..], r.epoch, vault],
     )
     .map_err(db_err)?;
+    // A creator who was removed stops paying for the vault: the owner who removed
+    // them does (an agent's owner, if an agent signed).
+    tx.execute(
+        "UPDATE vaults SET creator = (SELECT COALESCE(owner, username) FROM accounts WHERE username = ?1)
+         WHERE id = ?2 AND creator NOT IN (SELECT username FROM members WHERE vault_id = ?2)",
+        params![s.signer, vault],
+    )
+    .map_err(db_err)?;
     Ok(())
 }
 
 fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
+    if keys.len() > MAX_MEMBERS {
+        return Err((BAD, "too many keys"));
+    }
     for k in keys {
-        check_blob(&k.key)?;
+        if k.key.0.is_empty() || k.key.0.len() > 1024 {
+            return Err((BAD, "key size"));
+        }
         tx.execute(
             "INSERT OR REPLACE INTO vault_keys(vault_id, username, epoch, key) VALUES(?,?,?,?)",
             params![vault, k.username, k.epoch, k.key.0],
@@ -557,8 +965,7 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     if env.vault_id.0[..] != *vault || env.counter != counter + 1 || env.epoch != epoch || env.roster > roster || env.prev.0 != last.unwrap_or_default() {
         return Err((BAD, "manifest doesn't extend the chain"));
     }
-    // A manifest lists every item (~90 bytes each), so it gets more room than an item.
-    if env.sealed.0.is_empty() || env.sealed.0.len() > 16 * MAX_BLOB {
+    if env.sealed.0.is_empty() || env.sealed.0.len() > MAX_MANIFEST {
         return Err((BAD, "manifest size"));
     }
     for u in &put.upserts {
@@ -589,7 +996,7 @@ fn insert_vault(tx: &Transaction, nv: &NewVault, username: &str) -> R<()> {
         return Err((BAD, "bad roster"));
     }
     let vault = r.vault_id.0;
-    tx.execute("INSERT INTO vaults(id, counter, epoch, roster_version) VALUES(?,0,0,0)", [&vault[..]])
+    tx.execute("INSERT INTO vaults(id, counter, epoch, roster_version, creator) VALUES(?,0,0,0,?)", params![&vault[..], username])
         .map_err(|_| (StatusCode::CONFLICT, "vault exists"))?;
     store_roster(tx, &vault, &nv.roster, &r)?;
     store_keys(tx, &vault, &nv.keys)?;
@@ -598,7 +1005,7 @@ fn insert_vault(tx: &Transaction, nv: &NewVault, username: &str) -> R<()> {
 }
 
 async fn create_vault(State(db): State<Db>, h: HeaderMap, Json(nv): Json<NewVault>) -> R<StatusCode> {
-    let mut db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
     if !c.human {
         return Err(DENIED);
@@ -621,7 +1028,7 @@ struct Since {
 
 async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<Since>) -> R<Json<VaultResponse>> {
     let vault = hex_id(&id)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Reader)?;
     if !c.human {
@@ -660,24 +1067,54 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
-    Ok(Json(VaultResponse { counter, manifests, rosters, key, items }))
+    // Roster members the server no longer serves: their accounts were deleted.
+    let (roster,): (String,) = db
+        .query_row(
+            "SELECT signed FROM rosters WHERE vault_id = ?1 AND version = (SELECT roster_version FROM vaults WHERE id = ?1)",
+            [&vault[..]],
+            |r| Ok((r.get(0)?,)),
+        )
+        .map_err(db_err)?;
+    let roster: Roster = parse(&serde_json::from_str::<Signed>(&roster).map_err(db_err)?)?;
+    let mut gone = Vec::new();
+    for m in roster.members {
+        let kept: bool = db
+            .query_row("SELECT COUNT(*) FROM members WHERE vault_id = ? AND username = ?", params![&vault[..], m.username], |r| r.get(0))
+            .map_err(db_err)?;
+        if !kept {
+            gone.push(m.username);
+        }
+    }
+    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone }))
 }
 
-async fn put_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Json(put): Json<VaultPut>) -> R<StatusCode> {
+async fn put_vault(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(put): Json<VaultPut>,
+) -> R<StatusCode> {
     let vault = hex_id(&id)?;
-    let mut db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
     let tx = db.transaction().map_err(db_err)?;
     need_role(&tx, &vault, &c.username, Role::Writer)?;
-    store_put(&tx, &vault, &put, &c.username)?;
+    within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), || store_put(&tx, &vault, &put, &c.username))?;
     audit_log(&tx, &vault, &c.username, &format!("write {} items, delete {}", put.upserts.len(), put.deletes.len()))?;
     tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn update_roster(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Json(u): Json<RosterUpdate>) -> R<StatusCode> {
+async fn update_roster(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(u): Json<RosterUpdate>,
+) -> R<StatusCode> {
     let vault = hex_id(&id)?;
-    let mut db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
     let tx = db.transaction().map_err(db_err)?;
     need_role(&tx, &vault, &c.username, Role::Owner)?;
@@ -698,8 +1135,10 @@ async fn update_roster(State(db): State<Db>, h: HeaderMap, Path(id): Path<String
     store_roster(&tx, &vault, &u.roster, &r)?;
     store_keys(&tx, &vault, &u.keys)?;
     if let Some(put) = &u.rotation {
-        tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
-        store_put(&tx, &vault, put, &c.username)?;
+        within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), || {
+            tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
+            store_put(&tx, &vault, put, &c.username)
+        })?;
     }
     audit_log(&tx, &vault, &c.username, &format!("roster v{}", r.version))?;
     tx.commit().map_err(db_err)?;
@@ -708,7 +1147,7 @@ async fn update_roster(State(db): State<Db>, h: HeaderMap, Path(id): Path<String
 
 async fn audit(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<Json<Vec<AuditEntry>>> {
     let vault = hex_id(&id)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Owner)?;
     let mut st = db.prepare("SELECT ts, username, action FROM audit WHERE vault_id = ? ORDER BY ts DESC LIMIT 1000").map_err(db_err)?;
@@ -720,22 +1159,32 @@ async fn audit(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<
     Ok(Json(list))
 }
 
-async fn put_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(String, String)>, body: Bytes) -> R<StatusCode> {
+async fn put_file(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Path((id, fid)): Path<(String, String)>,
+    body: Bytes,
+) -> R<StatusCode> {
     let (vault, file) = (hex_id(&id)?, hex_id(&fid)?);
     if body.is_empty() || body.len() > MAX_FILE {
         return Err((BAD, "file size"));
     }
-    let db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
-    need_role(&db, &vault, &c.username, Role::Writer)?;
-    db.execute("INSERT OR REPLACE INTO files(vault_id, id, blob) VALUES(?,?,?)", params![&vault[..], &file[..], &body[..]])
-        .map_err(db_err)?;
+    let tx = db.transaction().map_err(db_err)?;
+    need_role(&tx, &vault, &c.username, Role::Writer)?;
+    within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), || {
+        tx.execute("INSERT OR REPLACE INTO files(vault_id, id, blob) VALUES(?,?,?)", params![&vault[..], &file[..], &body[..]])
+            .map_err(db_err)
+    })?;
+    tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(String, String)>) -> R<Vec<u8>> {
     let (vault, file) = (hex_id(&id)?, hex_id(&fid)?);
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Reader)?;
     if !c.human {
@@ -749,7 +1198,7 @@ async fn get_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(Str
 
 async fn delete_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(String, String)>) -> R<StatusCode> {
     let (vault, file) = (hex_id(&id)?, hex_id(&fid)?);
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Writer)?;
     db.execute("DELETE FROM files WHERE vault_id = ? AND id = ?", params![&vault[..], &file[..]]).map_err(db_err)?;
@@ -758,54 +1207,84 @@ async fn delete_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(
 
 // ---------- Messages and links ----------
 
-async fn send_message(State(db): State<Db>, h: HeaderMap, Json(s): Json<Signed>) -> R<StatusCode> {
-    let db = db.lock().expect("db lock");
+async fn send_message(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Json(s): Json<Signed>,
+) -> R<StatusCode> {
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
-    verify_signed(&db, &s, "message", &c.username)?;
+    let tx = db.transaction().map_err(db_err)?;
+    verify_signed(&tx, &s, "message", &c.username)?;
     let m: Message = parse(&s)?;
     check_blob(&m.sealed)?;
-    sign_pk(&db, &m.to)?;
-    db.execute(
-        "INSERT INTO messages(id, to_user, signed, expires, created) VALUES(?,?,?,?,?)",
-        params![&m.id.0[..], m.to, json(&s), m.expires, now()],
-    )
-    .map_err(|_| (StatusCode::CONFLICT, "message exists"))?;
+    sign_pk(&tx, &m.to)?;
+    within_quota(&tx, &cfg, Some(&c.payer), || {
+        tx.execute(
+            "INSERT INTO messages(id, to_user, signed, expires, created, sender) VALUES(?,?,?,?,?,?)",
+            params![&m.id.0[..], m.to, json(&s), m.expires, now(), c.username],
+        )
+        .map_err(|_| (StatusCode::CONFLICT, "message exists"))
+    })?;
+    tx.commit().map_err(db_err)?;
     Ok(StatusCode::CREATED)
 }
 
 async fn inbox(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<Signed>>> {
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
-    db.execute("DELETE FROM messages WHERE expires IS NOT NULL AND expires <= ?", [now()]).map_err(db_err)?;
-    let mut st = db.prepare("SELECT signed FROM messages WHERE to_user = ? ORDER BY created").map_err(db_err)?;
-    let list = st
-        .query_map([&c.username], |r| r.get::<_, String>(0))
-        .map_err(db_err)?
-        .filter_map(|s| serde_json::from_str(&s.ok()?).ok())
-        .collect();
+    let mut st = db
+        .prepare("SELECT signed FROM messages WHERE to_user = ? AND (expires IS NULL OR expires > ?) ORDER BY created")
+        .map_err(db_err)?;
+    let mut rows = st.query(params![c.username, now()]).map_err(db_err)?;
+    // Oldest first, and at least one: once they're deleted, the next fetch gets the rest.
+    let (mut list, mut size) = (Vec::new(), 0);
+    while let Some(row) = rows.next().map_err(db_err)? {
+        let s: String = row.get(0).map_err(db_err)?;
+        size += s.len();
+        if size > INBOX_BYTES && !list.is_empty() {
+            break;
+        }
+        list.extend(serde_json::from_str::<Signed>(&s).ok());
+    }
     Ok(Json(list))
 }
 
 async fn delete_message(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
     let id = hex_id(&id)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
-    db.execute("DELETE FROM messages WHERE id = ? AND to_user = ?", params![&id[..], c.username]).map_err(db_err)?;
+    // The recipient, or the sender while it's waiting (it counts against their quota).
+    db.execute(
+        &format!("DELETE FROM messages WHERE id = ?2 AND (to_user = ?1 OR {})", in_set("sender")),
+        params![c.username, &id[..]],
+    )
+    .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn create_link(State(db): State<Db>, h: HeaderMap, Json(l): Json<NewLink>) -> R<StatusCode> {
+async fn create_link(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Json(l): Json<NewLink>,
+) -> R<StatusCode> {
     check_blob(&l.blob)?;
-    let db = db.lock().expect("db lock");
+    let mut db = lock(&db);
     let c = caller(&db, &h)?;
     if l.expires <= now() || l.expires > now() + 30 * 86400 {
         return Err((BAD, "links last up to 30 days"));
     }
-    db.execute(
-        "INSERT INTO links(id, creator, blob, expires, views_left) VALUES(?,?,?,?,?)",
-        params![&l.id.0[..], c.username, l.blob.0, l.expires, l.max_views],
-    )
-    .map_err(|_| (StatusCode::CONFLICT, "link exists"))?;
+    let tx = db.transaction().map_err(db_err)?;
+    within_quota(&tx, &cfg, Some(&c.payer), || {
+        tx.execute(
+            "INSERT INTO links(id, creator, blob, expires, views_left) VALUES(?,?,?,?,?)",
+            params![&l.id.0[..], c.username, l.blob.0, l.expires, l.max_views],
+        )
+        .map_err(|_| (StatusCode::CONFLICT, "link exists"))
+    })?;
+    tx.commit().map_err(db_err)?;
     Ok(StatusCode::CREATED)
 }
 
@@ -815,15 +1294,20 @@ async fn create_link(State(db): State<Db>, h: HeaderMap, Json(l): Json<NewLink>)
 async fn open_link(State(db): State<Db>, Path(id): Path<String>) -> Response {
     let res: R<Vec<u8>> = (|| {
         let id = hex_id(&id)?;
-        let db = db.lock().expect("db lock");
-        db.execute("DELETE FROM links WHERE expires <= ? OR views_left = 0", [now()]).map_err(db_err)?;
-        let blob: Vec<u8> = db
-            .query_row("SELECT blob FROM links WHERE id = ?", [&id[..]], |r| r.get(0))
+        let db = lock(&db);
+        let (blob, views): (Vec<u8>, Option<u32>) = db
+            .query_row("SELECT blob, views_left FROM links WHERE id = ? AND expires > ? AND views_left IS NOT 0", params![&id[..], now()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()
             .map_err(db_err)?
             .ok_or((StatusCode::NOT_FOUND, "this link has expired or doesn't exist"))?;
-        db.execute("UPDATE links SET views_left = views_left - 1 WHERE id = ? AND views_left IS NOT NULL", [&id[..]])
-            .map_err(db_err)?;
+        match views {
+            Some(1) => db.execute("DELETE FROM links WHERE id = ?", [&id[..]]),
+            Some(_) => db.execute("UPDATE links SET views_left = views_left - 1 WHERE id = ?", [&id[..]]),
+            None => Ok(0),
+        }
+        .map_err(db_err)?;
         Ok(blob)
     })();
     let mut resp = match res {
@@ -836,7 +1320,7 @@ async fn open_link(State(db): State<Db>, Path(id): Path<String>) -> Response {
 
 async fn delete_link(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
     let id = hex_id(&id)?;
-    let db = db.lock().expect("db lock");
+    let db = lock(&db);
     let c = caller(&db, &h)?;
     db.execute("DELETE FROM links WHERE id = ? AND creator = ?", params![&id[..], c.username]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -844,6 +1328,70 @@ async fn delete_link(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
 
 #[cfg(test)]
 mod tests {
+    /// A database from before `vaults.creator`, `sessions.expires` and `messages.sender`
+    /// gets them. The creator is filled from roster
+    /// v0's signer while they're still a current member (else an enabled owner), and opening it again changes nothing.
+    #[test]
+    fn creator_migration() {
+        let path = std::env::temp_dir().join(format!("plaintext-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(include_str!("schema.sql")).unwrap();
+        old.execute_batch(
+            r#"INSERT INTO vaults(id, counter, epoch, roster_version) VALUES (x'01', 1, 0, 1), (x'02', 1, 0, 1);
+               INSERT INTO rosters(vault_id, version, signed) VALUES (x'01', 0, '{"body":"","signer":"alice","sig":""}'),
+                                                                    (x'01', 1, '{"body":"","signer":"bob","sig":""}'),
+                                                                    (x'02', 0, '{"body":"","signer":"alice","sig":""}');
+               INSERT INTO members(vault_id, username, role) VALUES (x'01', 'alice', 'writer'), (x'01', 'bob', 'owner'),
+                                                                    (x'02', 'aaron', 'owner'), (x'02', 'bob', 'writer'), (x'02', 'carol', 'owner');
+               INSERT INTO accounts(id, username, kind, identity, auth_key, account_key, keyring, disabled, created)
+                 VALUES (x'a1', 'alice', 'human', '', x'', x'', x'', 0, 0), (x'a2', 'aaron', 'human', '', x'', x'', x'', 1, 0),
+                        (x'b1', 'bob', 'human', '', x'', x'', x'', 0, 0), (x'c1', 'carol', 'human', '', x'', x'', x'', 0, 0);
+               INSERT INTO accounts(id, username, kind, owner, identity, auth_key, account_key, keyring, created)
+                 VALUES (x'a3', 'aaron-ci', 'agent', 'aaron', '', x'', x'', x'', 0);
+               INSERT INTO sessions(token_hash, account_id, device, created) VALUES (x'01', x'b1', 'phone', 0);
+               INSERT INTO messages(id, to_user, signed, created) VALUES (x'01', 'bob', '{"body":"","signer":"carol","sig":""}', 0);"#,
+        )
+        .unwrap();
+        drop(old);
+        for _ in 0..2 {
+            let db = super::open_db(path.to_str().unwrap()).unwrap();
+            let creators: Vec<String> =
+                db.prepare("SELECT creator FROM vaults ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(creators, ["alice", "carol"], "alice was removed from the second vault, aaron is disabled");
+            let expires: u64 = db.query_row("SELECT expires FROM sessions", [], |r| r.get(0)).unwrap();
+            assert!(expires > super::now() + super::SESSION_TTL - 60, "old sessions get a full term");
+            let sender: String = db.query_row("SELECT sender FROM messages", [], |r| r.get(0)).unwrap();
+            assert_eq!(sender, "carol");
+            let disabled: bool = db.query_row("SELECT disabled FROM accounts WHERE username = 'aaron-ci'", [], |r| r.get(0)).unwrap();
+            assert!(disabled, "a disabled person's agent");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        for h in ["localhost", "localhost:8080", "127.0.0.1", "127.0.0.1:1", "[::1]", "[::1]:8080"] {
+            assert!(super::loopback(h), "{h}");
+        }
+        let not = ["localhost.evil.example", "localhost:x@evil.example", "127.0.0.1@evil.example", "127.0.0.1:1@evil.example"];
+        for h in not.into_iter().chain(["[::1]@evil.example", "[::1]:80x", "localhost:", "[::ffff:127.0.0.1]", "evil.example", "[::1"]) {
+            assert!(!super::loopback(h), "{h}");
+        }
+    }
+
+    /// A full rate-limit table refuses new signups but never logins.
+    #[test]
+    fn full_limiter_still_lets_logins_through() {
+        let l = super::Limiter::default();
+        for i in 0..super::LIMITER_KEYS as u32 {
+            assert!(l.take((std::net::Ipv4Addr::from(i).into(), true), 1));
+        }
+        let new = std::net::IpAddr::from([255, 255, 255, 255]);
+        assert!(!l.take((new, true), 1));
+        assert!(l.take((new, false), 1));
+    }
+
     #[test]
     fn backup_copy_has_the_same_rows() {
         let dir = std::env::temp_dir().join(format!("plaintext-backup-{}", std::process::id()));

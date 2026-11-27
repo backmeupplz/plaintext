@@ -11,6 +11,11 @@ fn server() -> (String, std::path::PathBuf) {
 
 fn server_with(cfg: plaintext_server::Config) -> (String, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("plaintext-e2e-{}.db", hex::encode(plaintext_core::crypto::random::<8>())));
+    (server_at(&path, cfg), path)
+}
+
+/// A server on an existing database (a restart with other settings).
+fn server_at(path: &std::path::Path, cfg: plaintext_server::Config) -> String {
     let db = plaintext_server::open_db(path.to_str().unwrap()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -18,10 +23,10 @@ fn server_with(cfg: plaintext_server::Config) -> (String, std::path::PathBuf) {
         rt.block_on(async move {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(l.local_addr().unwrap()).unwrap();
-            axum::serve(l, plaintext_server::app(db, cfg)).await.unwrap();
+            plaintext_server::serve(l, db, cfg).await.unwrap();
         });
     });
-    (format!("http://{}", rx.recv().unwrap()), path)
+    format!("http://{}", rx.recv().unwrap())
 }
 
 fn login(url: &str, pw: &str, sk: &SecretKey) -> Session<Http> {
@@ -334,6 +339,263 @@ impl Transport for Named {
     }
 }
 
+fn count(path: &std::path::Path, sql: &str) -> i64 {
+    plaintext_server::open_db(path.to_str().unwrap()).unwrap().query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// Deleting an account needs the password, takes its agents, inbox, links and
+/// unshared vaults with it, and leaves shared vaults to the others, whose owners
+/// replace the key.
+#[test]
+fn account_deletion() {
+    let (url, path) = server();
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "t");
+    let code = alice.invite().unwrap();
+    let (bsk, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "t");
+    let code = alice.invite().unwrap();
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", Some(&code), "t");
+    let code = alice.invite().unwrap();
+    let (_, mut dave) = join(Http::new(&url), "dave", "dave pw", Some(&code), "t");
+
+    // Alice's family vault has bob as a writer and bob's agent as a reader.
+    let fam = alice.create_vault("Family").unwrap();
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Netflix", "n3tfl1x")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    let bot_key = bob.create_agent("bob-bot").unwrap();
+    alice.share_vault(&fam, "bob-bot", Role::Reader, None).unwrap();
+    // Bob's vault with carol as a second owner, and one only bob and his agent use.
+    let kept = bob.create_vault("Shared").unwrap();
+    bob.put_item(&kept, plaintext_core::new_item_id(), item("Router", "r0uter")).unwrap();
+    bob.share_vault(&kept, "carol", Role::Owner, None).unwrap();
+    let solo = bob.create_vault("Solo").unwrap();
+    bob.share_vault(&solo, "bob-bot", Role::Reader, None).unwrap();
+    let blocked = bob.create_vault("Blocked").unwrap();
+    bob.share_vault(&blocked, "carol", Role::Writer, None).unwrap();
+    carol.sync().unwrap();
+    carol.share_vault(&kept, "alice", Role::Reader, None).unwrap();
+    // Dave's club, where bob is only a reader, keeps no owner once dave is disabled.
+    let club = dave.create_vault("Club").unwrap();
+    dave.share_vault(&club, "bob", Role::Reader, None).unwrap();
+    dave.share_vault(&club, "carol", Role::Writer, None).unwrap();
+    alice.disable_user("dave").unwrap();
+    alice.send("bob", &Content::Request("hi".into()), None).unwrap();
+    bob.create_link(LINK_PAGE, &url, &item("Door", "4711"), now() + 600, None).unwrap();
+    bob.sync().unwrap();
+
+    // A stolen session token isn't enough, and neither is a wrong password.
+    let wrong = plaintext_core::delete_account(&derive("guess", &bsk), now_ms(), &plaintext_core::crypto::server_host(&url));
+    assert_eq!(status(bob.call::<()>("DELETE", "/v1/account", Some(&wrong))), 401);
+    let stale = plaintext_core::delete_account(&derive("bob pw", &bsk), now_ms() - 300_000, &plaintext_core::crypto::server_host(&url));
+    assert_eq!(status(bob.call::<()>("DELETE", "/v1/account", Some(&stale))), 401);
+    // Bob is the only owner of a vault carol uses: the client names it, the server refuses too.
+    let refused = bob.delete_account(&derive("bob pw", &bsk)).unwrap_err().to_string();
+    assert!(refused.contains("Blocked") && !refused.contains("Solo") && !refused.contains("Shared"), "{refused}");
+    let signed = plaintext_core::delete_account(&derive("bob pw", &bsk), now_ms(), &plaintext_core::crypto::server_host(&url));
+    assert_eq!(status(bob.call::<()>("DELETE", "/v1/account", Some(&signed))), 409);
+
+    bob.revoke(&blocked, "carol").unwrap();
+    bob.delete_account(&derive("bob pw", &bsk)).unwrap();
+    assert_eq!(status(bob.sessions()), 401);
+    assert_eq!(status(Session::login(Http::new(&url), &derive("bob pw", &bsk), "t")), 401);
+    let bot = AgentKey::parse(&bot_key.encode()).unwrap();
+    assert_eq!(status(Session::login(Http::new(&url), &derive_agent(&bot), "t")), 401, "his agent went with him");
+    assert!(matches!(alice.pin_user("bob"), Err(Error::NotFound(_))));
+    for (table, n) in [("accounts", 3), ("messages", 0), ("links", 0), ("vaults", 6)] {
+        assert_eq!(count(&path, &format!("SELECT COUNT(*) FROM {table}")), n, "{table}");
+    }
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 2, "carol now carries bob's shared vault");
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vault_keys WHERE username IN ('bob', 'bob-bot')"), 0);
+
+    // Alice's device removes bob and his agent in one new roster with a new key.
+    let epoch = alice.vaults[&fam].roster.as_ref().unwrap().epoch;
+    alice.sync().unwrap();
+    let r = alice.vaults[&fam].roster.as_ref().unwrap();
+    assert_eq!(r.epoch, epoch + 1);
+    assert_eq!(r.members.iter().map(|m| m.username.as_str()).collect::<Vec<_>>(), ["alice"]);
+    // Carol keeps bob's shared vault. Removing someone takes bob out in the same new key.
+    carol.revoke(&kept, "alice").unwrap();
+    assert_eq!(carol.vaults[&kept].roster.as_ref().unwrap().members.len(), 1);
+    carol.sync().unwrap();
+    assert_eq!(carol.one("router", None).unwrap().2.password, "r0uter");
+    assert_eq!(carol.vaults[&kept].roster.as_ref().unwrap().members.len(), 1);
+    carol.share_vault(&kept, "alice", Role::Reader, None).unwrap();
+    assert!(!carol.vaults.contains_key(&solo) && !carol.vaults.contains_key(&blocked));
+    assert!(carol.vaults.contains_key(&club), "a vault bob only read stays with the others");
+    // A creator who is removed stops paying for the vault; the owner who removed them does.
+    let vault_creator = |v: &Hex| count(&path, &format!("SELECT COUNT(*) FROM vaults WHERE lower(hex(id)) = '{v}' AND creator = 'alice'"));
+    let handoff = carol.create_vault("Handoff").unwrap();
+    carol.share_vault(&handoff, "alice", Role::Owner, None).unwrap();
+    assert_eq!(vault_creator(&handoff), 0);
+    alice.sync().unwrap();
+    alice.revoke(&handoff, "carol").unwrap();
+    assert_eq!(vault_creator(&handoff), 1);
+
+    // The name is free again, but nobody who pinned the old bob accepts the new one.
+    let code = alice.invite().unwrap();
+    join(Http::new(&url), "bob", "new bob pw", Some(&code), "t");
+    assert!(matches!(alice.pin_user("bob"), Err(Error::Core(plaintext_core::Error::KeyChanged(_)))));
+
+    // An agent may delete itself; its owner's device removes it from the vault.
+    let key = alice.create_agent("ci").unwrap();
+    alice.share_vault(&fam, "ci", Role::Reader, None).unwrap();
+    let mut ci = Session::login(Http::new(&url), &derive_agent(&key), "ci").unwrap();
+    ci.delete_account(&derive_agent(&key)).unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.vaults[&fam].roster.as_ref().unwrap().members.len(), 1);
+
+    // The admin can't leave a server others use.
+    let err = alice.delete_account(&derive("alice pw", &ask)).unwrap_err();
+    assert!(matches!(&err, Error::Server(409, m) if m.contains("admin")), "{err}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A quota counts items and files in the vaults an account created. Writes that
+/// would add past it get 413; reads, deletes and key replacement always work.
+#[test]
+fn storage_quota() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    let (bsk, _) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    let big = alice.upload_file(&personal, "scan.pdf", &vec![7u8; 300_000]).unwrap();
+    let id = plaintext_core::new_item_id();
+    alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bank", "b4nk") }).unwrap();
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert_eq!(acct.quota, None, "unlimited unless set");
+    assert!(acct.usage > 300_000);
+
+    // The same database restarted with a 256 KB quota: alice is already over it.
+    let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(256 << 10), ..Default::default() });
+    let mut alice = login(&url, "alice pw", &ask);
+    let mut bob = login(&url, "bob pw", &bsk);
+    alice.sync().unwrap();
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert_eq!(acct.quota, Some(256 << 10));
+    assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000, "reads still work");
+    assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 413);
+    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    alice.revoke(&personal, "bob").unwrap();
+    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    // A writer's items count against the vault's creator, not the writer.
+    let err = bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "x")).unwrap_err();
+    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    let mine = bob.default_vault().unwrap();
+    bob.upload_file(&mine, "bob.pdf", b"bob's own file").unwrap();
+    // The refused change waits on bob's device without holding up his other vaults.
+    bob.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Bob's own", "y"));
+    assert_eq!(status(bob.sync()), 413);
+    assert!(!bob.vaults[&mine].has_changes());
+
+    // Deleting an item deletes its attachment too, which makes room.
+    alice.delete_item(&personal, id).unwrap();
+    assert_eq!(status(alice.download_file(&personal, &big)), 404);
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.usage < 1000, "{}", acct.usage);
+    alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
+    // Being out of storage doesn't stop anyone deleting their account.
+    bob.delete_account(&derive("bob pw", &bsk)).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Open servers limit signups and failed logins per client address; behind a
+/// trusted proxy the address is the last one in X-Forwarded-For.
+#[test]
+fn signup_and_login_rate_limits() {
+    fn post_lines(url: &str, path: &str, xff: &[&str]) -> u16 {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut req = agent.post(format!("{url}{path}")).header("content-type", "application/json");
+        for x in xff {
+            req = req.header("x-forwarded-for", *x);
+        }
+        req.send("{}").unwrap().status().as_u16()
+    }
+    let post = |url: &str, path: &str, xff: Option<&str>| post_lines(url, path, xff.as_slice());
+    let open = plaintext_server::Config { open_signup: true, ..Default::default() };
+
+    // Invite-only servers have no limits.
+    let (url, _) = server();
+    assert!((0..12).all(|_| post(&url, "/v1/signup", None) != 429));
+
+    let (url, _) = server_with(open.clone());
+    let (sk, _) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    // Successful logins don't count (agents sign in on every run).
+    let d = derive("alice pw", &sk);
+    for _ in 0..35 {
+        Session::login(Http::new(&url), &d, "t").unwrap();
+    }
+    assert!((0..9).all(|_| post(&url, "/v1/signup", None) != 429));
+    assert_eq!(post(&url, "/v1/signup", None), 429);
+    assert_eq!(post(&url, "/v1/signup", Some("10.0.0.9")), 429, "the header is ignored unless the proxy is trusted");
+    assert!((0..30).all(|_| post(&url, "/v1/login", None) != 429));
+    assert_eq!(post(&url, "/v1/login", None), 429);
+    // Junk from the same address can't lock out someone who knows the password.
+    Session::login(Http::new(&url), &d, "t").unwrap();
+
+    let (url, _) = server_with(plaintext_server::Config { trust_proxy: true, ..open });
+    assert!((0..10).all(|_| post(&url, "/v1/signup", Some("203.0.113.1, 198.51.100.7")) != 429));
+    assert_eq!(post(&url, "/v1/signup", Some("203.0.113.1, 198.51.100.7")), 429);
+    assert_eq!(post(&url, "/v1/signup", Some("203.0.113.99, 198.51.100.7")), 429, "the client can't pick the address");
+    assert_ne!(post(&url, "/v1/signup", Some("203.0.113.1, 198.51.100.8")), 429);
+    // A proxy that adds its own header line after the client's is read the same way.
+    assert!((0..9).all(|i| post_lines(&url, "/v1/signup", &[&format!("10.9.9.{i}"), "198.51.100.8"]) != 429));
+    assert_eq!(post_lines(&url, "/v1/signup", &["10.9.9.99", "198.51.100.8"]), 429);
+    // Requests in flight together can't all slip through before any is counted.
+    let parallel: Vec<_> = (0..40).map(|_| {
+        let url = url.clone();
+        std::thread::spawn(move || post_lines(&url, "/v1/login", &["192.0.2.1"]))
+    }).collect();
+    assert_eq!(parallel.into_iter().map(|t| t.join().unwrap()).filter(|s| *s == 429).count(), 10);
+    // IPv6 counts per /64.
+    assert!((0..10).all(|i| post(&url, "/v1/signup", Some(&format!("2001:db8::{i}"))) != 429));
+    assert_eq!(post(&url, "/v1/signup", Some("2001:db8::ffff")), 429);
+    assert_ne!(post(&url, "/v1/signup", Some("2001:db8:0:1::1")), 429);
+    // A port or brackets from the proxy don't make a new address.
+    assert_eq!(post(&url, "/v1/signup", Some("[2001:db8::7]:443")), 429);
+    assert_eq!(post(&url, "/v1/signup", Some("[2001:db8::7]")), 429);
+    assert!((0..10).all(|i| post(&url, "/v1/signup", Some(&format!("198.51.100.200:{}", 1000 + i))) != 429));
+    assert_eq!(post(&url, "/v1/signup", Some("198.51.100.200")), 429);
+}
+
+/// Small requests by default; larger ones only with a valid session, checked
+/// before the server reads the body.
+#[test]
+fn request_size_limits() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    // Announces a `len`-byte body and sends only `sent` bytes of it: the answer
+    // must come without the rest.
+    let send = |method: &str, path: &str, token: Option<&str>, len: usize, sent: usize| -> u16 {
+        use std::io::{Read, Write};
+        let host = url.trim_start_matches("http://");
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let auth = token.map(|t| format!("authorization: Bearer {t}\r\n")).unwrap_or_default();
+        write!(s, "{method} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\n{auth}content-length: {len}\r\n\r\n").unwrap();
+        s.write_all(&vec![b' '; sent]).unwrap();
+        let mut head = [0u8; 12];
+        s.read_exact(&mut head).unwrap();
+        std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
+    };
+    assert_eq!(send("POST", "/v1/signup", None, 1 << 20, 65 << 10), 413);
+    let file = format!("/v1/vaults/{}/files/{}", "00".repeat(16), "11".repeat(16));
+    assert_eq!(send("PUT", &file, None, 3 << 20, 0), 401);
+    assert_eq!(send("PUT", &file, Some("not-a-session"), 3 << 20, 0), 401);
+    assert_eq!(send("PUT", &format!("/v1/vaults/{}", "00".repeat(16)), None, 3 << 20, 0), 401);
+
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    let f = alice.upload_file(&personal, "scan.pdf", &vec![7u8; 3 << 20]).unwrap();
+    assert_eq!(alice.download_file(&personal, &f).unwrap().len(), 3 << 20);
+    // A vault push and a share link well over the small limit.
+    let notes = Item { notes: "n".repeat(200_000), ..item("Big", "b") };
+    alice.put_item(&personal, plaintext_core::new_item_id(), notes.clone()).unwrap();
+    alice.create_link("https://getplaintext.org/s", &url, &notes, now_ms() / 1000 + 3600, None).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
 // ---------- Attacks from the 2026-11 security audit, over real HTTP; each must stay fixed ----------
 
 use plaintext_core::api::{Kind, UserInfo, VaultPut};
@@ -399,6 +661,7 @@ fn audit_agent_session_trusts_a_vault_the_server_made() {
         rosters: vec![fnv.roster.clone(), g.roster.clone()],
         key: Some(g.keys[0].key.clone()),
         items: p.upserts.clone(),
+        gone: vec![],
     };
     let forge = Forge { inner: Http::new(&url), id: fv.id, first, pushed: Default::default() };
 
@@ -502,4 +765,138 @@ fn a_stranger_s_vault_doesnt_jam_an_agent() {
     assert_eq!(agent.one("deploy token", None).unwrap().2.password, "real-deploy-token");
     assert!(agent.problems.iter().any(|p| p.contains("wasn't updated")), "{:?}", agent.problems);
     assert_eq!(agent.vaults.len(), 1, "the stranger's vault isn't listed as usable");
+}
+
+/// Server hardening: logins without PLAINTEXT_URL, document sizes, inbox
+/// paging, link views, quotas for links and messages, disabled owners' agents,
+/// session lifetimes and response headers.
+#[test]
+fn server_hardening() {
+    use plaintext_core::api::Message;
+    let (url, path) = server_with(plaintext_server::Config { setup_code: Some("first-run-code".into()), ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "t");
+    let d = derive("alice pw", &ask);
+    let host = url.trim_start_matches("http://").to_string();
+    let raw = |method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]| -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(&host).unwrap();
+        let mut req = format!("{method} {path} HTTP/1.1\r\nconnection: close\r\ncontent-length: {}\r\n", body.len());
+        for (k, v) in headers {
+            req += &format!("{k}: {v}\r\n");
+        }
+        s.write_all(format!("{req}\r\n").as_bytes()).unwrap();
+        s.write_all(body).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        (resp[9..12].parse().unwrap(), resp)
+    };
+    let json = [("content-type", "application/json")];
+
+    // Without PLAINTEXT_URL, only logins signed for this machine work: a look-alike
+    // server can't relay one by naming itself in the Host header.
+    for name in ["vault.examp1e.com", "localhost.examp1e.com"] {
+        let relayed = serde_json::to_vec(&plaintext_core::login_request(&d, now_ms(), "t", name)).unwrap();
+        let (st, _) = raw("POST", "/v1/login", &[json[0], ("host", name)], &relayed);
+        assert_eq!(st, 403, "{name}");
+    }
+    let local = format!("localhost:{}", host.rsplit(':').next().unwrap());
+    let ok = serde_json::to_vec(&plaintext_core::login_request(&d, now_ms(), "t", &local)).unwrap();
+    assert_eq!(raw("POST", "/v1/login", &[json[0], ("host", &local)], &ok).0, 200);
+
+    // Every response says not to cache it; HEAD doesn't use up a link's view.
+    let (_, info) = raw("GET", "/v1/info", &[], b"");
+    assert!(info.to_ascii_lowercase().contains("cache-control: no-store"), "{info}");
+    let link = alice.create_link(LINK_PAGE, &url, &item("Door", "4711"), now() + 600, Some(1)).unwrap();
+    let lid = link.split('#').nth(1).unwrap().rsplit('/').nth(1).unwrap().to_string();
+    assert_eq!(raw("HEAD", &format!("/v1/links/{lid}"), &[], b"").0, 405);
+    assert_eq!(raw("GET", &format!("/v1/links/{lid}"), &[], b"").0, 200);
+    assert_eq!(raw("GET", &format!("/v1/links/{lid}"), &[], b"").0, 404, "one view");
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM links"), 0, "used up links go right away");
+
+    // Signed documents are capped as a whole, not just their sealed part.
+    let code = alice.invite().unwrap();
+    let (bsk, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "t");
+    let me = bob.me();
+    alice.pin_user("bob").unwrap();
+    bob.pin_user("alice").unwrap();
+    let msg = plaintext_core::send(&me, &bob.keyring, "alice", &Content::Request("hi".into()), None).unwrap();
+    let mut padded: serde_json::Value = serde_json::from_slice(&msg.body.0).unwrap();
+    padded["pad"] = "A".repeat(1_480_000).into();
+    assert_eq!(status(bob.call::<()>("POST", "/v1/messages", Some(&me.sign_doc("message", &padded)))), 400);
+    let (_, mut carol) = {
+        let code = alice.invite().unwrap();
+        join(Http::new(&url), "carol", "carol pw", Some(&code), "t")
+    };
+    let (_, mut agent) = plaintext_core::create_agent(&mut carol.keyring, "carol-bot").unwrap();
+    let am = agent.keyring.me();
+    let id = serde_json::json!({ "username": "carol-bot", "kind": "agent", "owner": "carol", "sign_pk": am.sign_pk(), "enc_pk": am.enc_pk(), "pad": "A".repeat(4000) });
+    agent.request.identity = am.sign_doc("identity", &id);
+    assert_eq!(status(carol.call::<()>("POST", "/v1/agents", Some(&agent.request))), 400, "identity too large");
+    // Rosters: no duplicates, at most 1000 members.
+    for n in [2, 1001] {
+        let (_, mut nv) = plaintext_core::Vault::create(&bob.me(), "x").unwrap();
+        let mut r: Roster = serde_json::from_slice(&nv.roster.body.0).unwrap();
+        let me = r.members[0].clone();
+        r.members = vec![me.clone(); n];
+        if n > 2 {
+            // Different names, so this is the member cap rather than the duplicate check.
+            r.members.iter_mut().enumerate().skip(1).for_each(|(i, m)| m.username = format!("user{i}"));
+        }
+        nv.roster = bob.me().sign_doc("roster", &r);
+        let err = bob.call::<()>("POST", "/v1/vaults", Some(&nv)).unwrap_err();
+        assert!(matches!(&err, Error::Server(400, m) if m.contains("up to 1000 different members")), "{err}");
+    }
+
+    // A large inbox comes in pages, oldest first; deleting them brings the rest.
+    for _ in 0..20 {
+        bob.send("alice", &Content::Request("A".repeat(1_000_000)), None).unwrap();
+    }
+    let mut seen = 0;
+    loop {
+        let page: Vec<Signed> = alice.call("GET", "/v1/messages", NONE).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() < 20, "{}", page.len());
+        for s in &page {
+            alice.delete_message(&serde_json::from_slice::<Message>(&s.body.0).unwrap().id).unwrap();
+        }
+        seen += page.len();
+    }
+    assert_eq!(seen, 20);
+
+    let bob_ci = bob.create_agent("bob-ci").unwrap();
+
+    // Disabling a person disables their agents, whose keys they still hold.
+    let key = carol.create_agent("carol-ci").unwrap();
+    let ci = Session::login(Http::new(&url), &derive_agent(&key), "ci").unwrap();
+    alice.disable_user("carol").unwrap();
+    assert_eq!(status(ci.sessions()), 401);
+    assert_eq!(status(Session::login(Http::new(&url), &derive_agent(&key), "ci")), 401);
+
+    // Sessions end on the server: a login may ask for less than 30 days.
+    let mut short = plaintext_core::login_request(&d, now_ms(), "t", &host);
+    short.ttl = Some(1);
+    let token = call::<_, LoginResponse>(&Http::new(&url), "POST", "/v1/login", None, Some(&short)).unwrap().token;
+    assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 200);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 401);
+
+    // Links and messages count against the sender's quota.
+    let url = server_at(&path, plaintext_server::Config { setup_code: Some("first-run-code".into()), quota: Some(512 << 10), ..Default::default() });
+    let mut bob = login(&url, "bob pw", &bsk);
+    let err = bob.send("alice", &Content::Request("A".repeat(1_000_000)), None).unwrap_err();
+    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    let big = Item { notes: "n".repeat(900_000), ..item("Big", "b") };
+    assert_eq!(status(bob.create_link(LINK_PAGE, &url, &big, now() + 600, None)), 413);
+    bob.send("alice", &Content::Request("small".into()), None).unwrap();
+    // An agent's links count against its owner; a sender can take back an unread message.
+    let msg = plaintext_core::send(&bob.me(), &bob.keyring, "alice", &Content::Request("A".repeat(250_000)), None).unwrap();
+    bob.call::<()>("POST", "/v1/messages", Some(&msg)).unwrap();
+    let ci = Session::login(Http::new(&url), &derive_agent(&bob_ci), "ci").unwrap();
+    let mid = Item { notes: "n".repeat(200_000), ..item("Mid", "m") };
+    assert_eq!(status(ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None)), 413);
+    bob.delete_message(&serde_json::from_slice::<Message>(&msg.body.0).unwrap().id).unwrap();
+    ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None).unwrap();
+    let _ = std::fs::remove_file(&path);
 }
