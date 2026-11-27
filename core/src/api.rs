@@ -200,6 +200,14 @@ pub struct Staged {
     pub count: u64,
 }
 
+/// `POST /v1/vaults/{id}/leave`, signed (domain `leave`) by the member leaving.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LeaveVault {
+    pub vault_id: Hex,
+    /// Unix milliseconds; the server takes it within ±120 s.
+    pub ts: u64,
+}
+
 /// `POST /v1/vaults/{id}/stage`: part of the items of a push (or a key rotation)
 /// too big for one request. The server holds them, uncommitted, until the push
 /// that names `stage` (for a day at most). Staging under a new id drops what the

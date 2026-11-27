@@ -611,7 +611,12 @@ impl<T: Transport> Session<T> {
         if !self.keyring.contacts.contains_key(username) {
             self.pin_user(username)?;
         }
-        self.sync_vault(id)?;
+        // A change the server holds back (the account is full) waits; promoting
+        // someone doesn't need it sent first.
+        match self.sync_vault(id) {
+            Err(e) if !e.held_back() => return Err(e),
+            _ => {}
+        }
         self.remove_members(id, None)?;
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
@@ -634,7 +639,8 @@ impl<T: Transport> Session<T> {
     /// key. The vault is deleted if nobody else uses it; refused (409) while you're
     /// its only owner and others use it.
     pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), NONE)?;
+        let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
+        self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
         if let Some(v) = self.vaults.remove(id) {
             self.hidden.insert(*id, v);
         }

@@ -492,14 +492,18 @@ fn storage_quota() {
     assert!(!bob.vaults[&mine].has_changes());
     // Staged items count too: over the quota only an owner may stage, and only as
     // much as the vault's items (a new key re-seals them).
-    let stage = |s: &Session<Http>, id: Hex, n: usize| {
+    let stage = |s: &Session<Http>, v: &Hex, id: Hex, n: usize| {
         let upserts = vec![ItemBlob { id: plaintext_core::new_item_id(), blob: B64(vec![1; n]) }];
-        status(s.call::<()>("POST", &format!("/v1/vaults/{personal}/stage"), Some(&StageRequest { stage: id, upserts })))
+        status(s.call::<()>("POST", &format!("/v1/vaults/{v}/stage"), Some(&StageRequest { stage: id, upserts })))
     };
     let st = plaintext_core::new_item_id();
-    assert_eq!(stage(&bob, st, 100), 507);
-    assert_eq!(stage(&alice, st, 100), 200);
-    assert_eq!(stage(&alice, st, 2000), 507);
+    assert_eq!(stage(&bob, &personal, st, 100), 507);
+    assert_eq!(stage(&alice, &personal, st, 100), 200);
+    assert_eq!(stage(&alice, &personal, st, 2000), 507);
+    // A refused part drops the parts before it, which would otherwise keep counting.
+    assert_eq!(stage(&bob, &mine, st, 100_000), 200);
+    assert_eq!(stage(&bob, &mine, st, 200_000), 507);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
     // Over the quota, a promotion and removing someone (a new key) still work;
     // adding someone doesn't.
     alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
@@ -513,6 +517,8 @@ fn storage_quota() {
     assert!(acct.usage < 20_000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
     alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert_eq!(stage(&bob, &personal, st, 100), 403, "readers can't stage");
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -726,6 +732,9 @@ fn leaving_a_vault() {
     bob.sync().unwrap();
     assert!(bob.vaults.contains_key(&fam));
 
+    // Leaving is signed for the vault it names, so a session token alone can't.
+    let other = bob.me().sign_doc("leave", &LeaveVault { vault_id: bob.default_vault().unwrap(), ts: now_ms() });
+    assert_eq!(status(bob.call::<()>("POST", &format!("/v1/vaults/{fam}/leave"), Some(&other))), 400);
     // Bob leaves, his agent with him, and alice's device replaces the key.
     bob.leave_vault(&fam).unwrap();
     bob.sync().unwrap();

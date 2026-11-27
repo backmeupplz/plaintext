@@ -53,6 +53,9 @@ const BLOB_BODY: usize = 2 << 20;
 /// Vault create, push, stage and roster requests. A push or key rotation with
 /// more items than fit sends them ahead in parts (`/stage`).
 const VAULT_BODY: usize = 32 << 20;
+/// Most item bytes one push may write: a pull brings them all in one response,
+/// which clients take up to 128 MiB of (base64, with the manifests).
+const MAX_PUSH: usize = 80 << 20;
 /// How long staged items wait for the push that commits them, in seconds.
 const STAGE_TTL: u64 = 86400;
 
@@ -448,6 +451,7 @@ fn max_body(domain: &str) -> usize {
     match domain {
         "identity" => 2 << 10,
         "roster" => 512 << 10,
+        "leave" => 256,
         "message" => MAX_BLOB / 3 * 4 + (4 << 10),
         "manifest" => MAX_MANIFEST / 3 * 4 + (4 << 10),
         _ => 0,
@@ -730,16 +734,23 @@ fn leave_vault(tx: &Transaction, vault: &[u8], username: &str, why: &str) -> R<(
     audit_log(tx, vault, username, why)
 }
 
-/// Vaults `username` created (all, or just `vault`) that live on without them
-/// count against a remaining member from now on, owners first.
+/// Vaults that live on without whoever they count against move to a remaining
+/// member, owners first: every vault `username` created, or just `vault` if
+/// neither its payer nor any agent of theirs is a member any more.
 fn hand_off(tx: &Transaction, username: &str, vault: Option<&[u8]>) -> R<()> {
+    let whose = match vault {
+        Some(_) => "id = ?3 AND creator NOT IN (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
+                    WHERE m.vault_id = ?3)"
+            .to_string(),
+        // ?3 (NULL here) keeps both forms' parameters the same.
+        None => format!("{} AND ?3 IS NULL", in_set("creator")),
+    };
     tx.execute(
         &format!(
             "UPDATE vaults SET creator = (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
                WHERE m.vault_id = vaults.id AND (m.expires IS NULL OR m.expires > ?2) AND a.disabled = 0
                ORDER BY m.role = 'owner' DESC, a.owner IS NOT NULL, m.username LIMIT 1)
-             WHERE {} AND (?3 IS NULL OR id = ?3)",
-            in_set("creator")
+             WHERE {whose}"
         ),
         params![username, now(), vault],
     )
@@ -952,21 +963,29 @@ fn within_quota<T>(tx: &Transaction, cfg: &Config, account: Option<&str>, write:
 /// so editing and deleting keep working when the account is full.
 fn push_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], write: impl FnOnce() -> R<T>) -> R<T> {
     let Some(quota) = cfg.quota else { return write() };
-    let sizes = || -> R<(u64, usize)> {
+    // Items, sealed manifest, and bytes in the signed envelope beyond its known fields.
+    let sizes = || -> R<(u64, usize, usize)> {
         let items: u64 = tx.query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", [vault], |r| r.get(0)).map_err(db_err)?;
         let manifest: String = tx
             .query_row("SELECT m.signed FROM manifests m JOIN vaults v ON v.id = m.vault_id AND v.counter = m.counter WHERE v.id = ?", [vault], |r| r.get(0))
             .map_err(db_err)?;
-        let env: ManifestEnvelope = parse(&serde_json::from_str::<Signed>(&manifest).map_err(db_err)?)?;
-        Ok((items, env.sealed.0.len()))
+        let s: Signed = serde_json::from_str(&manifest).map_err(db_err)?;
+        let env: ManifestEnvelope = parse(&s)?;
+        Ok((items, env.sealed.0.len(), padding(&s, &env)))
     };
     let before = sizes()?;
     let out = write()?;
     let after = sizes()?;
-    if (after.0 > before.0 || after.1 > before.1) && usage(tx, creator(tx, vault)?.as_deref())? > quota {
+    if (after.0 > before.0 || after.1 > before.1 || after.2 > before.2) && usage(tx, creator(tx, vault)?.as_deref())? > quota {
         return Err(FULL);
     }
     Ok(out)
+}
+
+/// Bytes of a signed document's body beyond what its known fields take (unknown
+/// fields or whitespace): over the quota, nobody may grow a counted document that way.
+fn padding<T: serde::Serialize>(s: &Signed, doc: &T) -> usize {
+    s.body.0.len().saturating_sub(serde_json::to_vec(doc).map_or(0, |b| b.len()))
 }
 
 /// Store a roster version and refresh the members table from it.
@@ -999,6 +1018,8 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
         )
         .map_err(db_err)?;
     }
+    tx.execute("DELETE FROM staged WHERE vault_id = ?1 AND username NOT IN (SELECT username FROM members WHERE vault_id = ?1)", [vault])
+        .map_err(db_err)?;
     tx.execute(
         "UPDATE vaults SET roster_version = ?, roster_hash = ?, epoch = ? WHERE id = ?",
         params![r.version, &sha256(&s.body.0)[..], r.epoch, vault],
@@ -1062,14 +1083,22 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
         let n = tx
             .execute(
                 "INSERT OR REPLACE INTO items(vault_id, id, blob, counter)
-                 SELECT vault_id, id, blob, ?1 FROM staged WHERE vault_id = ?2 AND username = ?3 AND stage = ?4",
-                params![env.counter, vault, username, &st.id.0[..]],
+                 SELECT vault_id, id, blob, ?1 FROM staged WHERE vault_id = ?2 AND username = ?3 AND stage = ?4 AND created > ?5",
+                params![env.counter, vault, username, &st.id.0[..], now() - STAGE_TTL],
             )
             .map_err(db_err)?;
         if n as u64 != st.count {
             return Err((StatusCode::CONFLICT, "the staged items are gone (another push from this account replaced them, or they expired): push again"));
         }
-        tx.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![vault, username]).map_err(db_err)?;
+    }
+    // Whatever this member staged is either in now or left over from a push that won't come.
+    tx.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![vault, username]).map_err(db_err)?;
+    // Every member's next pull brings all of this push's items in one response.
+    let pushed: u64 = tx
+        .query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ? AND counter = ?", params![vault, env.counter], |r| r.get(0))
+        .map_err(db_err)?;
+    if pushed > MAX_PUSH as u64 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "more items than a device can pull in one go: push fewer at a time"));
     }
     for d in &put.deletes {
         tx.execute("DELETE FROM items WHERE vault_id = ? AND id = ?", params![vault, &d.0[..]]).map_err(db_err)?;
@@ -1203,12 +1232,19 @@ async fn put_vault(
 }
 
 /// The caller (and their agents) stop using a vault; see `leave_vault`.
-async fn leave(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
+/// Signed by the caller's identity key, so a stolen session token alone can't
+/// delete a vault nobody else uses.
+async fn leave(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Json(s): Json<Signed>) -> R<StatusCode> {
     let vault = hex_id(&id)?;
     let mut db = lock(&db);
     let c = caller(&db, &h)?;
     let tx = db.transaction().map_err(db_err)?;
     need_role(&tx, &vault, &c.username, Role::Reader)?;
+    verify_signed(&tx, &s, "leave", &c.username)?;
+    let req: LeaveVault = parse(&s)?;
+    if req.vault_id.0 != vault || req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS {
+        return Err((BAD, "the request names another vault or time"));
+    }
     leave_vault(&tx, &vault, &c.username, "left")?;
     tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1239,17 +1275,26 @@ async fn stage(
         )
         .map_err(db_err)?;
     }
+    // The stage expires a day after its last part.
+    tx.execute("UPDATE staged SET created = ? WHERE vault_id = ? AND username = ?", params![now(), &vault[..], c.username]).map_err(db_err)?;
     // Staged items count against the vault's creator. Over the quota, an owner may
     // still stage up to the size of the vault's items, which is what re-sealing
     // them all for a new key takes.
-    if let Some(quota) = cfg.quota {
-        let sum = |table: &str| -> R<u64> {
-            tx.query_row(&format!("SELECT COALESCE(SUM(length(blob)), 0) FROM {table} WHERE vault_id = ?"), [&vault[..]], |r| r.get(0)).map_err(db_err)
-        };
-        let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && sum("staged")? <= sum("items")?;
-        if !rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota {
-            return Err(FULL);
+    let full = match cfg.quota {
+        Some(quota) => {
+            let sum = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> R<u64> { tx.query_row(sql, p, |r| r.get(0)).map_err(db_err) };
+            let mine = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", &[&&vault[..], &c.username])?;
+            let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
+            let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && mine <= items;
+            !rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
         }
+        None => false,
+    };
+    if full {
+        // The push this was part of can't go through: drop its earlier parts too.
+        drop(tx);
+        db.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![&vault[..], c.username]).map_err(db_err)?;
+        return Err(FULL);
     }
     tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1304,6 +1349,12 @@ async fn update_roster(
     if r.members.iter().any(|m| !had(&m.username)) {
         within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), store)?;
     } else {
+        if let Some(quota) = cfg.quota
+            && padding(&u.roster, &r) > 0
+            && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
+        {
+            return Err(FULL);
+        }
         store()?;
     }
     if let Some(put) = &u.rotation {

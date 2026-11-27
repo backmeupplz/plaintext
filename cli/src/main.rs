@@ -1018,6 +1018,9 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             let id = s.vault(&vault)?;
             let name = s.vaults[&id].meta.name.clone();
             println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
+            if s.vaults[&id].has_changes() {
+                println!("Changes to it that haven't reached the server yet are lost.");
+            }
             print!("Type the vault's name ({name}) to confirm: ");
             std::io::stdout().flush()?;
             let mut typed = String::new();
