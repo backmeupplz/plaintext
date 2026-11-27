@@ -349,7 +349,7 @@ class Model(val context: Context) {
     fun signOut(id: String, withStored: Boolean = false) = scope.launch {
         val server = known(id)?.server ?: return@launch
         withContext(Dispatchers.IO) {
-            val stored = if (withStored) runCatching { vault.sessions()[id] }.getOrNull() else null
+            val stored = if (withStored) runCatching { vault.session(id) }.getOrNull() else null
             core.signOut(id, server, stored)
             stored?.accountKey?.fill(0)
         }

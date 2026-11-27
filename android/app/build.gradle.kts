@@ -19,6 +19,8 @@ android {
         // Minutes since the epoch, so every build installs over the last one without a bump.
         versionCode = (System.currentTimeMillis() / 60_000).toInt()
         versionName = providers.gradleProperty("versionName").getOrElse("0.1.0")
+        // The ABIs build.sh compiles Rust for; dependencies' other ABIs would install on phones the app can't run on.
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     signingConfigs {
         if (keys.isNotEmpty()) create("release") {

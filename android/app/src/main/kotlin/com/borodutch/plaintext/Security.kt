@@ -125,21 +125,20 @@ class Vault(private val context: Context) {
      * Open stored sessions. Call within a few seconds of a successful BiometricPrompt. Throws
      * [android.security.keystore.KeyPermanentlyInvalidatedException] when biometrics changed since.
      */
-    fun sessions(): Map<String, UnlockData> {
-        val key = ks.getKey(BIO, null) as? java.security.PrivateKey ?: return emptyMap()
-        val out = mutableMapOf<String, UnlockData>()
-        for (k in known) {
-            val raw = prefs.getString("session.${k.id}", null) ?: continue
-            val (wrapped, sealed) = raw.split(".", limit = 2).let { it[0] to it[1] }
-            val rsa = Cipher.getInstance(RSA).apply { init(Cipher.DECRYPT_MODE, key, OAEP) }
-            val dataKey = rsa.doFinal(unb64(wrapped))
-            val body = open(SecretKeySpec(dataKey, "AES"), sealed)
-            dataKey.fill(0)
-            val o = JSONObject(String(body))
-            body.fill(0)
-            out[k.id] = UnlockData(o.getString("token"), unb64(o.getString("accountId")), unb64(o.getString("accountKey")))
-        }
-        return out
+    fun sessions(): Map<String, UnlockData> = known.mapNotNull { k -> session(k.id)?.let { k.id to it } }.toMap()
+
+    /** One stored session, under the same rules as [sessions]. */
+    fun session(account: String): UnlockData? {
+        val key = ks.getKey(BIO, null) as? java.security.PrivateKey ?: return null
+        val raw = prefs.getString("session.$account", null) ?: return null
+        val (wrapped, sealed) = raw.split(".", limit = 2).let { it[0] to it[1] }
+        val rsa = Cipher.getInstance(RSA).apply { init(Cipher.DECRYPT_MODE, key, OAEP) }
+        val dataKey = rsa.doFinal(unb64(wrapped))
+        val body = open(SecretKeySpec(dataKey, "AES"), sealed)
+        dataKey.fill(0)
+        val o = JSONObject(String(body))
+        body.fill(0)
+        return UnlockData(o.getString("token"), unb64(o.getString("accountId")), unb64(o.getString("accountKey")))
     }
 
     fun forgetSession(account: String) = prefs.edit().remove("session.$account").apply()

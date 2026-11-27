@@ -378,6 +378,15 @@ private fun Attachments(ref: ItemRef, data: ItemData, canEdit: Boolean) {
 
 private const val MAX_FILE = 64 * 1024 * 1024
 
+/** Core's safe name is cut by characters; Android file names are limited to 255 bytes. Keeps the extension. */
+fun diskName(name: String): String {
+    if (name.toByteArray().size <= 200) return name
+    val ext = name.substringAfterLast('.', "").take(16).let { if (it.isEmpty()) "" else ".$it" }
+    var base = name.removeSuffix(ext)
+    while ((base + ext).toByteArray().size > 200) base = base.dropLast(if (base.length > 1 && base[base.length - 2].isHighSurrogate()) 2 else 1)
+    return base + ext
+}
+
 /** A picked file's name and bytes (attachments are capped at 64 MB by the server). */
 fun readUri(context: Context, uri: Uri): Pair<String, ByteArray> {
     val name = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
@@ -405,7 +414,7 @@ private suspend fun shareFile(context: Context, ref: ItemRef, f: FileData, actio
     if (model.locked) return // locked while downloading: nothing goes on disk
     val file = withContext(Dispatchers.IO) {
         val dir = File(context.cacheDir, "open/${UUID.randomUUID()}").apply { mkdirs() }
-        File(dir, f.name).apply { writeBytes(bytes) }
+        File(dir, diskName(f.name)).apply { writeBytes(bytes) }
     }
     if (model.locked) return model.wipeCache()
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
