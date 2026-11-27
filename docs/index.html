@@ -97,7 +97,9 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
   .hero { padding: 36px 0 32px; }
   .lead { font-size: 18px; }
   .cards { grid-template-columns: 1fr; }
-  nav a { margin-left: 12px; font-size: 14px; }
+  header { flex-wrap: wrap; gap: 6px 0; }
+  nav { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+  nav a { margin-left: 0; font-size: 14px; }
   pre { font-size: 12.5px; }
   th { white-space: normal; }
 }
@@ -107,7 +109,7 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
 <div class="wrap">
 <header>
   <a class="mark" href="/">plain<span>text</span></a>
-  <nav><a href="#how">How it works</a><a href="#self-host">Self-host</a><a href="https://git.borodutch.com/backmeupplz/plaintext">Source</a></nav>
+  <nav><a href="#how">How it works</a><a href="#cli">Command line</a><a href="#agents">Agents</a><a href="#self-host">Self-host</a><a href="https://git.borodutch.com/backmeupplz/plaintext">Source</a></nav>
 </header>
 
 <main>
@@ -115,10 +117,11 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
   <h1>Go ahead, store your passwords in <em>Plaintext</em>.</h1>
   <p class="lead">Every security guide tells you never to store passwords in plain text, and this is the one exception. Plaintext is an open-source password manager that you host yourself. Your vault is encrypted on your phone and computer with your password and a Secret Key that never leaves them, so the server, and anyone who breaks into it, only ever holds ciphertext.</p>
   <div class="ctas">
-    <a class="btn primary" href="https://git.borodutch.com/backmeupplz/plaintext/src/branch/main/DESIGN.md">Read the design</a>
+    <a class="btn primary" href="#cli">Install the command line</a>
+    <a class="btn" href="https://git.borodutch.com/backmeupplz/plaintext/src/branch/main/DESIGN.md">Read the design</a>
     <a class="btn" href="https://git.borodutch.com/backmeupplz/plaintext">Browse the source</a>
   </div>
-  <p class="status">Plaintext is in early development. The encryption core and the server work and are tested today, and the apps for iPhone, Mac, Android and the browser extensions are being built next.</p>
+  <p class="status">Plaintext is in early development. The encryption core, the server, the command line and the MCP server for AI agents work and are tested today, and the apps for iPhone, Mac, Android and the browser extensions are being built next.</p>
 </div>
 
 <section id="how">
@@ -146,14 +149,56 @@ a public login key, sealed keys, sealed items
 and one counter per vault</pre>
 </section>
 
+<section id="cli">
+  <h2>Your vault in the terminal</h2>
+  <p class="sub">The <code>plaintext</code> command line keeps your Secret Key and unlocked session in your operating system's keychain. Unlocking lasts 12 hours and, on macOS and Linux, only in the terminal you unlocked in, the way <code>sudo</code> does, so scripts and AI tools use agent keys of their own instead. The installer works on macOS and Linux and checks the download against the release's checksums before it unpacks anything, and Homebrew works too.</p>
+<pre>curl -fsSL https://getplaintext.org/install | sh
+<span class="c"># or</span>
+brew install backmeupplz/tap/plaintext</pre>
+  <p class="sub" style="margin-top:18px">Windows builds and the server binaries are on the <a href="https://github.com/backmeupplz/plaintext/releases/latest">releases page</a>. Once the command line is installed, you can create your account on your server, add logins with generated passwords, share a vault with your family and bring everything over from 1Password or Bitwarden.</p>
+<pre><span class="c"># CODE is the invite an admin sent you, or your setup code on a new server</span>
+plaintext signup --server https://vault.example.com --username alice --invite CODE
+plaintext add GitHub --username alice --generate --url https://github.com
+plaintext get github
+plaintext vault create Family && plaintext vault share Family bob --role writer
+plaintext import 1pux ~/Downloads/export.1pux   <span class="c"># also bitwarden and csv</span></pre>
+</section>
+
+<section id="agents">
+  <h2>Secrets for AI agents, without handing them over</h2>
+  <p class="sub">An agent gets its own account that you own, which can reach only the vaults you share with it and loses a vault when that share expires. It uses a secret by running a command with that secret injected, so the value stays out of prompts and shell history, and every read shows up in the vault's audit log. A model that runs commands can still print whatever it injects, though, so give each agent only the vaults it needs.</p>
+<pre><span class="c"># on your computer, which prints a ptk_… key once</span>
+plaintext agent create deploy-bot --vault Infra --role reader --expires 30d
+
+<span class="c"># on the agent's machine</span>
+export PLAINTEXT_SERVER=https://vault.example.com PLAINTEXT_AGENT_KEY=ptk_…
+DATABASE_URL="pt://Infra/Prod DB/password" plaintext run -- ./migrate</pre>
+  <p class="sub" style="margin-top:18px">For coding agents and chat apps, <code>plaintext mcp</code> is a Model Context Protocol server. The model can search items and read their non-secret fields, run commands with secrets injected and scrubbed from the output, save new logins with generated passwords and ask you for more access, and it doesn't get secret values back unless you set <code>PLAINTEXT_MCP_REVEAL=1</code>. That keeps them out of transcripts by accident, but a model that can run commands can still reach anything in the vaults its agent account can read. In Claude Code, one command adds it:</p>
+<pre>claude mcp add plaintext -e PLAINTEXT_SERVER=https://vault.example.com \
+  -e PLAINTEXT_AGENT_KEY=ptk_… -- plaintext mcp</pre>
+  <p class="sub" style="margin-top:18px">Claude Desktop reads the same entry from <code>claude_desktop_config.json</code>, which Settings › Developer › Edit Config opens for you, and Cursor reads it from <code>~/.cursor/mcp.json</code>. Desktop apps don't always see your shell's PATH, so if one of them can't find <code>plaintext</code>, put the full path that <code>command -v plaintext</code> prints into <code>command</code>.</p>
+<pre>{
+  "mcpServers": {
+    "plaintext": {
+      "command": "plaintext",
+      "args": ["mcp"],
+      "env": {
+        "PLAINTEXT_SERVER": "https://vault.example.com",
+        "PLAINTEXT_AGENT_KEY": "ptk_…"
+      }
+    }
+  }
+}</pre>
+</section>
+
 <section id="self-host">
   <h2>Run your own server</h2>
-  <p class="sub">The server is one small Rust binary on SQLite that stores sealed blobs and checks who may read them. It needs no other services, so a small VPS or a box at home is enough.</p>
-<pre>git clone https://git.borodutch.com/backmeupplz/plaintext
-cd plaintext
-docker build -t plaintext .
-docker run -d -v plaintext:/data -p 8080:8080 plaintext</pre>
-  <p class="sub" style="margin-top:18px">The first account signs up freely and claims the server; set <code>PLAINTEXT_INVITE</code> to let family or teammates join with an invite code, and put the server behind HTTPS.</p>
+  <p class="sub">The server is one small Rust binary on SQLite that stores sealed blobs and checks who may read them. It needs no other services, so a small VPS or a box at home is enough, and the image runs on both amd64 and arm64.</p>
+<pre>docker run -d --name plaintext -v plaintext:/data -p 127.0.0.1:8080:8080 \
+  -e PLAINTEXT_URL=https://vault.example.com \
+  -e PLAINTEXT_SETUP_CODE=a-long-random-string \
+  ghcr.io/backmeupplz/plaintext-server</pre>
+  <p class="sub" style="margin-top:18px">The port above only listens on the machine itself, so put an HTTPS proxy in front of it (or drop the <code>127.0.0.1:</code> if the proxy runs on another machine) and set <code>PLAINTEXT_URL</code> to the address that proxy serves, because the server only accepts logins signed for the address your apps use to reach it. Then create the first account with <code>plaintext signup --invite</code> and your setup code, which must not contain dots because a dotted code reads as an invite. That first signup makes you the server's admin and keeps anyone from claiming it before you. Everyone after that joins with an invite code from an admin, which <code>plaintext user invite</code> makes. If you'd rather skip Docker, each release also has a <code>plaintext-server</code> binary for Linux and macOS that keeps its database wherever <code>PLAINTEXT_DB</code> points.</p>
 </section>
 
 <section>
