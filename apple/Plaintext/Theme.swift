@@ -128,7 +128,6 @@ struct CodeBlock: View {
         Text(text)
             .font(size.monospaced())
             .foregroundStyle(Palette.fg)
-            .textSelection(.enabled)
             .multilineTextAlignment(.center)
             .padding(14)
             .frame(maxWidth: .infinity)

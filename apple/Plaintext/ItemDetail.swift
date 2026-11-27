@@ -10,6 +10,8 @@ struct ItemDetail: View {
     @State private var sharing = false
     @State private var moving = false
     @State private var exportFile: ExportFile?
+    @State private var attaching = false
+    @State private var busy = false
 
     private var summary: ItemSummary? { model.summary(ref.id) }
     private var vault: VaultInfo? { model.vault(ref) }
@@ -42,7 +44,8 @@ struct ItemDetail: View {
                     }
                     if !d.notes.isEmpty {
                         Section("Notes") {
-                            Text((try? AttributedString(markdown: d.notes, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(d.notes))
+                            // Plain text: a link in a shared note never acts on its own.
+                            Text(verbatim: d.notes)
                                 .textSelection(.enabled)
                                 .foregroundStyle(Palette.fg)
                         }
@@ -52,7 +55,7 @@ struct ItemDetail: View {
                             Text(d.tags.map { "#\($0)" }.joined(separator: "  ")).foregroundStyle(Palette.accent)
                         }
                     }
-                    if !d.files.isEmpty {
+                    if !d.files.isEmpty || canEdit {
                         Section("Attachments") {
                             ForEach(d.files, id: \.id) { f in
                                 Button { download(f) } label: {
@@ -63,6 +66,18 @@ struct ItemDetail: View {
                                     }
                                 }
                                 .buttonStyle(.plain)
+                                .contextMenu {
+                                    if canEdit { Button(role: .destructive) { removeFile(f) } label: { Label("Remove", systemImage: "trash") } }
+                                }
+                                .swipeActions {
+                                    if canEdit { Button(role: .destructive) { removeFile(f) } label: { Label("Remove", systemImage: "trash") } }
+                                }
+                            }
+                            if canEdit {
+                                Button { attaching = true } label: {
+                                    if busy { ProgressView() } else { Label("Add attachment", systemImage: "plus") }
+                                }
+                                .disabled(busy)
                             }
                         }
                     }
@@ -111,6 +126,9 @@ struct ItemDetail: View {
         .sheet(isPresented: $sharing) { ShareItemSheet(ref: ref, title: data?.title ?? "") }
         .sheet(isPresented: $moving) { MoveSheet(ref: ref) }
         .fileExporter(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } }), document: exportFile, contentType: .data, defaultFilename: exportFile?.name) { _ in exportFile = nil }
+        .fileImporter(isPresented: $attaching, allowedContentTypes: [.item]) { r in
+            if case .success(let url) = r { attach(url) }
+        }
     }
 
     @ToolbarContentBuilder
@@ -172,6 +190,35 @@ struct ItemDetail: View {
         }
     }
 
+    private func attach(_ url: URL) {
+        let ok = url.startAccessingSecurityScopedResource()
+        defer { if ok { url.stopAccessingSecurityScopedResource() } }
+        let data: Data
+        do { data = try Data(contentsOf: url) } catch { model.show(error); return }
+        let name = url.lastPathComponent
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                try await model.call { [ref] in try $0.attachFile(account: ref.account, vault: ref.vault, id: ref.item, name: name, data: data) }
+                model.reload()
+                load()
+                model.flash("Attached \(name)")
+            } catch { model.show(error) }
+        }
+    }
+
+    private func removeFile(_ f: FileData) {
+        Task {
+            do {
+                try await model.call { [ref] in try $0.removeFile(account: ref.account, vault: ref.vault, id: ref.item, file: f.id) }
+                model.reload()
+                load()
+                model.flash("Removed \(f.name)", icon: "trash")
+            } catch { model.show(error) }
+        }
+    }
+
     private func download(_ f: FileData) {
         Task {
             do {
@@ -193,6 +240,7 @@ func date(seconds: UInt64) -> String {
 
 struct ExportFile: FileDocument {
     static var readableContentTypes: [UTType] { [.data] }
+    static var writableContentTypes: [UTType] { [.data, .pdf] }
     var name: String
     var data: Data
     init(name: String, data: Data) { (self.name, self.data) = (name, data) }
@@ -233,7 +281,6 @@ struct FieldRow: View {
                 }
                 .font(mono ? .body.monospaced() : .body)
                 .foregroundStyle(Palette.fg)
-                .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)

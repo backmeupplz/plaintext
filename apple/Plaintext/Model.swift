@@ -63,6 +63,10 @@ enum Prefs {
     static let sortRecent = "sortRecent"
 
     static func register() {
+        #if !DEBUG
+        // Launch arguments (`-linkPage …`) would override these settings.
+        UserDefaults.standard.removeVolatileDomain(forName: UserDefaults.argumentDomain)
+        #endif
         UserDefaults.standard.register(defaults: [autoLockMinutes: 10, clipboardSeconds: 90, linkPage: defaultLinkPage(), biometrics: true, hideOnShare: true])
     }
 
@@ -104,8 +108,6 @@ final class AppModel: ObservableObject {
     @Published var toast: Toast?
     @Published var banner: String?
     @Published var syncing = false
-    /// An invite or device link opened from outside, for the first-run flow.
-    @Published var incoming: IncomingLink?
     /// Hidden from lists while its undo toast is up.
     private var deleting: Set<String> = []
 
@@ -115,11 +117,6 @@ final class AppModel: ObservableObject {
         var icon = "checkmark.circle.fill"
         var undo: (() -> Void)?
         static func == (a: Toast, b: Toast) -> Bool { a.id == b.id }
-    }
-
-    enum IncomingLink: Equatable {
-        case invite(server: String?, code: String)
-        case device(DeviceCode)
     }
 
     init() {
@@ -194,6 +191,7 @@ final class AppModel: ObservableObject {
         saveSession(unlock, for: k)
         locked = false
         reload()
+        showProblems()
         Task {
             // The app locked meanwhile (say, while writing the kit down): open it again.
             if account(info.id) == nil, !core.accounts().contains(where: { $0.id == info.id }) {
@@ -257,6 +255,7 @@ final class AppModel: ObservableObject {
         reload()
         if !accounts.isEmpty { locked = false }
         banner = errors.first
+        showProblems()
         if !locked { Task { await syncAll() } }
     }
 
@@ -270,6 +269,7 @@ final class AppModel: ObservableObject {
         saveSession(r.unlock, for: k)
         reload()
         locked = false
+        showProblems()
         Task { await syncAll() }
     }
 
@@ -277,6 +277,7 @@ final class AppModel: ObservableObject {
         // Without a stored session the next unlock signs in again, so end these.
         // Not mid-onboarding, though: that session is about to be stored.
         core.lock(endSessions: !sessionsStored && !settingUp)
+        Clipboard.clear()
         accounts = []
         items = []
         vaults = []
@@ -289,11 +290,15 @@ final class AppModel: ObservableObject {
 
     func signOut(_ id: String) {
         guard let k = known(id) else { return }
-        Keychain.forget(k)
+        let locked = account(id) == nil
         known.removeAll { $0.id == id }
         inbox[id] = nil
         Task {
-            _ = try? await call { $0.signOut(account: id) }
+            // A locked account's session ends with the token the keychain kept,
+            // which asks for Face ID / Touch ID first.
+            let stored = locked && Keychain.hasSession(for: k) ? await Task.detached { Keychain.session(for: k, context: nil) }.value : nil
+            Keychain.forget(k)
+            _ = try? await call { $0.signOut(account: id, server: k.server, stored: stored) }
             reload()
             if known.isEmpty { lock() }
         }
@@ -357,10 +362,16 @@ final class AppModel: ObservableObject {
         if accounts.isEmpty, !locked { lock() }
         if let firstError {
             show(firstError)
-        } else if let p = accounts.lazy.flatMap(\.problems).first {
-            // The client's text can end with a CLI hint; the app has its own Verify screen.
-            banner = capitalized(p.components(separatedBy: " (plaintext ").first ?? p)
+        } else {
+            showProblems()
         }
+    }
+
+    /// What the last sync or sign-in couldn't do (vaults that didn't verify, a damaged copy).
+    private func showProblems() {
+        guard banner == nil, let p = accounts.lazy.flatMap(\.problems).first else { return }
+        // The client's text can end with a CLI hint; the app has its own Verify screen.
+        banner = capitalized(p.components(separatedBy: " (plaintext ").first ?? p)
     }
 
     private func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
@@ -451,12 +462,6 @@ final class AppModel: ObservableObject {
         case "totp": if let c = totpCode(spec: d.totp) { copy(c.code, what: "One-time code") }
         default: if !d.password.isEmpty { copy(d.password, what: "Password") }
         }
-    }
-
-    func open(_ url: URL) {
-        let s = url.absoluteString
-        if let d = parseDeviceCode(code: s) { incoming = .device(d); return }
-        if s.hasPrefix("plaintext:invite:"), let l = parseInviteLink(link: s) { incoming = .invite(server: l.server, code: l.code) }
     }
 
     /// The breach check: only five characters of each password's SHA-1 leave the device.

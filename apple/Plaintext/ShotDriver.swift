@@ -44,7 +44,7 @@ enum ShotDriver {
             flow.path = path
             await snap(name, size) { Onboarding(flow: flow) }
         }
-        if let c = flow.signup { model.core.signOut(account: c.account.id) }
+        if let c = flow.signup { model.core.signOut(account: c.account.id, server: server, stored: nil) }
 
         // bob, signed in, with what alice shared.
         do {

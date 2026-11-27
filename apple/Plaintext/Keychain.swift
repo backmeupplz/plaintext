@@ -71,7 +71,13 @@ enum Keychain {
     // and the app still asks for Touch ID or the Mac password before reading.
     // Release builds are always signed, so they never do.
     private static var legacy: Bool {
-        get { UserDefaults.standard.bool(forKey: "keychain.legacy") }
+        get {
+            #if DEBUG
+            return UserDefaults.standard.bool(forKey: "keychain.legacy")
+            #else
+            return false
+            #endif
+        }
         set { UserDefaults.standard.set(newValue, forKey: "keychain.legacy") }
     }
 

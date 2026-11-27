@@ -8,9 +8,11 @@ import AppKit
 @main
 struct PlaintextMain: App {
     @StateObject private var model = AppModel()
+    #if os(iOS)
+    @UIApplicationDelegateAdaptor private var delegate: AppDelegate
+    #endif
 
     init() {
-        EmergencyKit.discardLeftovers()
         #if DEBUG && os(macOS)
         ShotDriver.start()
         #endif
@@ -21,7 +23,6 @@ struct PlaintextMain: App {
             RootView()
                 .environmentObject(model)
                 .tint(Palette.accent)
-                .onOpenURL { model.open($0) }
                 #if os(macOS)
                 .frame(minWidth: 820, minHeight: 520)
                 #endif
@@ -44,8 +45,10 @@ struct RootView: View {
     @AppStorage(Prefs.autoLockMinutes) private var autoLock = 10
     @AppStorage(Prefs.hideOnShare) private var hideOnShare = true
     @State private var backgrounded: Date?
+    #if os(iOS)
     @State private var obscured = false
-    @State private var captured = false
+    @State private var captured = UIScreen.main.isCaptured
+    #endif
 
     var body: some View {
         ZStack {
@@ -60,20 +63,12 @@ struct RootView: View {
         }
         .overlay(alignment: .bottom) { ToastView() }
         .overlay(alignment: .top) { BannerView() }
-        .overlay {
-            // The app switcher snapshot and screen recordings show nothing.
-            if obscured || (captured && hideOnShare) {
-                ZStack {
-                    Rectangle().fill(.regularMaterial)
-                    Wordmark()
-                }
-                .ignoresSafeArea()
-                .accessibilityHidden(true)
-            }
-        }
+        .onAppear { Activity.watch() }
+        .onChange(of: model.locked) { _, locked in if !locked { Activity.touch() } }
         .onChange(of: phase) { _, p in
             #if os(iOS)
-            obscured = p != .active && !model.locked
+            // The app switcher snapshot shows nothing, onboarding (the Secret Key) included.
+            obscured = p != .active
             #endif
             if p == .background {
                 backgrounded = Date()
@@ -83,14 +78,23 @@ struct RootView: View {
                 if Date().timeIntervalSince(b) >= Double(autoLock * 60) { model.lock() }
             }
         }
+        // No touch, typing or click for the auto-lock time.
+        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in
+            if !model.locked, autoLock > 0, Date().timeIntervalSince(Activity.last) >= Double(autoLock * 60) { model.lock() }
+        }
         #if os(iOS)
+        .onChange(of: obscured || (captured && hideOnShare), initial: true) { _, on in PrivacyCover.show(on) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataWillBecomeUnavailableNotification)) { _ in model.lock() }
         .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in captured = UIScreen.main.isCaptured }
         #else
         .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name("com.apple.screenIsLocked"))) { _ in model.lock() }
-        .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { _ in
-            let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
-            if !model.locked, autoLock > 0, idle >= Double(autoLock * 60) { model.lock() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            if autoLock == 0 { model.lock() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in Clipboard.clear() }
+        // Sheets and Settings are windows of their own: hide each one as it appears.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            if hideOnShare { NSApp.windows.forEach { $0.sharingType = .none } }
         }
         .onChange(of: hideOnShare, initial: true) { _, hide in
             DispatchQueue.main.async { NSApp.windows.forEach { $0.sharingType = hide ? .none : .readOnly } }

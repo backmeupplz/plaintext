@@ -85,7 +85,7 @@ struct NewAgent: View {
             Form {
                 if let key {
                     Section {
-                        Text(key).font(.callout.monospaced()).textSelection(.enabled)
+                        Text(key).font(.callout.monospaced())
                         Button { model.copy(key, what: "Agent key") } label: { Label("Copy", systemImage: "doc.on.doc") }
                     } header: {
                         Text("Agent key")
@@ -144,7 +144,9 @@ struct NewAgent: View {
         Task {
             defer { busy = false }
             do {
-                key = try await model.call { try $0.createAgent(account: account, name: n, vault: v, role: r, expires: exp) }
+                let made = try await model.call { try $0.createAgent(account: account, name: n, vault: v, role: r, expires: exp) }
+                key = made.key
+                if let w = made.warning { model.banner = w }
                 model.reload()
             } catch { self.error = errorText(error) }
         }

@@ -69,23 +69,147 @@ enum Device {
     static var undoSeconds: Double { voiceOver ? 15 : 5 }
 }
 
-/// Copied secrets leave the clipboard after a while and are marked concealed.
+/// Copied secrets leave the clipboard after a while, stay on this device (no
+/// Universal Clipboard) and are marked concealed. Locking and quitting clear them.
+@MainActor
 enum Clipboard {
+    /// The pasteboard's change count right after our last copy.
+    private static var ours: Int?
+
     static func copy(_ text: String, seconds: Int) {
         #if os(iOS)
         UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: text]], options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(TimeInterval(seconds))])
+        ours = UIPasteboard.general.changeCount
         #else
         let pb = NSPasteboard.general
-        pb.clearContents()
+        pb.prepareForNewContents(with: .currentHostOnly)
         pb.setString(text, forType: .string)
         pb.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
         let count = pb.changeCount
+        ours = count
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds)) {
             if pb.changeCount == count { pb.clearContents() }
         }
         #endif
         Haptics.tap()
     }
+
+    /// Remove what we copied, unless something else was copied since.
+    static func clear() {
+        #if os(iOS)
+        if UIPasteboard.general.changeCount == ours { UIPasteboard.general.items = [] }
+        #else
+        if NSPasteboard.general.changeCount == ours { NSPasteboard.general.clearContents() }
+        #endif
+        ours = nil
+    }
 }
+
+/// When someone last used the app: auto-lock counts from here, so an iPad on a
+/// stand or a Mac left on another app still locks.
+@MainActor
+enum Activity {
+    private(set) static var last = Date()
+    static func touch() { last = Date() }
+
+    /// Start counting touches, typing and clicks (once).
+    static func watch() {
+        guard !watching else { return }
+        watching = true
+        #if os(iOS)
+        for name in [UITextField.textDidChangeNotification, UITextView.textDidChangeNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in MainActor.assumeIsolated { touch() } }
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { TouchWatcher.install() }
+        }
+        TouchWatcher.install()
+        #else
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]) { e in
+            MainActor.assumeIsolated { touch() }
+            return e
+        }
+        #endif
+    }
+
+    private static var watching = false
+}
+
+#if os(iOS)
+import UIKit.UIGestureRecognizerSubclass
+
+/// Sees every touch in a window (sheets included) without taking any.
+private final class TouchWatcher: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    static func install() {
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for w in scene.windows where !(w.gestureRecognizers ?? []).contains(where: { $0 is TouchWatcher }) {
+                let g = TouchWatcher()
+                g.cancelsTouchesInView = false
+                g.delaysTouchesBegan = false
+                g.delaysTouchesEnded = false
+                g.delegate = g
+                w.addGestureRecognizer(g)
+            }
+        }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        Activity.touch()
+        state = .failed
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+}
+
+/// Covers everything, sheets and alerts included, in the app switcher and while
+/// the screen is recorded or mirrored: its own window above them all.
+@MainActor
+enum PrivacyCover {
+    private static var windows: [UIWindow] = []
+
+    static func show(_ on: Bool) {
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            if let w = windows.first(where: { $0.windowScene === scene }) {
+                w.isHidden = !on
+            } else if on {
+                let w = UIWindow(windowScene: scene)
+                w.windowLevel = .alert + 1
+                w.rootViewController = UIHostingController(rootView: CoverView())
+                w.isHidden = false
+                windows.append(w)
+            }
+        }
+    }
+}
+
+struct CoverView: View {
+    var body: some View {
+        ZStack {
+            Palette.bg
+            Wordmark()
+        }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
+    }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Third-party keyboards could read the Secret Key, revealed passwords and codes.
+    func application(_ application: UIApplication, shouldAllowExtensionPointIdentifier id: UIApplication.ExtensionPointIdentifier) -> Bool {
+        id != .keyboard
+    }
+}
+#else
+/// Keeps its window out of screenshots and screen sharing, whatever the setting.
+struct NoCapture: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { v.window?.sharingType = .none }
+        return v
+    }
+
+    func updateNSView(_ v: NSView, context: Context) { v.window?.sharingType = .none }
+}
+#endif
 
 import UniformTypeIdentifiers
