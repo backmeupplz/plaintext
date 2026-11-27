@@ -46,8 +46,8 @@ struct ItemDetail: View {
                         Section("Notes") {
                             // Plain text: a link in a shared note never acts on its own.
                             Text(verbatim: d.notes)
-                                .textSelection(.enabled)
                                 .foregroundStyle(Palette.fg)
+                                .contextMenu { Button { model.copy(d.notes, what: "Notes") } label: { Label("Copy", systemImage: "doc.on.doc") } }
                         }
                     }
                     if !d.tags.isEmpty {
@@ -78,6 +78,9 @@ struct ItemDetail: View {
                                     if busy { ProgressView() } else { Label("Add attachment", systemImage: "plus") }
                                 }
                                 .disabled(busy)
+                                .fileImporter(isPresented: $attaching, allowedContentTypes: [.item]) { r in
+                                    if case .success(let url) = r { attach(url) }
+                                }
                             }
                         }
                     }
@@ -126,9 +129,6 @@ struct ItemDetail: View {
         .sheet(isPresented: $sharing) { ShareItemSheet(ref: ref, title: data?.title ?? "") }
         .sheet(isPresented: $moving) { MoveSheet(ref: ref) }
         .fileExporter(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } }), document: exportFile, contentType: .data, defaultFilename: exportFile?.name) { _ in exportFile = nil }
-        .fileImporter(isPresented: $attaching, allowedContentTypes: [.item]) { r in
-            if case .success(let url) = r { attach(url) }
-        }
     }
 
     @ToolbarContentBuilder
@@ -191,16 +191,21 @@ struct ItemDetail: View {
     }
 
     private func attach(_ url: URL) {
-        let ok = url.startAccessingSecurityScopedResource()
-        defer { if ok { url.stopAccessingSecurityScopedResource() } }
-        let data: Data
-        do { data = try Data(contentsOf: url) } catch { model.show(error); return }
+        // The server takes files up to 64 MiB.
+        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 64 << 20 {
+            model.banner = "Attachments can be up to 64 MB."
+            return
+        }
         let name = url.lastPathComponent
         busy = true
         Task {
-            defer { busy = false }
+            let ok = url.startAccessingSecurityScopedResource()
+            defer {
+                if ok { url.stopAccessingSecurityScopedResource() }
+                busy = false
+            }
             do {
-                try await model.call { [ref] in try $0.attachFile(account: ref.account, vault: ref.vault, id: ref.item, name: name, data: data) }
+                try await model.call { [ref] in try $0.attachFile(account: ref.account, vault: ref.vault, id: ref.item, name: name, data: try Data(contentsOf: url)) }
                 model.reload()
                 load()
                 model.flash("Attached \(name)")

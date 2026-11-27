@@ -80,7 +80,7 @@ final class AppModel: ObservableObject {
     /// Accounts on this device (signed in, locked or needing their password).
     @Published var known: [KnownAccount] { didSet { saveKnown() } }
     @Published var accounts: [AccountInfo] = []
-    @Published var locked = true
+    @Published var locked = true { didSet { if oldValue && !locked { Activity.reset() } } }
     @Published var unlocking = false
     /// The first account's onboarding is still on screen (Emergency Kit, biometrics)
     /// although `known` already holds the account.
@@ -124,6 +124,21 @@ final class AppModel: ObservableObject {
         let dir = AppModel.dataDirectory()
         core = PlaintextApp(dir: dir.path, device: Device.name)
         known = (UserDefaults.standard.data(forKey: "accounts")).flatMap { try? JSONDecoder().decode([KnownAccount].self, from: $0) } ?? []
+        Guard.start(self)
+        AppModel.wipeTemporary()
+    }
+
+    /// What the system staged for Save dialogs (the Emergency Kit, attachments)
+    /// lands in this app's own temporary folder: clear it at launch and on lock.
+    static func wipeTemporary() {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        // Only a sandboxed folder of our own, and never where the vaults are kept.
+        #if os(macOS)
+        guard ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil else { return }
+        #endif
+        guard dataDirectory().standardizedFileURL != tmp.standardizedFileURL else { return }
+        for f in (try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil)) ?? [] { try? fm.removeItem(at: f) }
     }
 
     /// The shared app-group container when it's available (the AutoFill and
@@ -278,6 +293,7 @@ final class AppModel: ObservableObject {
         // Not mid-onboarding, though: that session is about to be stored.
         core.lock(endSessions: !sessionsStored && !settingUp)
         Clipboard.clear()
+        AppModel.wipeTemporary()
         accounts = []
         items = []
         vaults = []

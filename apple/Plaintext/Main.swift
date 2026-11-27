@@ -42,13 +42,6 @@ struct PlaintextMain: App {
 struct RootView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.scenePhase) private var phase
-    @AppStorage(Prefs.autoLockMinutes) private var autoLock = 10
-    @AppStorage(Prefs.hideOnShare) private var hideOnShare = true
-    @State private var backgrounded: Date?
-    #if os(iOS)
-    @State private var obscured = false
-    @State private var captured = UIScreen.main.isCaptured
-    #endif
 
     var body: some View {
         ZStack {
@@ -63,46 +56,52 @@ struct RootView: View {
         }
         .overlay(alignment: .bottom) { ToastView() }
         .overlay(alignment: .top) { BannerView() }
-        .onAppear { Activity.watch() }
-        .onChange(of: model.locked) { _, locked in if !locked { Activity.touch() } }
-        .onChange(of: phase) { _, p in
-            #if os(iOS)
-            // The app switcher snapshot shows nothing, onboarding (the Secret Key) included.
-            obscured = p != .active
-            #endif
-            if p == .background {
-                backgrounded = Date()
-                if autoLock == 0 { model.lock() }
-            } else if p == .active, let b = backgrounded {
-                backgrounded = nil
-                if Date().timeIntervalSince(b) >= Double(autoLock * 60) { model.lock() }
-            }
-        }
-        // No touch, typing or click for the auto-lock time.
-        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in
-            if !model.locked, autoLock > 0, Date().timeIntervalSince(Activity.last) >= Double(autoLock * 60) { model.lock() }
-        }
-        #if os(iOS)
-        .onChange(of: obscured || (captured && hideOnShare), initial: true) { _, on in PrivacyCover.show(on) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataWillBecomeUnavailableNotification)) { _ in model.lock() }
-        .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in captured = UIScreen.main.isCaptured }
-        #else
-        .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name("com.apple.screenIsLocked"))) { _ in model.lock() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
-            if autoLock == 0 { model.lock() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in Clipboard.clear() }
-        // Sheets and Settings are windows of their own: hide each one as it appears.
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            if hideOnShare { NSApp.windows.forEach { $0.sharingType = .none } }
-        }
-        .onChange(of: hideOnShare, initial: true) { _, hide in
-            DispatchQueue.main.async { NSApp.windows.forEach { $0.sharingType = hide ? .none : .readOnly } }
-        }
-        #endif
         .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
             if phase == .active { Task { await model.syncAll() } }
         }
+    }
+}
+
+/// Locking, the privacy cover and clearing the clipboard, for the app's whole
+/// life: a Mac app keeps running with its window closed.
+@MainActor
+enum Guard {
+    private static var started = false
+    private static var autoLock: Int { UserDefaults.standard.integer(forKey: Prefs.autoLockMinutes) }
+    /// No touch, typing or click for this long locks. "Immediately" locks on
+    /// leaving the app, and after a minute without use while in it.
+    static var idleLimit: TimeInterval { Double(max(autoLock, 1) * 60) }
+
+    static func start(_ model: AppModel) {
+        guard !started else { return }
+        started = true
+        func on(_ name: Notification.Name, _ f: @escaping @MainActor (Notification) -> Void) {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { n in MainActor.assumeIsolated { f(n) } }
+        }
+        Activity.onIdle = { [weak model] in if let model, !model.locked { model.lock() } }
+        Activity.watch()
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in MainActor.assumeIsolated { Activity.check() } }
+        #if os(iOS)
+        on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 { model.lock() } }
+        // Time away counts as time without use.
+        on(UIApplication.willEnterForegroundNotification) { _ in Activity.check() }
+        on(UIApplication.protectedDataWillBecomeUnavailableNotification) { _ in model.lock() }
+        // The app switcher snapshot shows nothing, onboarding (the Secret Key) included.
+        on(UIScene.willDeactivateNotification) { n in PrivacyCover.set(n.object as? UIWindowScene, true) }
+        on(UIScene.didActivateNotification) { n in PrivacyCover.set(n.object as? UIWindowScene, PrivacyCover.capturedHidden) }
+        on(UIScreen.capturedDidChangeNotification) { _ in PrivacyCover.refresh() }
+        on(UserDefaults.didChangeNotification) { _ in PrivacyCover.refresh() }
+        #else
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { model.lock() }
+        }
+        on(NSApplication.didResignActiveNotification) { _ in if autoLock == 0 { model.lock() } }
+        on(NSApplication.didBecomeActiveNotification) { _ in Activity.check() }
+        on(NSApplication.willTerminateNotification) { _ in Clipboard.clear() }
+        // Sheets and Settings are windows of their own: hide each one as it appears.
+        on(NSWindow.didBecomeKeyNotification) { _ in NoCapture.apply() }
+        on(UserDefaults.didChangeNotification) { _ in NoCapture.apply() }
+        #endif
     }
 }
 

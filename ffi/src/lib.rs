@@ -123,7 +123,8 @@ fn password_error(e: ClientError) -> PlaintextError {
 /// save, as the CLI does: say so, but don't keep the account locked. Call after
 /// the first sync, which clears `problems`.
 fn local_warning(s: &mut S, loaded: Result<(), ClientError>) {
-    if loaded.is_err() {
+    // Only a copy that doesn't open: a failed upload of the merged keyring is retried by the next sync.
+    if let Err(ClientError::Core(_)) = loaded {
         s.problems.push("this device's saved copy couldn't be read, so it was replaced with the server's".into());
     }
 }

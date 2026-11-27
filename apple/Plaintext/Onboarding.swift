@@ -423,6 +423,8 @@ struct BiometricsStep: View {
             Button("Not now") { done(false) }.buttonStyle(SecondaryButtonStyle())
         }
         .navigationBarBackButtonHiddenCompat()
+        // Already on for the other accounts: it covers this one too.
+        .onAppear { if model.known.count > 1 && biometrics && Biometrics.available { done(true) } }
     }
 
     private func done(_ on: Bool) {

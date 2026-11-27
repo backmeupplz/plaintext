@@ -110,20 +110,32 @@ enum Clipboard {
 @MainActor
 enum Activity {
     private(set) static var last = Date()
-    static func touch() { last = Date() }
+    /// Called when the app has gone unused for `Guard.idleLimit`.
+    static var onIdle: () -> Void = {}
 
-    /// Start counting touches, typing and clicks (once).
+    /// Someone used the app. The first use after too long locks instead (a
+    /// timer may not have fired while the app was away or napping).
+    static func touch() {
+        check()
+        last = Date()
+    }
+
+    /// Unlocked: count from now.
+    static func reset() { last = Date() }
+
+    static func check() {
+        if Date().timeIntervalSince(last) >= Guard.idleLimit { onIdle() }
+    }
+
+    /// Start counting touches, typing, VoiceOver moves and clicks (once).
     static func watch() {
-        guard !watching else { return }
-        watching = true
         #if os(iOS)
-        for name in [UITextField.textDidChangeNotification, UITextView.textDidChangeNotification] {
+        for name in [UITextField.textDidChangeNotification, UITextView.textDidChangeNotification, UIAccessibility.elementFocusedNotification] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in MainActor.assumeIsolated { touch() } }
         }
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { TouchWatcher.install() }
         }
-        TouchWatcher.install()
         #else
         NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]) { e in
             MainActor.assumeIsolated { touch() }
@@ -131,8 +143,6 @@ enum Activity {
         }
         #endif
     }
-
-    private static var watching = false
 }
 
 #if os(iOS)
@@ -167,17 +177,27 @@ private final class TouchWatcher: UIGestureRecognizer, UIGestureRecognizerDelega
 enum PrivacyCover {
     private static var windows: [UIWindow] = []
 
-    static func show(_ on: Bool) {
+    /// Recording or mirroring the screen, with "hide while sharing" on.
+    static var capturedHidden: Bool { UIScreen.main.isCaptured && UserDefaults.standard.bool(forKey: Prefs.hideOnShare) }
+
+    /// Each window scene is covered on its own (iPad has several).
+    static func set(_ scene: UIWindowScene?, _ on: Bool) {
+        guard let scene else { return }
+        windows.removeAll { $0.windowScene == nil }
+        if let w = windows.first(where: { $0.windowScene === scene }) {
+            w.isHidden = !on
+        } else if on {
+            let w = UIWindow(windowScene: scene)
+            w.windowLevel = .alert + 1
+            w.rootViewController = UIHostingController(rootView: CoverView())
+            w.isHidden = false
+            windows.append(w)
+        }
+    }
+
+    static func refresh() {
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            if let w = windows.first(where: { $0.windowScene === scene }) {
-                w.isHidden = !on
-            } else if on {
-                let w = UIWindow(windowScene: scene)
-                w.windowLevel = .alert + 1
-                w.rootViewController = UIHostingController(rootView: CoverView())
-                w.isHidden = false
-                windows.append(w)
-            }
+            set(scene, scene.activationState != .foregroundActive || capturedHidden)
         }
     }
 }
@@ -202,13 +222,27 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 #else
 /// Keeps its window out of screenshots and screen sharing, whatever the setting.
 struct NoCapture: NSViewRepresentable {
+    /// Windows that stay hidden even with "hide while sharing" off.
+    @MainActor private static let always = NSHashTable<NSWindow>.weakObjects()
+
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
-        DispatchQueue.main.async { v.window?.sharingType = .none }
+        DispatchQueue.main.async { v.window.map(NoCapture.hide) }
         return v
     }
 
-    func updateNSView(_ v: NSView, context: Context) { v.window?.sharingType = .none }
+    func updateNSView(_ v: NSView, context: Context) { v.window.map(NoCapture.hide) }
+
+    @MainActor private static func hide(_ w: NSWindow) {
+        always.add(w)
+        w.sharingType = .none
+    }
+
+    /// Every window as the setting says.
+    @MainActor static func apply() {
+        let hide = UserDefaults.standard.bool(forKey: Prefs.hideOnShare)
+        for w in NSApp.windows { w.sharingType = hide || always.contains(w) ? .none : .readOnly }
+    }
 }
 #endif
 
