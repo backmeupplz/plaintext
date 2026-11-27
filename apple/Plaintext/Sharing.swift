@@ -426,7 +426,7 @@ struct ShareItemSheet: View {
                     }
                 } else if let link {
                     Section {
-                        Text(link).font(.footnote.monospaced()).textSelection(.enabled).lineLimit(4)
+                        Text(link).font(.footnote.monospaced()).lineLimit(4)
                         ShareLink(item: link) { Label("Share link", systemImage: "square.and.arrow.up") }
                         Button { model.copy(link, what: "Link") } label: { Label("Copy link", systemImage: "doc.on.doc") }
                     } footer: {

@@ -9,48 +9,43 @@ import AppKit
 /// The printable Emergency Kit: Secret Key, server, username, a blank line for
 /// the password, and the sign-in QR for a new device.
 enum EmergencyKit {
+    /// The kit as PDF, in memory: it holds the Secret Key, so it's never written
+    /// to this app's folders, only to where Save puts it.
     @MainActor
-    static func write(secretKey: String, server: String, username: String) -> URL? {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Plaintext Emergency Kit - \(username).pdf")
+    static func pdf(secretKey: String, server: String, username: String) -> Data? {
         let page = KitPage(secretKey: secretKey, server: server, username: username, qr: deviceCode(server: server, username: username, secretKey: secretKey))
             .environment(\.colorScheme, .light)
-        let r = ImageRenderer(content: page)
+        let out = NSMutableData()
         var ok = false
-        r.render { size, draw in
+        ImageRenderer(content: page).render { size, draw in
             var box = CGRect(origin: .zero, size: size)
-            guard let ctx = CGContext(url as CFURL, mediaBox: &box, nil) else { return }
+            guard let consumer = CGDataConsumer(data: out as CFMutableData), let ctx = CGContext(consumer: consumer, mediaBox: &box, nil) else { return }
             ctx.beginPDFPage(nil)
             draw(ctx)
             ctx.endPDFPage()
             ctx.closePDF()
             ok = true
         }
-        return ok ? url : nil
-    }
-
-    /// The PDF holds the Secret Key: don't leave it in the temporary folder.
-    static func discard(_ url: URL?) {
-        if let url { try? FileManager.default.removeItem(at: url) }
-    }
-
-    /// At launch: kits left behind when the app was quit with one on screen.
-    static func discardLeftovers() {
-        let tmp = FileManager.default.temporaryDirectory
-        for name in (try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? [] where name.hasPrefix("Plaintext Emergency Kit") {
-            discard(tmp.appendingPathComponent(name))
-        }
+        return ok ? out as Data : nil
     }
 
     @MainActor
-    static func print(_ url: URL) {
+    static func print(_ pdf: Data) {
         #if os(iOS)
         let pc = UIPrintInteractionController.shared
-        pc.printingItem = url
+        pc.printingItem = pdf
         pc.present(animated: true)
         #else
-        guard let doc = PDFDocument(url: url), let op = doc.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true) else { return }
+        guard let doc = PDFDocument(data: pdf), let op = doc.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true) else { return }
         op.runModal(for: NSApp.keyWindow ?? NSWindow(), delegate: nil, didRun: nil, contextInfo: nil)
         #endif
+    }
+}
+
+extension View {
+    /// Save the kit PDF where the user picks.
+    func kitExporter(isPresented: Binding<Bool>, pdf: Data, username: String) -> some View {
+        fileExporter(isPresented: isPresented, document: ExportFile(name: "", data: pdf), contentType: .pdf, defaultFilename: "Plaintext Emergency Kit - \(username)") { _ in }
     }
 }
 

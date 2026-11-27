@@ -337,6 +337,21 @@ pub struct NewLink {
     pub max_views: Option<u32>,
 }
 
+/// `GET /v1/vaults/{id}/files`: every uploaded file, and the server's clock
+/// (unix seconds), which times collection so a device's own clock can't.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileList {
+    pub now: u64,
+    pub files: Vec<FileInfo>,
+}
+
+/// An uploaded file; `size` is the sealed blob's.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileInfo {
+    pub id: Hex,
+    pub size: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuditEntry {
     pub ts: u64,

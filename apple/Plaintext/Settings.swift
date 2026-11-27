@@ -97,7 +97,8 @@ struct AccountSettings: View {
     @State private var users: [UserData] = []
     @State private var invite: String?
     @State private var deviceCode: String?
-    @State private var kit: URL?
+    @State private var kit: Data?
+    @State private var savingKit = false
     @State private var changing = false
     @State private var confirmSignOut = false
     @State private var password = ""
@@ -130,10 +131,11 @@ struct AccountSettings: View {
                         Label("Add a device", systemImage: "qrcode")
                     }
                     Button {
-                        if let sk = Keychain.secretKey(for: known) { kit = EmergencyKit.write(secretKey: sk, server: known.server, username: known.username) }
+                        if let sk = Keychain.secretKey(for: known) { kit = EmergencyKit.pdf(secretKey: sk, server: known.server, username: known.username) }
                     } label: { Label("Emergency Kit", systemImage: "doc.text") }
                     if let kit {
-                        ShareLink(item: kit) { Label("Save the kit as PDF", systemImage: "square.and.arrow.down") }
+                        Button { savingKit = true } label: { Label("Save the kit as PDF", systemImage: "square.and.arrow.down") }
+                            .kitExporter(isPresented: $savingKit, pdf: kit, username: known.username)
                         Button { EmergencyKit.print(kit) } label: { Label("Print the kit", systemImage: "printer") }
                     }
                     Button { changing = true } label: { Label("Change password", systemImage: "key") }
@@ -157,8 +159,9 @@ struct AccountSettings: View {
                         Button { makeInvite() } label: { Label("Invite someone", systemImage: "person.badge.plus") }
                         if let invite {
                             QRImage(text: invite).frame(maxWidth: 200).frame(maxWidth: .infinity)
-                            Text(invite).font(.caption.monospaced()).textSelection(.enabled)
+                            Text(invite).font(.caption.monospaced())
                             ShareLink(item: invite) { Label("Share invite", systemImage: "square.and.arrow.up") }
+                            Button { model.copy(invite, what: "Invite") } label: { Label("Copy invite", systemImage: "doc.on.doc") }
                         }
                         if info?.admin == true {
                             ForEach(users.filter { $0.username != known.username }, id: \.username) { u in
@@ -189,7 +192,6 @@ struct AccountSettings: View {
         .navigationTitle(known.name)
         .inlineTitle()
         .task { await load() }
-        .onDisappear { EmergencyKit.discard(kit) }
         .sheet(isPresented: Binding(get: { deviceCode != nil }, set: { if !$0 { deviceCode = nil } })) { AddDeviceSheet(code: deviceCode ?? "") }
         .sheet(isPresented: $changing) { ChangePassword(known: known) }
         .confirmationDialog("Sign out of \(known.name)?", isPresented: $confirmSignOut, titleVisibility: .visible) {
@@ -246,6 +248,11 @@ struct AddDeviceSheet: View {
     let code: String
     @Environment(\.dismiss) private var dismiss
     @State private var shown = false
+    #if os(iOS)
+    @State private var captured = UIScreen.main.isCaptured
+    #else
+    private let captured = false
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -254,8 +261,15 @@ struct AddDeviceSheet: View {
                     .foregroundStyle(Palette.muted)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                if shown {
+                if captured {
+                    Note(text: "The code stays hidden while your screen is recorded or shared.", icon: "eye.slash")
+                } else if shown {
+                    // It holds the Secret Key: shown for a minute at a time.
                     QRImage(text: code).frame(maxWidth: 260)
+                        .task {
+                            try? await Task.sleep(for: .seconds(60))
+                            shown = false
+                        }
                 } else {
                     Button("Show the code") { shown = true }.buttonStyle(PrimaryButtonStyle()).frame(maxWidth: 260)
                 }
@@ -263,6 +277,11 @@ struct AddDeviceSheet: View {
             }
             .padding(24)
             .background(Palette.bg)
+            #if os(iOS)
+            .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in captured = UIScreen.main.isCaptured }
+            #else
+            .background(NoCapture())
+            #endif
             .navigationTitle("Add a device")
             .inlineTitle()
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }

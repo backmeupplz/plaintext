@@ -117,7 +117,16 @@ fn app_end_to_end() {
     assert!(alice.items(None, None, "first-password".into(), false).is_empty(), "search never matches secrets");
 
     // Attachments, and moving an item re-encrypts them for the new vault.
+    let stale = alice.item(a.clone(), personal.clone(), id.clone()).unwrap();
     alice.attach_file(a.clone(), personal.clone(), id.clone(), "codes.txt".into(), b"recovery codes".to_vec()).unwrap();
+    alice.attach_file(a.clone(), personal.clone(), id.clone(), "../../evil.plist".into(), b"x".to_vec()).unwrap();
+    // An editor opened before the attach saves: the files stay.
+    alice.put_item(a.clone(), personal.clone(), Some(id.clone()), stale).unwrap();
+    let files = alice.item(a.clone(), personal.clone(), id.clone()).unwrap().files;
+    assert_eq!(files.len(), 2, "an edit keeps files attached meanwhile");
+    assert!(!files[1].name.contains('/'), "{}", files[1].name);
+    alice.remove_file(a.clone(), personal.clone(), id.clone(), files[1].id.clone()).unwrap();
+    assert_eq!(alice.item(a.clone(), personal.clone(), id.clone()).unwrap().files.len(), 1);
     let work = alice.create_vault(a.clone(), "Work".into()).unwrap();
     let moved = alice.move_item(a.clone(), personal.clone(), id.clone(), a.clone(), work.clone()).unwrap();
     let f = alice.item(a.clone(), work.clone(), moved.clone()).unwrap().files[0].id.clone();
@@ -166,8 +175,8 @@ fn app_end_to_end() {
     assert!(alice.create_link(a.clone(), work.clone(), moved.clone(), "".into(), 3600, true).unwrap().starts_with("https://getplaintext.org/s/#"));
 
     // An agent made from the app, and its request in the owner's inbox.
-    let key = alice.create_agent(a.clone(), "Deploy-Bot".into(), work.clone(), Role::Reader, Some(now() + 3600)).unwrap();
-    assert!(key.starts_with("ptk_"));
+    let made = alice.create_agent(a.clone(), "Deploy-Bot".into(), work.clone(), Role::Reader, Some(now() + 3600)).unwrap();
+    assert!(made.key.starts_with("ptk_") && made.warning.is_none());
     let agents = alice.agents(a.clone()).unwrap();
     assert_eq!((agents[0].name.as_str(), agents[0].access[0].role), ("deploy-bot", Role::Reader));
 
@@ -179,6 +188,11 @@ fn app_end_to_end() {
     alice.lock(false);
     alice.resume("http://127.0.0.1:9".into(), r.unlock.clone()).unwrap();
     assert_eq!(alice.items(None, Some(work.clone()), "".into(), false).len(), 1, "offline from the device's copies");
+    // A move that can't reach the server leaves no copy in the target to go out later.
+    let plain = alice.items(Some(a.clone()), Some(personal.clone()), "".into(), false).into_iter().find(|i| alice.item(a.clone(), personal.clone(), i.id.clone()).unwrap().files.is_empty()).unwrap();
+    assert!(matches!(alice.move_item(a.clone(), personal.clone(), plain.id.clone(), a.clone(), work.clone()), Err(PlaintextError::Network { .. })));
+    assert_eq!(alice.items(None, Some(work.clone()), "".into(), false).len(), 1);
+    assert!(alice.item(a.clone(), personal.clone(), plain.id).is_ok());
     alice.set_flags(a.clone(), work.clone(), moved.clone(), false, true).unwrap();
     assert!(alice.accounts()[0].pending);
     alice.lock(false);
@@ -210,7 +224,7 @@ fn app_end_to_end() {
     assert!(matches!(phone.resume(url.clone(), unlock), Err(PlaintextError::SignedOut)));
     assert!(!phone.is_unlocked());
     let p = phone.login(url.clone(), r.secret_key.clone(), "alice pw".into()).unwrap().account.id;
-    phone.sign_out(p);
+    phone.sign_out(p, url.clone(), None);
     assert!(!phone.is_unlocked());
     let _ = std::fs::remove_dir_all(adir);
 }
@@ -259,7 +273,7 @@ fn several_accounts() {
     app.resume(family.clone(), home.unlock).unwrap();
     app.resume(hosted.clone(), cloud.unlock).unwrap();
     assert_eq!(app.items(None, None, "".into(), false).len(), 2);
-    app.sign_out(c.clone());
+    app.sign_out(c.clone(), String::new(), None);
     assert_eq!(app.accounts().len(), 1);
     assert!(app.vaults().iter().all(|v| v.account_id == h));
     let _ = std::fs::remove_dir_all(dir);

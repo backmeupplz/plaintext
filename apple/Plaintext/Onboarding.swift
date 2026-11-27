@@ -36,30 +36,9 @@ struct Onboarding: View {
                 }
         }
         .environmentObject(flow)
-        .onAppear {
-            flow.finish = onDone
-            take(model.incoming)
-        }
-        .onChange(of: model.incoming) { _, l in take(l) }
+        .onAppear { flow.finish = onDone }
         // Closed before finishing (say, Add account cancelled on the kit step).
         .onDisappear { model.settingUp = false }
-    }
-
-    private func take(_ link: AppModel.IncomingLink?) {
-        guard let link else { return }
-        model.incoming = nil
-        switch link {
-        case .invite(let server, let code):
-            flow.mode = .create
-            flow.invite = code
-            flow.fromInvite = true
-            if let server { flow.custom = server; flow.useCloud = false }
-            flow.path = [.server]
-        case .device(let d):
-            flow.mode = .signIn
-            (flow.server, flow.custom, flow.useCloud, flow.username, flow.secretKey) = (d.server, d.server, false, d.username, d.secretKey)
-            flow.path = [.server, .password]
-        }
     }
 }
 
@@ -78,7 +57,8 @@ final class Flow: ObservableObject {
     @Published var username = ""
     @Published var password = ""
     @Published var invite = ""
-    var fromInvite = false
+    /// Show the invite field on an open server too.
+    @Published var hasInvite = false
     @Published var secretKey = ""
     var signup: SignupResult?
     var login: LoginResult?
@@ -265,6 +245,7 @@ struct CreateStep: View {
     @State private var reveal = false
     @State private var busy = false
     @State private var error: String?
+    @State private var scanning = false
 
     private var needsInvite: Bool { !(flow.info?.open ?? true) }
     private var setup: Bool { flow.info?.setup ?? false }
@@ -305,10 +286,21 @@ struct CreateStep: View {
                 Field(label: "Setup code", note: "The code the person who runs this server set, so nobody else can claim it first.") {
                     TextField("Setup code", text: $flow.invite).plainInput()
                 }
-            } else if needsInvite || flow.fromInvite {
+            } else if needsInvite || flow.hasInvite {
                 Field(label: needsInvite ? "Invite code" : "Invite code (optional)", note: "From the person who invited you. It also confirms who they are.") {
-                    TextField("Paste the invite code", text: $flow.invite).plainInput().font(.body.monospaced())
+                    HStack {
+                        TextField("Paste the invite code", text: $flow.invite).plainInput().font(.body.monospaced())
+                        Button { scanning = true } label: { Image(systemName: "qrcode.viewfinder") }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Palette.accent)
+                            .accessibilityLabel("Scan an invite")
+                    }
                 }
+            } else {
+                Button { flow.hasInvite = true } label: { Label("I have an invite", systemImage: "envelope.open") }
+                    .font(.subheadline.weight(.medium))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Palette.accent)
             }
             if let error { Note(text: error, icon: "exclamationmark.circle", color: Palette.danger) }
         } actions: {
@@ -317,6 +309,16 @@ struct CreateStep: View {
             }
             .buttonStyle(PrimaryButtonStyle())
             .disabled(!ready || busy)
+        }
+        .sheet(isPresented: $scanning) {
+            CodeScanner(title: "Scan an invite", prompt: "Scan the invite code the person who invited you shows, or paste their invite link.") { code in
+                guard let l = parseInviteLink(link: code) else { return "That isn't a Plaintext invite." }
+                if let s = l.server, (try? serverAddress(address: s))?.url != flow.server {
+                    return "This invite is for \(s). Go back and choose that server."
+                }
+                flow.invite = l.code
+                return nil
+            }
         }
     }
 
@@ -342,7 +344,9 @@ struct CreateStep: View {
 
 struct KitStep: View {
     @EnvironmentObject var flow: Flow
-    @State private var pdf: URL?
+    @EnvironmentObject var model: AppModel
+    @State private var pdf: Data?
+    @State private var saving = false
 
     var body: some View {
         let r = flow.signup
@@ -352,28 +356,32 @@ struct KitStep: View {
                     Text("Secret Key").font(.subheadline.weight(.medium)).foregroundStyle(Palette.muted)
                     CodeBlock(text: r.secretKey, size: .title2)
                         .accessibilityLabel("Secret Key \(r.secretKey.map { String($0) }.joined(separator: " "))")
+                    Button { model.copy(r.secretKey, what: "Secret Key") } label: { Label("Copy", systemImage: "doc.on.doc") }
+                        .font(.subheadline.weight(.medium))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Palette.accent)
                 }
                 LabeledRow(label: "Server", value: r.account.server)
                 LabeledRow(label: "Username", value: r.account.username)
                 if let w = r.warning { Note(text: w, icon: "exclamationmark.triangle", color: Palette.warn) }
             }
         } actions: {
-            if let pdf {
+            if let pdf, let r {
                 HStack(spacing: 12) {
-                    ShareLink(item: pdf) { Label("Save as PDF", systemImage: "square.and.arrow.down") }
+                    Button { saving = true } label: { Label("Save as PDF", systemImage: "square.and.arrow.down") }
                         .buttonStyle(SecondaryButtonStyle())
                     Button { EmergencyKit.print(pdf) } label: { Label("Print", systemImage: "printer") }
                         .buttonStyle(SecondaryButtonStyle())
                 }
+                .kitExporter(isPresented: $saving, pdf: pdf, username: r.account.username)
                 Button("I've saved it") { flow.path.append(.biometrics) }
                 .buttonStyle(PrimaryButtonStyle())
             }
         }
         .navigationBarBackButtonHiddenCompat()
         .task {
-            if let r { pdf = EmergencyKit.write(secretKey: r.secretKey, server: r.account.server, username: r.account.username) }
+            if let r { pdf = EmergencyKit.pdf(secretKey: r.secretKey, server: r.account.server, username: r.account.username) }
         }
-        .onDisappear { EmergencyKit.discard(pdf) }
     }
 }
 
@@ -384,7 +392,7 @@ struct LabeledRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label).font(.subheadline).foregroundStyle(Palette.muted)
-            Text(value).font(mono ? .body.monospaced() : .body).foregroundStyle(Palette.fg).textSelection(.enabled)
+            Text(value).font(mono ? .body.monospaced() : .body).foregroundStyle(Palette.fg)
         }
         .accessibilityElement(children: .combine)
     }
@@ -415,15 +423,22 @@ struct BiometricsStep: View {
             Button("Not now") { done(false) }.buttonStyle(SecondaryButtonStyle())
         }
         .navigationBarBackButtonHiddenCompat()
+        // Already on for the other accounts: it covers this one too.
+        .onAppear { if model.known.count > 1 && biometrics && Biometrics.available { done(true) } }
     }
 
     private func done(_ on: Bool) {
-        biometrics = on
+        // One setting for every account: "Not now" on an added account leaves the
+        // others as they are (turning it off would end their stored sessions).
+        let adding = model.known.count > 1
+        let turnedOn = on && !biometrics
+        if on || !adding { biometrics = on }
         if let r = flow.signup {
             model.added(r.account, unlock: r.unlock, secretKey: r.secretKey)
         } else if let l = flow.login {
             model.added(l.account, unlock: l.unlock, secretKey: flow.secretKey)
         }
+        if adding && turnedOn { model.biometricsChanged() }
         flow.finish()
     }
 }

@@ -1,0 +1,183 @@
+# Pushing a v* tag to git.borodutch.com (`git tag -a v0.1.0 -m "Plaintext 0.1.0" && git push origin v0.1.0`; the push
+# mirror carries it to GitHub) builds the command line (`plaintext`) and the server (`plaintext-server`) for every
+# platform docs/install supports and publishes them with SHA256SUMS, which the installer checks, as the GitHub Release
+# (the installer and Homebrew download from there) and the same release on git.borodutch.com. Then:
+#   Homebrew  Formula/plaintext.rb in backmeupplz/homebrew-tap on git.borodutch.com     (secret FJ_PUSH_TOKEN)
+#   Docker    ghcr.io/backmeupplz/plaintext-server:<version> and :latest, amd64 + arm64   (secret GH_MIRROR_TOKEN)
+# GH_MIRROR_TOKEN is a GitHub PAT (repo, write:packages): it creates the GitHub Release, since the repo there is a
+# read-only mirror, and pushes the image to GHCR (Forgejo's own registry is turned off on git.borodutch.com).
+# Linux builds are static musl binaries and Windows is the GNU target, all cross-compiled with zig; the image is the
+# Linux server binary alone on an empty base, assembled by packaging/image.sh without a Docker daemon (jobs have none).
+# Pull requests that touch the release tooling or dependencies run the build job only, so a tag is never the first
+# build (the publish jobs only run on tags). Actions are
+# pinned to commits and every downloaded tool to a checksum, so a moved tag can't change a release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [.forgejo/workflows/release.yml, packaging/**, Cargo.lock, "**/Cargo.toml"]
+permissions:
+  contents: read
+# one release at a time (the tap is pushed, not merged, and `latest` must end on the newest), PRs on their own
+concurrency: release-${{ github.event_name == 'pull_request' && github.ref || 'tags' }}
+env:
+  GH_REPO: ${{ github.repository }} # gh talks to github.com/backmeupplz/plaintext, not to the Forgejo remote
+jobs:
+  build:
+    # outsiders' pull requests don't get the Mac runners
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude"]'), github.event.pull_request.user.login)
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, server: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, server: true }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, server: true }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-musl, server: true }
+          - { os: ubuntu-24.04, target: x86_64-pc-windows-gnu, server: false }
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag matches the version in Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml says $version, the tag is $GITHUB_REF_NAME"; exit 1; }
+      - name: Rust stable, in the job's own directory (the macOS runner is a shared host, the Linux image has none)
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME="$RUNNER_TEMP/cargo" RUSTUP_HOME="$RUNNER_TEMP/rustup" \
+            sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable --target "$TARGET"
+      - name: zig and cargo-zigbuild for the Linux and Windows targets
+        if: runner.os == 'Linux'
+        env:
+          ZIG_URL: https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+          ZIG_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+          ZIGBUILD_URL: https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz
+          ZIGBUILD_SHA256: f09b180a517af0e4dd4bffc921bb88e5ab705452a9dd948c61e489b3020c68c2
+        run: |
+          curl -sSfL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl -sSfL "$ZIGBUILD_URL" -o "$RUNNER_TEMP/zigbuild.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$RUNNER_TEMP/zig.tar.xz" "$ZIGBUILD_SHA256" "$RUNNER_TEMP/zigbuild.tar.xz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components 1
+          tar -xJf "$RUNNER_TEMP/zigbuild.tar.xz" -C "$RUNNER_TEMP/cargo/bin" --strip-components 1 \
+            cargo-zigbuild-x86_64-unknown-linux-musl/cargo-zigbuild
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          build=build; [ "$RUNNER_OS" = Linux ] && build=zigbuild
+          packages="-p plaintext-cli"; [ "${{ matrix.server }}" = true ] && packages="$packages -p plaintext-server"
+          cargo $build --release --locked --target "$TARGET" $packages
+      - name: Package
+        run: |
+          out=target/$TARGET/release
+          case "$TARGET" in
+            aarch64-apple-darwin | x86_64-unknown-linux-musl) "$out/plaintext" --version ;; # the ones this runner can run
+          esac
+          if [ "${{ matrix.server }}" = true ]; then
+            tar -czf "plaintext-$TARGET.tar.gz" -C "$out" plaintext
+            tar -czf "plaintext-server-$TARGET.tar.gz" -C "$out" plaintext-server
+          else
+            (cd "$out" && zip -q "$GITHUB_WORKSPACE/plaintext-$TARGET.zip" plaintext.exe)
+          fi
+          ls -l plaintext-*
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
+        with:
+          name: plaintext-${{ matrix.target }}
+          path: |
+            plaintext-*.tar.gz
+            plaintext-*.zip
+
+  # One job publishes the release with every file at once, so releases/latest/download/* never 404s mid-release.
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
+        with:
+          pattern: plaintext-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum plaintext-* > SHA256SUMS && cat SHA256SUMS
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "" --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+
+  forgejo:
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: The same release on git.borodutch.com
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          FJ_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -D dist
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
+          id=$(jq -n --arg t "$GITHUB_REF_NAME" '{tag_name: $t, name: $t, body: ""}' |
+            curl -sSf -H "Authorization: token $FJ_TOKEN" -H 'Content-Type: application/json' -d @- "$api" | jq .id)
+          for f in dist/*; do
+            curl -sSf -o /dev/null -H "Authorization: token $FJ_TOKEN" -F "attachment=@$f" "$api/$id/assets?name=$(basename "$f")"
+          done
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: Formula/plaintext.rb in backmeupplz/homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          FJ_PUSH_TOKEN: ${{ secrets.FJ_PUSH_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS
+          packaging/homebrew/formula.sh "${GITHUB_REF_NAME#v}" SHA256SUMS > plaintext.rb
+          git clone --depth 1 "https://backmeupplz:$FJ_PUSH_TOKEN@git.borodutch.com/backmeupplz/homebrew-tap.git" tap
+          mv plaintext.rb tap/Formula/plaintext.rb
+          cd tap
+          git add Formula/plaintext.rb
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "plaintext ${GITHUB_REF_NAME#v}"
+          git push
+
+  docker:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: crane, pinned by checksum because it gets the registry token
+        env:
+          CRANE_URL: https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          curl -sSfL "$CRANE_URL" -o "$RUNNER_TEMP/crane.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/crane" && tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
+          echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
+      - name: ghcr.io/backmeupplz/plaintext-server from the release's own Linux binaries
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -p 'plaintext-server-*-linux-musl.tar.gz' -p SHA256SUMS -D dist
+          (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
+          printf '%s' "$GH_TOKEN" | crane auth login ghcr.io -u backmeupplz --password-stdin
+          packaging/image.sh ghcr.io/backmeupplz/plaintext-server "${GITHUB_REF_NAME#v}" dist
