@@ -262,6 +262,7 @@ private fun NewAgentSheet(account: String, onDismiss: () -> Unit) {
     var role by remember { mutableStateOf(Role.READER) }
     var expiry by remember { mutableStateOf(0L) }
     var key by remember { mutableStateOf<String?>(null) }
+    var keyWarning by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var vaultMenu by remember { mutableStateOf(false) }
@@ -274,6 +275,7 @@ private fun NewAgentSheet(account: String, onDismiss: () -> Unit) {
                 Text("Agent key", color = P.muted, style = MaterialTheme.typography.labelLarge)
                 CodeBlock(k, style = MaterialTheme.typography.bodyMedium)
                 SecondaryButton("Copy", { model.copy(k, "Agent key") })
+                keyWarning?.let { Note(it) }
                 Text("This is the only time it's shown. Store it where the agent runs; anyone with it acts as ${name.lowercase()}.", color = P.muted, style = MaterialTheme.typography.bodySmall)
                 Text("Use it", color = P.muted, style = MaterialTheme.typography.labelLarge)
                 CodeBlock("PLAINTEXT_SERVER=$server PLAINTEXT_AGENT_KEY=… plaintext run --env API_TOKEN=\"Item/password\" -- ./deploy.sh", style = MaterialTheme.typography.bodySmall)
@@ -299,7 +301,9 @@ private fun NewAgentSheet(account: String, onDismiss: () -> Unit) {
                     val (n, v, r) = Triple(name, vault, role)
                     model.act {
                         try {
-                            key = model.call { it.createAgent(account, n, v, r, expiresAt(expiry)) }
+                            val made = model.call { it.createAgent(account, n, v, r, expiresAt(expiry)) }
+                            keyWarning = made.warning
+                            key = made.key
                             model.reload()
                         } catch (e: Exception) { error = errorText(e) } finally { busy = false }
                     }

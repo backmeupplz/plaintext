@@ -77,17 +77,6 @@ import java.util.UUID
 /** Field kinds whose values are secrets: shown as dots until revealed, copied as sensitive. */
 fun concealed(kind: String) = kind == "concealed" || kind == "ssh_key"
 
-/**
- * A file name that can't leave the folder it's written to: its last path part, without control characters.
- * ponytail: mirrors core's `safe_file_name`; switch to the Rust export once the FFI has it (after PR #14).
- */
-fun safeName(name: String): String {
-    var base = name.substringAfterLast('/').substringAfterLast('\\').filterNot { Character.isISOControl(it) }.trim().take(200)
-    // File names are limited to 255 bytes, not characters.
-    while (base.toByteArray().size > 200) base = base.dropLast(if (base.length > 1 && base[base.length - 2].isHighSurrogate()) 2 else 1)
-    return if (base.isEmpty() || base == "." || base == "..") "attachment" else base
-}
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ItemDetail(ref: ItemRef) {
@@ -320,6 +309,7 @@ private fun Attachments(ref: ItemRef, data: ItemData, canEdit: Boolean) {
     val model = context.model
     var busy by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf<FileData?>(null) }
+    var removing by remember { mutableStateOf<FileData?>(null) }
     val add = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         busy = true
@@ -339,7 +329,7 @@ private fun Attachments(ref: ItemRef, data: ItemData, canEdit: Boolean) {
         model.act {
             val bytes = model.call { it.downloadFile(ref.account, ref.vault, ref.item, f.id) }
             withContext(Dispatchers.IO) { context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) } }
-            model.flash("Saved ${safeName(f.name)}")
+            model.flash("Saved ${f.name}")
         }
     }
     if (data.files.isEmpty() && !canEdit) return
@@ -351,14 +341,15 @@ private fun Attachments(ref: ItemRef, data: ItemData, canEdit: Boolean) {
                 Row(Modifier.fillMaxWidth().clickable { menu = true }.heightIn(min = 52.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Icon(Icons.Rounded.AttachFile, null, tint = P.muted)
                     Column(Modifier.weight(1f)) {
-                        Text(safeName(f.name), color = P.fg)
+                        Text(f.name, color = P.fg)
                         Text(android.text.format.Formatter.formatShortFileSize(context, f.size.toLong()), color = P.muted, style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 DropdownMenu(menu, { menu = false }) {
                     DropdownMenuItem({ Text("Open") }, { menu = false; model.act { shareFile(context, ref, f, Intent.ACTION_VIEW) } })
                     DropdownMenuItem({ Text("Share…") }, { menu = false; model.act { shareFile(context, ref, f, Intent.ACTION_SEND) } })
-                    DropdownMenuItem({ Text("Save to Files…") }, { menu = false; saving = f; model.external = true; save.launch(safeName(f.name)) })
+                    DropdownMenuItem({ Text("Save to Files…") }, { menu = false; saving = f; model.external = true; save.launch(f.name) })
+                    if (canEdit) DropdownMenuItem({ Text("Remove", color = P.danger) }, { menu = false; removing = f })
                 }
             }
         }
@@ -369,15 +360,42 @@ private fun Attachments(ref: ItemRef, data: ItemData, canEdit: Boolean) {
             }
         }
     }
+    removing?.let { f ->
+        AlertDialog(
+            onDismissRequest = { removing = null },
+            title = { Text("Remove ${f.name}?") },
+            text = { Text("It's taken off this item on all your devices.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    removing = null
+                    model.act { model.call { it.removeFile(ref.account, ref.vault, ref.item, f.id) }; model.reload() }
+                }) { Text("Remove", color = P.danger) }
+            },
+            dismissButton = { TextButton(onClick = { removing = null }) { Text("Cancel") } },
+        )
+    }
 }
+
+private const val MAX_FILE = 64 * 1024 * 1024
 
 /** A picked file's name and bytes (attachments are capped at 64 MB by the server). */
 fun readUri(context: Context, uri: Uri): Pair<String, ByteArray> {
     val name = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
         if (c.moveToFirst()) c.getString(0) else null
     } ?: "attachment"
-    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw UserError("Couldn't read that file.")
-    return safeName(name) to bytes
+    // Read at most one byte past the limit, so a huge (or unknown-size) file never fills memory.
+    val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        while (out.size() <= MAX_FILE) {
+            val n = input.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+        }
+        out.toByteArray()
+    } ?: throw UserError("Couldn't read that file.")
+    if (bytes.size > MAX_FILE) throw UserError("Attachments can be up to 64 MB.")
+    return name to bytes
 }
 
 /** Decrypt into a fresh folder in the cache (wiped on lock and sign-out) and hand it to another app. */
@@ -387,7 +405,7 @@ private suspend fun shareFile(context: Context, ref: ItemRef, f: FileData, actio
     if (model.locked) return // locked while downloading: nothing goes on disk
     val file = withContext(Dispatchers.IO) {
         val dir = File(context.cacheDir, "open/${UUID.randomUUID()}").apply { mkdirs() }
-        File(dir, safeName(f.name)).apply { writeBytes(bytes) }
+        File(dir, f.name).apply { writeBytes(bytes) }
     }
     if (model.locked) return model.wipeCache()
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)

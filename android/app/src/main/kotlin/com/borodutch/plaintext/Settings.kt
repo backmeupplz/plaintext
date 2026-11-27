@@ -246,8 +246,16 @@ fun AccountScreen(account: String) {
         confirmButton = {
             TextButton(onClick = {
                 confirmSignOut = false
-                model.pop()
-                model.signOut(account)
+                // Locked, with a stored session: a fingerprint lets it end on the server too.
+                if (info == null && model.vault.hasSession(account) && Vault.biometricsAvailable(context)) {
+                    promptBiometrics(
+                        context as FragmentActivity, "Sign out of ${known.name}", subtitle = "Also ends this device's session on the server",
+                        negative = "Skip", onNegative = { model.pop(); model.signOut(account) },
+                    ) { model.pop(); model.signOut(account, withStored = true) }
+                } else {
+                    model.pop()
+                    model.signOut(account)
+                }
             }) { Text("Sign out", color = P.danger) }
         },
         dismissButton = { TextButton(onClick = { confirmSignOut = false }) { Text("Cancel") } },

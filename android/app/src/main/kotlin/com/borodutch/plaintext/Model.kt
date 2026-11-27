@@ -345,8 +345,14 @@ class Model(val context: Context) {
         File(context.cacheDir, "open").deleteRecursively()
     }
 
-    fun signOut(id: String) = scope.launch {
-        withContext(Dispatchers.IO) { core.signOut(id) }
+    /** Sign out of one account. A locked one's server session ends too when [withStored] (right after a biometric prompt). */
+    fun signOut(id: String, withStored: Boolean = false) = scope.launch {
+        val server = known(id)?.server ?: return@launch
+        withContext(Dispatchers.IO) {
+            val stored = if (withStored) runCatching { vault.sessions()[id] }.getOrNull() else null
+            core.signOut(id, server, stored)
+            stored?.accountKey?.fill(0)
+        }
         vault.forget(id)
         storeKnown(known.filter { it.id != id })
         inbox = inbox - id

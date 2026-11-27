@@ -6,7 +6,7 @@ You need the Android SDK (`ANDROID_HOME`, with NDK 28.2.13676358), JDK 17, rustu
 
 ```sh
 android/build.sh                                   # release APK, arm64-v8a + x86_64
-ABIS=x86_64 PROFILE=dev TASK=assembleDebug android/build.sh   # quick debug build for the emulator
+ABIS=arm64-v8a PROFILE=dev TASK=assembleDebug android/build.sh   # quick debug build (x86_64 for an Intel emulator)
 ```
 
 The script builds `plaintext-ffi` with cargo-ndk, generates the Kotlin bindings with UniFFI and runs Gradle. The APKs end up in `android/app/build/outputs/apk/`. A release build is signed only when `android/keystore.properties` exists. The keystore lives in Vaultwarden under "Plaintext: Android release keystore" and never goes into the repo.

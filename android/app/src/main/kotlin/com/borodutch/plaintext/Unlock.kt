@@ -43,15 +43,26 @@ import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
 
 /** One strong-biometric prompt; on success the stored sessions open (the Keystore key allows a few seconds). */
-fun promptBiometrics(activity: FragmentActivity, title: String, onSuccess: () -> Unit) {
+fun promptBiometrics(
+    activity: FragmentActivity,
+    title: String,
+    subtitle: String? = null,
+    negative: String = "Use password",
+    onNegative: () -> Unit = {},
+    onSuccess: () -> Unit,
+) {
     val prompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), object : BiometricPrompt.AuthenticationCallback() {
         override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) = onSuccess()
+        override fun onAuthenticationError(code: Int, message: CharSequence) {
+            if (code == BiometricPrompt.ERROR_NEGATIVE_BUTTON) onNegative()
+        }
     })
     prompt.authenticate(
         BiometricPrompt.PromptInfo.Builder()
             .setTitle(title)
+            .apply { if (subtitle != null) setSubtitle(subtitle) }
             .setAllowedAuthenticators(BIOMETRIC_STRONG)
-            .setNegativeButtonText("Use password")
+            .setNegativeButtonText(negative)
             .build(),
     )
 }
