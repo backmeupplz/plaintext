@@ -103,7 +103,11 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
                 .values()
                 .map(|v| json!({"name": v.meta.name, "role": v.role(&me, now()), "items": v.items().count()}))
                 .collect();
-            serde_json::to_string_pretty(&v)?
+            let mut out = serde_json::to_string_pretty(&v)?;
+            for p in &s.problems {
+                out.push_str(&format!("\nwarning: {}", crate::clean(p)));
+            }
+            out
         }
         "search_items" => {
             let hits: Vec<Value> = match arg(a, "query") {

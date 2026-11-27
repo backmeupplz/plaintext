@@ -44,8 +44,8 @@ impl std::error::Error for Error {}
 
 impl Error {
     /// The server didn't take a vault's change this time: another device changed
-    /// it first (409), it was too big (413: for one request, or for one pull,
-    /// `api::MAX_PUSH`) or the account is full (507).
+    /// it first (409), it was too big (413: for one request, or for every member's
+    /// next pull, `api::MAX_PUSH`) or the account is full (507).
     /// The change waits on the device for the next sync.
     pub fn held_back(&self) -> bool {
         matches!(self, Error::Server(409 | 413 | 507, _))

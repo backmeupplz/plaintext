@@ -715,6 +715,24 @@ fn large_pushes() {
         }
     }
     assert!(resp.starts_with("HTTP/1.1 413") && resp.contains("length limit"), "{resp}");
+
+    // A vault too big to pull is reported on its own; the rest of the sync goes on.
+    struct TooBig(Http, Hex);
+    impl Transport for TooBig {
+        fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+            if method == "GET" && path.starts_with(&format!("/v1/vaults/{}?", self.1)) {
+                return Ok((413, b"too big".to_vec()));
+            }
+            self.0.send(method, path, token, body)
+        }
+        fn host(&self) -> String {
+            self.0.host()
+        }
+    }
+    let mut fresh = Session::login(TooBig(Http::new(&url), personal), &derive("alice pw", &ask), "t").unwrap();
+    fresh.sync().unwrap();
+    assert!(!fresh.vaults.contains_key(&personal));
+    assert!(fresh.problems.iter().any(|p| p.contains("too big to pull")), "{:?}", fresh.problems);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -758,7 +776,9 @@ fn leaving_a_vault() {
         f(&mut r);
         RosterUpdate { roster: me.sign_doc("roster", &r), ..u }
     };
-    for u in [tweak(&|r| r.members.iter_mut().for_each(|m| m.role = Role::Reader)), tweak(&|r| r.key_check = B64(vec![0; 1000]))] {
+    let demoted = tweak(&|r| r.members.iter_mut().for_each(|m| m.role = Role::Reader));
+    let expiring = tweak(&|r| r.members.iter_mut().filter(|m| m.role == Role::Owner).for_each(|m| m.expires = Some(now() + 3600)));
+    for u in [demoted, expiring, tweak(&|r| r.key_check = B64(vec![0; 1000]))] {
         assert_eq!(status(alice.call::<()>("POST", &format!("/v1/vaults/{fam}/roster"), Some(&u))), 400);
     }
     // A creator who leaves hands the vault to an owner who stays.

@@ -285,12 +285,13 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
 /// device got there first) instead of failing every command over it.
 fn sync(s: &mut S) -> Result<(), Error> {
     match s.sync() {
-        Err(e) if e.held_back() => {
-            eprintln!("warning: {e}");
-            Ok(())
-        }
-        r => r,
+        Err(e) if e.held_back() => eprintln!("warning: {e}"),
+        r => r?,
     }
+    for p in &s.problems {
+        eprintln!("plaintext: warning: {}", crate::clean(p));
+    }
+    Ok(())
 }
 
 /// An unlocked, synced session: an agent from `PLAINTEXT_AGENT_KEY`, or the
@@ -317,9 +318,6 @@ pub fn open() -> Res<S> {
             sync(&mut s)?;
         }
         r => r?,
-    }
-    for p in &s.problems {
-        eprintln!("plaintext: warning: {}", crate::clean(p));
     }
     save(&s)?;
     Ok(s)

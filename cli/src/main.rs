@@ -836,20 +836,20 @@ fn run(cli: Cli) -> Res<()> {
             }
             // A device pulls a vault's items in one response, so a vault holds at most
             // one push's worth: sealed, an item is padded to 256 bytes plus 41, and
-            // each attachment adds a reference of about its name plus 200.
+            // each attachment adds a reference of less than its name plus 256.
             let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
             let mut size = std::collections::BTreeMap::<_, usize>::new();
             for (to, items) in &targets {
                 let have = || to.as_ref().ok().and_then(|id| s.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
                 let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
-                *size.entry(to.clone()).or_insert_with(have) += adds;
+                *size.entry(to.clone().map_err(|n| n.to_ascii_lowercase())).or_insert_with(have) += adds;
             }
             if let Some((to, _)) = size.iter().find(|(_, n)| **n > plaintext_client::plaintext_core::api::MAX_PUSH) {
                 let name = match to {
                     Ok(id) => s.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
                     Err(name) => name.clone(),
                 };
-                return Err(format!("that's more than one vault can hold (64 MiB of items, for {name}): split the file and import the parts into different vaults with --vault NAME").into());
+                return Err(format!("that's more than one vault can hold (64 MiB of items, for {name}): split the file, make a vault for each part (plaintext vault create NAME) and import each part with --vault NAME").into());
             }
             let mut made = Vec::new();
             for (to, items) in targets {
