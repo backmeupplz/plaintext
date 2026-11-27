@@ -836,11 +836,12 @@ fn run(cli: Cli) -> Res<()> {
                 };
                 targets.push((vid, v.items));
             }
-            // Every item goes into this device's copy before anything is pushed, so a
-            // failed push loses nothing. Once an upload fails, the remaining
-            // attachments are left out and listed.
-            let (mut upload_err, mut skipped, mut vids) = (None, Vec::new(), Vec::new());
+            // Every item goes into this device's copy before it's pushed, so a failed
+            // push loses nothing; pushes go every 32 MiB, as one may write at most 64.
+            // Once an upload fails, the remaining attachments are left out and listed.
+            let (mut upload_err, mut skipped, mut vids, mut sync_err) = (None, Vec::new(), Vec::new(), None);
             for (vid, items) in targets {
+                let mut unsent = 0;
                 for (mut it, files) in items {
                     for (name, bytes) in files {
                         if upload_err.is_none() {
@@ -854,13 +855,19 @@ fn run(cli: Cli) -> Res<()> {
                         }
                         skipped.push(format!("{}: {name}", it.title));
                     }
+                    unsent += serde_json::to_vec(&it)?.len();
                     s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
+                    if unsent > plaintext_client::plaintext_core::api::MAX_PUSH / 2 && sync_err.is_none() {
+                        unsent = 0;
+                        if let Err(e) = s.sync_vault(&vid) {
+                            sync_err = Some(e);
+                        }
+                    }
                 }
                 if !vids.contains(&vid) {
                     vids.push(vid);
                 }
             }
-            let mut sync_err = None;
             for vid in &vids {
                 if let Err(e) = s.sync_vault(vid) {
                     sync_err.get_or_insert(e);

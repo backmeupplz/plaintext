@@ -200,6 +200,11 @@ pub struct Staged {
     pub count: u64,
 }
 
+/// Most item bytes one push (or key rotation) may write. Every member's next pull
+/// brings them in one response, which clients take up to 128 MiB of, in base64
+/// and with a manifest of up to 16 MiB (twice base64).
+pub const MAX_PUSH: usize = 64 << 20;
+
 /// `POST /v1/vaults/{id}/leave`, signed (domain `leave`) by the member leaving.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LeaveVault {
@@ -210,8 +215,8 @@ pub struct LeaveVault {
 
 /// `POST /v1/vaults/{id}/stage`: part of the items of a push (or a key rotation)
 /// too big for one request. The server holds them, uncommitted, until the push
-/// that names `stage` (for a day at most). Staging under a new id drops what the
-/// member staged before in that vault.
+/// that names `stage`, or a day after the last part. Staging under a new id drops
+/// what the member staged before in that vault, and so does a refused part or push.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StageRequest {
     pub stage: Hex,

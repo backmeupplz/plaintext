@@ -44,7 +44,8 @@ impl std::error::Error for Error {}
 
 impl Error {
     /// The server didn't take a vault's change this time: another device changed
-    /// it first (409), it was too big to send (413) or the account is full (507).
+    /// it first (409), it was too big (413: for one request, or for one pull,
+    /// `api::MAX_PUSH`) or the account is full (507).
     /// The change waits on the device for the next sync.
     pub fn held_back(&self) -> bool {
         matches!(self, Error::Server(409 | 413 | 507, _))
@@ -363,6 +364,10 @@ impl<T: Transport> Session<T> {
     /// server's staging area first, in parts, and the returned push commits them.
     fn staged(&self, vault: &Hex, put: &VaultPut) -> Result<Option<VaultPut>> {
         let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
+        if items > MAX_PUSH {
+            // The server would refuse it after every part was sent (as if it had said so).
+            return Err(Error::Server(413, "more items than a device can pull in one go: push fewer at a time".into()));
+        }
         if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
             return Ok(None);
         }
@@ -619,6 +624,13 @@ impl<T: Transport> Session<T> {
         }
         self.remove_members(id, None)?;
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        // Members who left have to go first, with a new key, which waits for the unsent changes.
+        if let Some(who) = self.gone.get(id).and_then(|g| g.first()).filter(|_| v.has_changes()) {
+            return Err(Error::Refused(format!(
+                "{who} left {}; its key has to change first, which needs your unsent changes to it sent (make room) or deleted",
+                v.meta.name
+            )));
+        }
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
         self.post_roster(id, update)?;
         self.pull(id)?;
@@ -641,8 +653,10 @@ impl<T: Transport> Session<T> {
     pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
         let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
         self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
-        if let Some(v) = self.vaults.remove(id) {
-            self.hidden.insert(*id, v);
+        // Kept as a vault this device knows nothing about: unsent changes are
+        // gone, and if someone adds us again it starts afresh.
+        if self.vaults.remove(id).is_some() {
+            self.hidden.insert(*id, Vault::new(*id));
         }
         Ok(())
     }

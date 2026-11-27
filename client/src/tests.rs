@@ -691,13 +691,14 @@ fn large_pushes() {
     let (a, b) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
     let stage = format!("/v1/vaults/{personal}/stage");
     alice.call::<()>("POST", &stage, Some(&StageRequest { stage: a, upserts: put.upserts.clone() })).unwrap();
-    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: vec![] })).unwrap();
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
     let stale = VaultPut { upserts: vec![], staged: Some(Staged { id: a, count: 1 }), ..put };
     assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&stale))), 409);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0, "a failed push drops what its member staged");
     alice.sync_vault(&personal).unwrap();
     assert!(!alice.vaults[&personal].has_changes());
 
-    // A request over the limit says so, unlike a full account (507).
+    // A request over the limit gets 413, unlike a full account (507).
     use std::io::{Read, Write};
     let host = url.trim_start_matches("http://");
     let mut s = std::net::TcpStream::connect(host).unwrap();
@@ -712,7 +713,7 @@ fn large_pushes() {
             Ok(n) => resp.push_str(&String::from_utf8_lossy(&buf[..n])),
         }
     }
-    assert!(resp.starts_with("HTTP/1.1 413") && resp.contains("bigger than the server takes"), "{resp}");
+    assert!(resp.starts_with("HTTP/1.1 413") && resp.contains("length limit"), "{resp}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -754,6 +755,8 @@ fn leaving_a_vault() {
     carol.leave_vault(&club).unwrap();
     assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'alice'"), 3);
 
+    // An owner leaves rather than taking themselves out of the roster.
+    assert_eq!(status(alice.revoke(&fam, "alice")), 400);
     // The only owner can't leave a vault others use.
     let gift = bob.create_vault("Gift").unwrap();
     bob.share_vault(&gift, "carol", Role::Reader, None).unwrap();
