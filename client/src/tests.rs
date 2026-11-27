@@ -450,8 +450,9 @@ fn account_deletion() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A quota counts items and files in the vaults an account created. Writes that
-/// would add past it get 413; reads, deletes and key replacement always work.
+/// `PLAINTEXT_QUOTA_MB` counts items, files, rosters and the latest manifest of
+/// the vaults an account created. Writes that would add past it get 507; reads,
+/// edits, deletes and key replacement always work.
 #[test]
 fn storage_quota() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
@@ -462,6 +463,7 @@ fn storage_quota() {
     let big = alice.upload_file(&personal, "scan.pdf", &vec![7u8; 300_000]).unwrap();
     let id = plaintext_core::new_item_id();
     alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bank", "b4nk") }).unwrap();
+    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert_eq!(acct.quota, None, "unlimited unless set");
     assert!(acct.usage > 300_000);
@@ -471,30 +473,34 @@ fn storage_quota() {
     let mut alice = login(&url, "alice pw", &ask);
     let mut bob = login(&url, "bob pw", &bsk);
     alice.sync().unwrap();
+    bob.sync().unwrap();
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert_eq!(acct.quota, Some(256 << 10));
     assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000, "reads still work");
-    assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 413);
-    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
-    alice.revoke(&personal, "bob").unwrap();
-    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
-    bob.sync().unwrap();
+    assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 507);
+    assert_eq!(status(alice.create_vault("More")), 507, "a vault's roster and manifest count");
+    // An edit that takes no more room goes through.
+    alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bonk", "b4nk") }).unwrap();
     // A writer's items count against the vault's creator, not the writer.
     let err = bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "x")).unwrap_err();
-    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    assert!(matches!(&err, Error::Server(507, m) if m.contains("out of storage")), "{err}");
     let mine = bob.default_vault().unwrap();
     bob.upload_file(&mine, "bob.pdf", b"bob's own file").unwrap();
     // The refused change waits on bob's device without holding up his other vaults.
     bob.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Bob's own", "y"));
-    assert_eq!(status(bob.sync()), 413);
+    assert_eq!(status(bob.sync()), 507);
     assert!(!bob.vaults[&mine].has_changes());
+    // Removing someone (a new key) works over the quota; adding someone doesn't.
+    alice.revoke(&personal, "bob").unwrap();
+    assert_eq!(status(alice.share_vault(&personal, "bob", Role::Reader, None)), 507);
 
     // Deleting an item deletes its attachment too, which makes room.
     alice.delete_item(&personal, id).unwrap();
     assert_eq!(status(alice.download_file(&personal, &big)), 404);
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
-    assert!(acct.usage < 1000, "{}", acct.usage);
+    assert!(acct.usage < 20_000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -631,6 +637,107 @@ fn strict_transport_security() {
     assert_eq!(hsts(&url), [(200, on.clone()), (404, on.clone()), (413, on)]);
     let (url, _) = server();
     assert_eq!(hsts(&url), [(200, None), (404, None), (413, None)]);
+}
+
+/// A push or key rotation over the 32 MiB request limit goes up in parts (staged),
+/// and commits in one request.
+#[test]
+fn large_pushes() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    join(Http::new(&url), "bob", "bob pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    // 30 items of 900 KB: 27 MB sealed, 36 MB in base64.
+    let v = alice.vaults.get_mut(&personal).unwrap();
+    for i in 0..30 {
+        v.put(plaintext_core::new_item_id(), Item { notes: "n".repeat(900_000), ..item(&format!("Scan {i}"), "x") });
+    }
+    alice.sync_vault(&personal).unwrap();
+    let mut alice2 = login(&url, "alice pw", &ask);
+    alice2.sync().unwrap();
+    assert_eq!(alice2.vaults[&personal].items().count(), 30);
+    // Removing someone re-seals every item under a new key.
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.revoke(&personal, "bob").unwrap();
+    alice2.sync().unwrap();
+    assert_eq!(alice2.vaults[&personal].roster.as_ref().unwrap().epoch, 1);
+    assert_eq!(alice2.vaults[&personal].items().filter(|(_, i)| i.notes.len() == 900_000).count(), 30);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0);
+
+    // A push whose staged items another push from the account replaced is refused.
+    let me = alice.me();
+    let v = alice.vaults.get_mut(&personal).unwrap();
+    v.put(plaintext_core::new_item_id(), item("Late", "l8"));
+    let put = v.push(&me, now()).unwrap();
+    let (a, b) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    let stage = format!("/v1/vaults/{personal}/stage");
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: a, upserts: put.upserts.clone() })).unwrap();
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: vec![] })).unwrap();
+    let stale = VaultPut { upserts: vec![], staged: Some(Staged { id: a, count: 1 }), ..put };
+    assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&stale))), 409);
+    alice.sync_vault(&personal).unwrap();
+    assert!(!alice.vaults[&personal].has_changes());
+
+    // A request over the limit says so, unlike a full account (507).
+    use std::io::{Read, Write};
+    let host = url.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    write!(s, "PUT /v1/vaults/{personal} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\ncontent-type: application/json\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n", alice.token, 33 << 20).unwrap();
+    // The server stops reading once past the limit, so the end may not go through.
+    let _ = s.write_all(&vec![b' '; 33 << 20]);
+    let (mut resp, mut buf) = (String::new(), [0u8; 4096]);
+    while !resp.contains("bigger") {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+    assert!(resp.starts_with("HTTP/1.1 413") && resp.contains("bigger than the server takes"), "{resp}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Members can leave a vault (their agents leave with them), so nobody is stuck
+/// paying for a vault someone handed them.
+#[test]
+fn leaving_a_vault() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    let (bsk, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let fam = alice.create_vault("Family").unwrap();
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Netflix", "n3tfl1x")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    let bot_key = bob.create_agent("bob-bot").unwrap();
+    alice.share_vault(&fam, "bob-bot", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&fam));
+
+    // Bob leaves, his agent with him, and alice's device replaces the key.
+    bob.leave_vault(&fam).unwrap();
+    bob.sync().unwrap();
+    assert!(!bob.vaults.contains_key(&fam));
+    let bot = Session::login(Http::new(&url), &derive_agent(&bot_key), "t").unwrap();
+    assert_eq!(status(bot.call::<VaultResponse>("GET", &format!("/v1/vaults/{fam}"), NONE)), 404);
+    alice.sync().unwrap();
+    let r = alice.vaults[&fam].roster.clone().unwrap();
+    assert_eq!((r.epoch, r.members.len()), (1, 1));
+
+    // The only owner can't leave a vault others use.
+    let gift = bob.create_vault("Gift").unwrap();
+    bob.share_vault(&gift, "carol", Role::Reader, None).unwrap();
+    assert_eq!(status(bob.leave_vault(&gift)), 409);
+    // Bob makes carol an owner and deletes his account: the vault now counts
+    // against carol, who can leave it, which deletes it.
+    bob.share_vault(&gift, "carol", Role::Owner, None).unwrap();
+    bob.delete_account(&derive("bob pw", &bsk)).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 2);
+    carol.sync().unwrap();
+    carol.leave_vault(&gift).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 1);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults"), 3, "alice's two and carol's own");
+    let _ = std::fs::remove_file(&path);
 }
 
 // ---------- Attacks from the 2026-11 security audit, over real HTTP; each must stay fixed ----------
@@ -923,16 +1030,16 @@ fn server_hardening() {
     let url = server_at(&path, plaintext_server::Config { setup_code: Some("first-run-code".into()), quota: Some(512 << 10), ..Default::default() });
     let mut bob = login(&url, "bob pw", &bsk);
     let err = bob.send("alice", &Content::Request("A".repeat(1_000_000)), None).unwrap_err();
-    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    assert!(matches!(&err, Error::Server(507, m) if m.contains("out of storage")), "{err}");
     let big = Item { notes: "n".repeat(900_000), ..item("Big", "b") };
-    assert_eq!(status(bob.create_link(LINK_PAGE, &url, &big, now() + 600, None)), 413);
+    assert_eq!(status(bob.create_link(LINK_PAGE, &url, &big, now() + 600, None)), 507);
     bob.send("alice", &Content::Request("small".into()), None).unwrap();
     // An agent's links count against its owner; a sender can take back an unread message.
     let msg = plaintext_core::send(&bob.me(), &bob.keyring, "alice", &Content::Request("A".repeat(250_000)), None).unwrap();
     bob.call::<()>("POST", "/v1/messages", Some(&msg)).unwrap();
     let ci = Session::login(Http::new(&url), &derive_agent(&bob_ci), "ci").unwrap();
     let mid = Item { notes: "n".repeat(200_000), ..item("Mid", "m") };
-    assert_eq!(status(ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None)), 413);
+    assert_eq!(status(ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None)), 507);
     bob.delete_message(&serde_json::from_slice::<Message>(&msg.body.0).unwrap().id).unwrap();
     ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None).unwrap();
     let _ = std::fs::remove_file(&path);

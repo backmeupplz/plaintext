@@ -49,6 +49,10 @@ impl From<plaintext_core::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Past this many bytes of items (and manifest), a push or key rotation stages its
+/// items in parts of about this size, well under the server's 32 MiB request limit.
+const STAGE_PAST: usize = 16 << 20;
+
 /// An inbox message as opened, or why it couldn't be.
 pub type Received = std::result::Result<(Message, Content), plaintext_core::Error>;
 
@@ -277,16 +281,16 @@ impl<T: Transport> Session<T> {
             self.hidden.insert(id, v);
         }
         self.problems.clear();
-        // A vault whose account is out of storage keeps its unpushed changes and
+        // A vault whose account is out of storage (507) keeps its unpushed changes and
         // reports the error at the end, without holding up the other vaults. So does
-        // a member removal another device raced, or one too big to send; the next sync retries.
+        // a member removal another device raced, or one too big to send (413); the next sync retries.
         let mut full = None;
         for id in &acct.vaults {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
             match self.sync_vault(id).and_then(|_| self.remove_members(id, None)) {
                 Ok(()) => {}
-                Err(e @ Error::Server(409 | 413, _)) => full = Some(e),
+                Err(e @ Error::Server(409 | 413 | 507, _)) => full = Some(e),
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
@@ -333,7 +337,8 @@ impl<T: Transport> Session<T> {
                 return Ok(());
             }
             let put = v.push(&me, now())?;
-            match raw(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))) {
+            let wire = self.staged(id, &put)?;
+            match raw(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(serde_json::to_vec(wire.as_ref().unwrap_or(&put)).expect("serializable"))) {
                 Ok(_) => {
                     self.vaults.get_mut(id).expect("exists").pushed(&put);
                     return Ok(());
@@ -343,6 +348,41 @@ impl<T: Transport> Session<T> {
             }
         }
         Err(Error::Server(409, "the vault kept changing; try again".into()))
+    }
+
+    /// `put` as it goes on the wire. Items too big for one request go to the
+    /// server's staging area first, in parts, and the returned push commits them.
+    fn staged(&self, vault: &Hex, put: &VaultPut) -> Result<Option<VaultPut>> {
+        let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
+        if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
+            return Ok(None);
+        }
+        let stage = plaintext_core::new_item_id();
+        let (mut part, mut bytes) = (Vec::new(), 0);
+        for (i, u) in put.upserts.iter().enumerate() {
+            part.push(u.clone());
+            bytes += u.blob.0.len();
+            let next = put.upserts.get(i + 1).map_or(usize::MAX, |n| n.blob.0.len());
+            if bytes.saturating_add(next) > STAGE_PAST {
+                self.call::<()>("POST", &format!("/v1/vaults/{vault}/stage"), Some(&StageRequest { stage, upserts: std::mem::take(&mut part) }))?;
+                bytes = 0;
+            }
+        }
+        Ok(Some(VaultPut {
+            expected_counter: put.expected_counter,
+            manifest: put.manifest.clone(),
+            upserts: vec![],
+            deletes: put.deletes.clone(),
+            staged: Some(Staged { id: stage, count: put.upserts.len() as u64 }),
+        }))
+    }
+
+    /// Sends a roster change, staging a key rotation's items if they're too big.
+    fn post_roster(&self, id: &Hex, mut update: RosterUpdate) -> Result<()> {
+        if let Some(wire) = update.rotation.as_ref().map(|r| self.staged(id, r)).transpose()?.flatten() {
+            update.rotation = Some(wire);
+        }
+        self.call("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))
     }
 
     /// Removes `who` (if given) with a new vault key. Members whose access expired,
@@ -368,7 +408,7 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         let update = v.revoke(&self.me(), &out, now())?;
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
+        self.post_roster(id, update)?;
         self.pull(id)
     }
 
@@ -503,7 +543,7 @@ impl<T: Transport> Session<T> {
     /// account is the only owner of a vault others use.
     pub fn delete_account(&mut self, d: &Derived) -> Result<()> {
         match self.sync() {
-            Ok(()) | Err(Error::Server(413, _)) => {}
+            Ok(()) | Err(Error::Server(413 | 507, _)) => {}
             Err(e) => return Err(e),
         }
         let me = self.username().to_string();
@@ -566,7 +606,7 @@ impl<T: Transport> Session<T> {
         self.remove_members(id, None)?;
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
+        self.post_roster(id, update)?;
         self.pull(id)?;
         // Record the new roster in the keyring now, so this account's other
         // devices (and new ones) can't be shown the vault from before it.
@@ -579,6 +619,17 @@ impl<T: Transport> Session<T> {
         self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         self.remove_members(id, Some(username))?;
         self.save_keyring()
+    }
+
+    /// Stop using a vault, along with your agents. Its owners' devices replace the
+    /// key. The vault is deleted if nobody else uses it; refused (409) while you're
+    /// its only owner and others use it.
+    pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
+        self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), NONE)?;
+        if let Some(v) = self.vaults.remove(id) {
+            self.hidden.insert(*id, v);
+        }
+        Ok(())
     }
 
     pub fn audit(&self, id: &Hex) -> Result<Vec<AuditEntry>> {

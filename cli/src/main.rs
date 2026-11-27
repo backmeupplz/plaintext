@@ -338,6 +338,8 @@ enum VaultCmd {
     },
     /// Remove someone and replace the vault key
     Revoke { vault: String, user: String },
+    /// Stop using a shared vault (your agents leave it too); deletes it if nobody else uses it
+    Leave { vault: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
 }
@@ -820,26 +822,34 @@ fn run(cli: Cli) -> Res<()> {
                 _ => import::csv(&String::from_utf8_lossy(&data))?,
             };
             let n = imported.iter().map(|v| v.items.len()).sum::<usize>();
-            for v in imported {
-                let vid = match (&vault, v.name.is_empty()) {
-                    (Some(name), _) => s.vault(name)?,
-                    (None, true) => s.default_vault()?,
-                    (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
-                    (None, false) => match s.own_vault(&v.name) {
-                        Some(id) => id,
-                        None => s.create_vault(&v.name)?,
-                    },
-                };
-                for (it, files) in v.items {
-                    let mut it = it;
-                    for (name, bytes) in files {
-                        it.files.push(s.upload_file(&vid, &name, &bytes)?);
+            let sent = (|| -> Res<()> {
+                for v in imported {
+                    let vid = match (&vault, v.name.is_empty()) {
+                        (Some(name), _) => s.vault(name)?,
+                        (None, true) => s.default_vault()?,
+                        (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
+                        (None, false) => match s.own_vault(&v.name) {
+                            Some(id) => id,
+                            None => s.create_vault(&v.name)?,
+                        },
+                    };
+                    for (it, files) in v.items {
+                        let mut it = it;
+                        for (name, bytes) in files {
+                            it.files.push(s.upload_file(&vid, &name, &bytes)?);
+                        }
+                        s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
                     }
-                    s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
+                    s.sync_vault(&vid)?;
                 }
-                s.sync_vault(&vid)?;
-            }
+                Ok(())
+            })();
+            // What was imported but not sent stays on this device for the next sync,
+            // with the attachments it already uploaded.
             state::save(&s)?;
+            if let Err(e) = sent {
+                return Err(format!("{e}\nThe items imported so far are saved on this device and go to the server with the next sync; don't import {file} again.").into());
+            }
             say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
         }
         Cmd::Export { vault } => {
@@ -972,6 +982,11 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             let id = s.vault(&vault)?;
             s.revoke(&id, &user)?;
             say!("Removed {user} and replaced the vault key.");
+        }
+        VaultCmd::Leave { vault } => {
+            let id = s.vault(&vault)?;
+            s.leave_vault(&id)?;
+            say!("Left {vault}.");
         }
         VaultCmd::Audit { vault } => {
             let id = s.vault(&vault)?;

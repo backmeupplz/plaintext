@@ -187,6 +187,27 @@ pub struct VaultPut {
     pub manifest: Signed,
     pub upserts: Vec<ItemBlob>,
     pub deletes: Vec<Hex>,
+    /// Item blobs sent ahead with `POST /v1/vaults/{id}/stage`, committed with this push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<Staged>,
+}
+
+/// The `count` item blobs this member staged under `id`; the push fails (409) if
+/// the server doesn't hold exactly that many.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Staged {
+    pub id: Hex,
+    pub count: u64,
+}
+
+/// `POST /v1/vaults/{id}/stage`: part of the items of a push (or a key rotation)
+/// too big for one request. The server holds them, uncommitted, until the push
+/// that names `stage` (for a day at most). Staging under a new id drops what the
+/// member staged before in that vault.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StageRequest {
+    pub stage: Hex,
+    pub upserts: Vec<ItemBlob>,
 }
 
 /// `POST /v1/vaults/{id}/roster`: a new roster version, plus keys for new members.
