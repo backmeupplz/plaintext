@@ -28,7 +28,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -92,7 +91,15 @@ fun UnlockScreen() {
             }
         }
     }
-    LaunchedEffect(Unit) { if (canBiometric) biometric() }
+    // Prompt whenever the app comes to the front locked (also right after the phone itself is unlocked).
+    val owner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(owner) {
+        val o = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_START && canBiometric && !model.unlocking && !signingIn) biometric()
+        }
+        owner.lifecycle.addObserver(o)
+        onDispose { owner.lifecycle.removeObserver(o) }
+    }
 
     if (signingIn) {
         Onboarding(adding = true, onClose = { signingIn = false })
