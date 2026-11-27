@@ -235,6 +235,9 @@ mod tests {
         assert!(p.len() == 6 && p.chars().all(|c| c.is_ascii_digit()));
         assert_ne!(generate(&Recipe::default()), generate(&Recipe::default()));
         assert_eq!(WORDS.lines().count(), 7776);
+        // Plain unique words only: a separator inside a word would blur the word count.
+        assert!(WORDS.lines().all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase())));
+        assert_eq!(WORDS.lines().collect::<std::collections::BTreeSet<_>>().len(), 7776);
     }
 
     #[test]
