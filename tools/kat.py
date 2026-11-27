@@ -1,4 +1,5 @@
-# Independent re-implementation of plaintext v1 derivation, to cross-check Rust vectors.
+# Independent re-implementation of plaintext v1 derivation and blob format, to cross-check the Rust vectors.
+# Needs: pip install argon2-cffi cryptography pynacl
 import hashlib, unicodedata
 from argon2.low_level import hash_secret_raw, Type
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
@@ -18,3 +19,8 @@ st = hash_secret_raw(unicodedata.normalize("NFKD", pw).encode(), salt, 3, 65536,
 print("unlock", hk(sk, st, b"plaintext/v1/unlock", 32).hex())
 seed = hk(sk, st, b"plaintext/v1/auth", 32)
 print("auth_pub", Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex())
+
+# Blob vector: XChaCha20-Poly1305 with key 07*32, nonce 03*24, AD = 0x01 ‖ "plaintext/v1/item" ‖ 01*16 ‖ 02*16.
+from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt as xc
+aad = b"\x01" + b"plaintext/v1/item" + b"\x01" * 16 + b"\x02" * 16
+print("blob", (b"\x01" + b"\x03" * 24 + xc(b"plaintext", aad, b"\x03" * 24, b"\x07" * 32)).hex())

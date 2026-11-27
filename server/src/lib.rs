@@ -29,7 +29,7 @@ type R<T> = Result<T, (StatusCode, &'static str)>;
 
 const MAX_BLOB: usize = 1 << 20;
 const MAX_BODY: usize = 64 << 20;
-const LOGIN_SKEW: u64 = 120;
+const LOGIN_SKEW_MS: u64 = 120_000;
 
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
@@ -65,8 +65,12 @@ pub fn app(db: Connection, invite: Option<String>) -> Router {
         .with_state(state)
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_millis() as u64
+}
+
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs()
+    now_ms() / 1000
 }
 
 fn db_err<E>(_: E) -> (StatusCode, &'static str) {
@@ -128,7 +132,7 @@ async fn signup(State(s): State<AppState>, h: HeaderMap, Json(req): Json<SignupR
 
 async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> R<Json<LoginResponse>> {
     let denied = (StatusCode::UNAUTHORIZED, "login failed");
-    if req.ts.abs_diff(now()) > LOGIN_SKEW || req.device.len() > 200 {
+    if req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS || req.device.len() > 200 {
         return Err(denied);
     }
     let sig = Signature::from_slice(&req.sig.0).map_err(|_| denied)?;

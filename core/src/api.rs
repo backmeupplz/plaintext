@@ -59,7 +59,7 @@ pub struct SignupRequest {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoginRequest {
     pub account_id: Hex,
-    /// Unix seconds. Must be newer than the account's last login (no replay).
+    /// Unix milliseconds. Must be newer than the account's last login (no replay).
     pub ts: u64,
     pub sig: B64,
     pub device: String,

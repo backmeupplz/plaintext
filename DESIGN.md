@@ -10,7 +10,7 @@ The server is untrusted, not merely the database dump. It can lie in any respons
 |---|---|
 | See how many items and vaults an account has, rough blob sizes (padded to 256 bytes), write times, device names, IPs | Read any item, title, URL, username or note |
 | Refuse service, delete everything | Brute-force the password offline (it would also need the 128-bit Secret Key) |
-| Serve a brand-new device an old but genuine vault state | Swap, drop, add or alter items, or roll a device back to an older state, without the client detecting it |
+| Serve a brand-new device an old but genuine vault state; fork two devices onto different branches (see Known limits) | Swap, add or alter items, or roll a device back to an older state it already verified, without the client detecting it |
 | | Downgrade the KDF or cipher (it supplies neither) |
 
 ## Secrets and keys
@@ -33,7 +33,7 @@ AUK ──wraps──► Account Key (random 256-bit) ──wraps──► Vault
 
 ## Login
 
-The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ts` with the Ed25519 key. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login (so a captured login can't be replayed), and returns a random bearer token. It stores only the token's SHA-256. The server never receives anything password-equivalent, and its stored public key can't be attacked without the Secret Key. A PAKE would add nothing here, because the server's verifier is already out of reach.
+The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms` with the Ed25519 key. The server stores only the public key, accepts a timestamp (milliseconds) within ±120 s that is strictly newer than the account's last login (so a captured login can't be replayed), and returns a random bearer token. It stores only the token's SHA-256. The server never receives anything password-equivalent, and its stored public key can't be attacked without the Secret Key. A PAKE would add nothing here, because the server's verifier is already out of reach.
 
 ## Blobs
 
@@ -54,7 +54,14 @@ Each vault has a counter and an encrypted **manifest** holding `{counter, item_i
 
 - **Pull.** `GET /v1/vaults/{id}?since=N` returns the manifest and every item written after counter N. The client checks that every received blob matches its manifest hash and that every other manifest entry matches a blob it already holds. It also checks that the manifest's counter equals the server's counter and is not lower than the last counter this device verified. Any mismatch rejects the whole response and leaves local state untouched.
 - **Push.** `PUT /v1/vaults/{id}` carries `expected_counter`, the new manifest, upserts and deletes. The server applies it only if the counter still matches, and otherwise answers 409. On a 409 the client pulls, keeps its own unpushed edits, and pushes again.
-- **The rollback guard** is the per-device last-verified counter, which each client must persist. A device that has never synced has nothing to compare against, so it can be shown an old but genuine state. The ETH Zurich paper (below) calls full rollback protection without trusted state an open problem.
+- **The rollback guard** is the per-device last-verified counter, persisted with the device's encrypted `VaultSnapshot`. A manifest with a lower counter is refused. A manifest at the same counter must describe exactly what the device already verified, which catches a server that stored a push it answered with an error and serves it later.
+- **Concurrent edits of the same item:** the device that pushes second wins on its retry. There is no conflict copy yet.
+
+## Known limits
+
+- **Forks.** The server can hide device A's write from device B, let B push on top, and then serve B's branch to A, where A's item looks deleted. Each device's own history stays consistent, but two devices can be split. Detecting this needs devices to compare state with each other (for example a manifest hash shown on both, or devices gossiping their last manifest through the vault itself). The ETH Zurich paper below calls full rollback protection without trusted state an open problem.
+- **A new device trusts its first sync.** It has no counter yet, so it can be shown an old but genuine state.
+- **Metadata.** The server sees item counts, padded sizes, write times, device names and IPs.
 
 ## Wire API
 
@@ -89,11 +96,11 @@ Quick unlock always means that the Account Key is kept in the OS keychain behind
 
 ## Lessons from Vaultwarden and Bitwarden
 
-Vaultwarden (read at `dbd7829`) is a faithful Bitwarden server, so it inherits the protocol attacks in Scarlata et al., *Zero Knowledge (About) Encryption*, USENIX Security 2026 ([ePrint 2026/058](https://eprint.iacr.org/2026/058)).
+Vaultwarden (read at `dbd7829`) is a faithful Bitwarden server, so it inherits the protocol attacks in Scarlata et al., *Zero Knowledge (About) Encryption: A Comparative Security Analysis of Four Cloud-based Password Managers*, USENIX Security 2026 ([ePrint 2026/058](https://eprint.iacr.org/2026/058)).
 
 | Bitwarden/Vaultwarden | Attack | Plaintext |
 |---|---|---|
-| The server returns KDF type and iterations at prelogin; email is the salt | BW07 KDF downgrade (cracking ~300,000× cheaper) | No prelogin; parameters pinned by the client; salt from the Secret Key |
+| The server returns KDF type and iterations at prelogin; email is the salt | BW07 KDF downgrade | No prelogin; parameters pinned by the client; salt from the Secret Key |
 | The login hash is PBKDF2(master key, password); the server re-hashes it | A DB leak allows offline guessing of weak passwords | The verifier is an Ed25519 public key that also needs the 128-bit Secret Key |
 | Each field is a separate EncString; metadata (type, folder, flags) in clear | BW04/BW05 field and item swapping | One AEAD blob per item, with ids in the AD |
 | Legacy AES-CBC (type 0, no MAC) is still decryptable | BW11/BW12 padding oracle, key recovery | A single AEAD with a version byte; no legacy path |

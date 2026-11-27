@@ -17,5 +17,5 @@ The first account can sign up freely. Set `PLAINTEXT_INVITE=<code>` to let more 
 
 ```sh
 cargo test                      # core unit tests + two-device end-to-end test
-python3 tools/kat.py            # independent check of the key-derivation vectors (needs argon2-cffi, cryptography)
+python3 tools/kat.py            # independent check of the key-derivation vectors (needs argon2-cffi, cryptography, pynacl)
 ```

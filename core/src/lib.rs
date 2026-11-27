@@ -209,6 +209,20 @@ impl Vault {
         if m.counter < self.counter {
             return Err(Error::Rollback);
         }
+        // Same counter: the server must describe exactly what this device already
+        // verified. Otherwise it is serving a different branch it kept back (for
+        // example a push it answered with an error but stored).
+        if m.counter == self.counter {
+            let clean = |id: &Hex| !self.dirty.contains(id) && !self.deleted.contains(id);
+            let same = m.items.keys().filter(|id| clean(id)).count()
+                == self.entries.keys().filter(|id| clean(id)).count()
+                && self.entries.iter().filter(|(id, _)| clean(id)).all(|(id, e)| {
+                    m.items.get(id).is_some_and(|h| h.0[..] == sha256(&e.blob)[..])
+                });
+            if !same {
+                return Err(Error::Rollback);
+            }
+        }
         let mut received = BTreeMap::new();
         for ib in &resp.items {
             match m.items.get(&ib.id) {
@@ -262,11 +276,59 @@ impl Vault {
         }
     }
 
+    /// Only what `put` carried becomes clean: an item edited while the push was
+    /// in flight stays dirty and goes out with the next push.
     pub fn pushed(&mut self, put: &VaultPut) {
         self.counter = put.expected_counter + 1;
-        self.dirty.clear();
-        self.deleted.clear();
+        for u in &put.upserts {
+            if self.entries.get(&u.id).is_some_and(|e| e.blob == u.blob.0) {
+                self.dirty.remove(&u.id);
+            }
+        }
+        for d in &put.deletes {
+            self.deleted.remove(d);
+        }
     }
+
+    /// Everything a device must keep between runs, encrypted: verified items,
+    /// unpushed edits, and the counter that guards against rollback.
+    pub fn snapshot(&self) -> VaultSnapshot {
+        let items = self
+            .entries
+            .iter()
+            .map(|(id, e)| {
+                let blob = if self.dirty.contains(id) { seal_json(&self.key, &self.item_ad(id), &e.item) } else { e.blob.clone() };
+                ItemBlob { id: *id, blob: B64(blob) }
+            })
+            .collect();
+        VaultSnapshot {
+            counter: self.counter,
+            items,
+            dirty: self.dirty.iter().copied().collect(),
+            deleted: self.deleted.iter().copied().collect(),
+        }
+    }
+
+    pub fn restore(id: Hex, key: Key, snap: &VaultSnapshot) -> Result<Vault, Error> {
+        let mut v = Vault::new(id, key);
+        v.counter = snap.counter;
+        v.dirty = snap.dirty.iter().copied().collect();
+        v.deleted = snap.deleted.iter().copied().collect();
+        for ib in &snap.items {
+            let item = open_json(&v.key, &v.item_ad(&ib.id), &ib.blob.0)?;
+            v.entries.insert(ib.id, Entry { item, blob: ib.blob.0.clone() });
+        }
+        Ok(v)
+    }
+}
+
+/// A device's local copy of one vault. Safe to write to disk: items stay sealed.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VaultSnapshot {
+    pub counter: u64,
+    pub items: Vec<ItemBlob>,
+    pub dirty: Vec<Hex>,
+    pub deleted: Vec<Hex>,
 }
 
 pub fn new_item_id() -> Hex {
@@ -313,6 +375,8 @@ mod tests {
         assert_eq!(Account::unlock(&derive("hunter3", &s.secret_key), &resp).err(), Some(Error::Tampered));
         assert_eq!(Account::unlock(&derive("hunter2", &SecretKey::generate()), &resp).err(), Some(Error::Tampered));
     }
+
+    const BLOB_VECTOR: &str = "01030303030303030303030303030303030303030303030303f46a2a721b55a38803873c9683da27fbe1fc928015e0d59931";
 
     fn server_view(v: &mut Vault) -> VaultResponse {
         let put = v.push();
@@ -361,6 +425,57 @@ mod tests {
         c.apply(&newer).unwrap();
         assert_eq!(c.items().count(), 3);
         assert_eq!(c.apply(&good).err(), Some(Error::Rollback));
+
+        // Fork at the same counter: the server answers a push with an error but
+        // keeps it, accepts the retry (which adds another item) at the same
+        // counter, and later serves the first push to drop the newer item.
+        let mut d = fresh();
+        d.apply(&good).unwrap();
+        d.put(new_item_id(), Item { title: "first".into(), ..Default::default() });
+        let kept = d.push(); // "failed": pushed() is not called
+        let kept = VaultResponse { counter: kept.expected_counter + 1, manifest: kept.manifest, items: kept.upserts };
+        let late = new_item_id();
+        d.put(late, Item { title: "second".into(), ..Default::default() });
+        server_view(&mut d);
+        assert_eq!(d.apply(&kept).err(), Some(Error::Rollback));
+        assert!(d.get(&late).is_some());
+    }
+
+    #[test]
+    fn edit_during_push_stays_dirty() {
+        let mut v = Vault::new(Hex(random()), random_key());
+        let id = new_item_id();
+        v.put(id, Item { title: "v1".into(), ..Default::default() });
+        let put = v.push();
+        v.put(id, Item { title: "v2".into(), ..Default::default() });
+        v.pushed(&put);
+        assert!(v.has_changes());
+        assert_eq!(v.push().upserts.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_counter_and_edits() {
+        let key = random_key();
+        let mut v = Vault::new(Hex(random()), Zeroizing::new(*key));
+        let (a, b) = (new_item_id(), new_item_id());
+        v.put(a, Item { title: "synced".into(), ..Default::default() });
+        let resp = server_view(&mut v);
+        v.put(b, Item { title: "unpushed".into(), ..Default::default() });
+        let snap: VaultSnapshot = serde_json::from_str(&serde_json::to_string(&v.snapshot()).unwrap()).unwrap();
+        let mut r = Vault::restore(v.id, Zeroizing::new(*key), &snap).unwrap();
+        assert_eq!(r.counter, 1);
+        assert_eq!(r.get(&b).unwrap().title, "unpushed");
+        assert!(r.has_changes());
+        r.apply(&resp).unwrap(); // same state: accepted, edit kept
+        assert_eq!(r.items().count(), 2);
+    }
+
+    /// Frozen blob format: this must open forever.
+    #[test]
+    fn blob_vector() {
+        let key = Zeroizing::new([7u8; 32]);
+        let blob = hex::decode(BLOB_VECTOR).unwrap();
+        assert_eq!(&open(&key, &ad("item", &[&[1u8; 16], &[2u8; 16]]), &blob).unwrap()[..], b"plaintext");
     }
 
     #[test]
