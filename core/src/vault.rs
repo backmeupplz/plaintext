@@ -416,6 +416,16 @@ impl Vault {
             }
         }
 
+        // A pending change now starts from the server's newer copy (kept below as
+        // a conflict copy if its content changed, or it was only re-sealed), so
+        // later pulls, which won't resend that blob, don't wait for it (#987).
+        let rebase: Vec<(Hex, B64, B64, Vec<Hex>)> = m
+            .items
+            .iter()
+            .filter(|(id, hash)| pending(id) && blob_changed(id, hash))
+            .filter_map(|(id, hash)| received.get(id).map(|e| (*id, hash.clone(), content_hash(&e.item), e.item.file_ids().collect())))
+            .collect();
+
         // 5. Merge. Local unpushed edits win; if the server's copy also changed
         //    since the edit began, it's kept as a conflict copy. A blob that was
         //    only re-sealed (a key rotation) is not a change.
@@ -453,6 +463,17 @@ impl Vault {
         }
         self.entries = next;
         self.deleted = deleted;
+        for (id, hash, content, files) in rebase {
+            if self.dirty.contains(&id) || self.deleted.contains(&id) {
+                self.base.insert(id, hash);
+                self.base_content.insert(id, content);
+                self.base_files.entry(id).or_default().extend(files);
+            } else {
+                self.base.remove(&id);
+                self.base_content.remove(&id);
+                self.base_files.remove(&id);
+            }
+        }
         for (id, mut item) in conflicts {
             // The server serves this version under `id` until our edit is pushed.
             self.base_files.entry(id).or_default().extend(item.file_ids());
