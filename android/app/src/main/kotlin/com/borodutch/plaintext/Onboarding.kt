@@ -91,9 +91,11 @@ private class Flow {
 }
 
 /** Rust's network message talks about items already on this device, and there are none yet. */
-private fun setupError(e: Throwable) =
-    if (e is PlaintextException.Network) "Couldn't reach that server. Check the address, and add http:// if it doesn't use https."
-    else errorText(e)
+private fun setupError(e: Throwable, typedAddress: Boolean = false) = when {
+    e !is PlaintextException.Network -> errorText(e)
+    typedAddress -> "Couldn't reach that server. Check the address, and add http:// if it doesn't use https."
+    else -> "Couldn't reach the server. Check your connection and try again."
+}
 
 /**
  * Welcome → Server → Create account → Emergency Kit → biometrics, or Welcome → Server → username → Secret Key
@@ -189,7 +191,7 @@ private fun ServerStep(flow: Flow) {
                 model.vault.recentServers = listOf(address.url) + model.vault.recentServers.filter { it != address.url }
                 if (flow.path.lastOrNull() == Step.Server) flow.go(if (flow.create) Step.Create else Step.Username)
             } catch (e: Exception) {
-                error = setupError(e)
+                error = setupError(e, typedAddress = !flow.useCloud)
             } finally {
                 busy = false
             }
