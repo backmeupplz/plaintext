@@ -309,7 +309,8 @@ impl<T: Transport> Session<T> {
                 // Best effort: an older server or a role that changed mid-run just means next time.
                 Ok(()) => drop(self.collect_files(id, 0)),
                 // Every held-back change comes after a pull, so collecting is still safe, and
-                // over quota it's what makes room for the refused change.
+                // over quota it's what makes room for the refused change (though another
+                // device may collect that change's own uploads meanwhile; DESIGN "Attachments").
                 Err(e) if e.held_back() => {
                     drop(self.collect_files(id, 0));
                     full = Some(e);

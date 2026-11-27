@@ -800,7 +800,7 @@ fn run(cli: Cli) -> Res<()> {
                 // The server refused the item, so nothing lists the file: don't leave
                 // it behind. After a network error or a proxy's 5xx the push may have
                 // landed; a later sync collects the file if it didn't.
-                if matches!(e, plaintext_client::Error::Server(400..=499, _)) {
+                if matches!(e, plaintext_client::Error::Server(400..=499 | 507, _)) {
                     let _ = s.delete_file(&vid, &fid);
                 }
                 return Err(e.into());

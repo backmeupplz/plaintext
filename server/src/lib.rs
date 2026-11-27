@@ -62,7 +62,7 @@ const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
 const TOO_BIG: (StatusCode, &str) = (StatusCode::PAYLOAD_TOO_LARGE, "more items than a device can pull in one go: push fewer at a time");
 /// 507, not 413: clients tell a full account from a request that's too big.
 const FULL: (StatusCode, &str) =
-    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items or share links to make room (their attachments are freed about a week later, by a device that syncs the vault)");
+    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items, share links or sent messages to make room (attachments are freed about a week later, by a device that syncs the vault)");
 
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
