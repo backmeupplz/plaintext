@@ -28,6 +28,16 @@ fn login(url: &str, pw: &str, sk: &SecretKey) -> Session<Http> {
     Session::login(Http::new(url), &derive(pw, sk), "test").unwrap()
 }
 
+/// Sign up and sign in, both expected to work.
+fn join<T: Transport>(t: T, username: &str, pw: &str, invite: Option<&str>, device: &str) -> (SecretKey, Session<T>) {
+    let (sk, s) = Session::signup(t, username, pw, invite, device).unwrap();
+    let mut s = s.unwrap();
+    if let Some(code) = invite {
+        s.trust_inviter(code).unwrap();
+    }
+    (sk, s)
+}
+
 fn item(title: &str, pw: &str) -> Item {
     Item { kind: "login".into(), title: title.into(), username: format!("{title}-user"), password: pw.into(), ..Default::default() }
 }
@@ -46,11 +56,11 @@ fn family_agent_and_sharing() {
 
     // The first user becomes the admin; the next needs an invite.
     assert_eq!(status(Session::signup(Http::new(&url), "mallory", "pw", None, "x")), 403, "the setup code guards the first account");
-    let (ask, mut alice) = Session::signup(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop").unwrap();
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
     assert!(alice.admin);
     assert_eq!(status(Session::signup(Http::new(&url), "bob", "bob pw", None, "phone")), 403);
     let code = alice.invite().unwrap();
-    let (bsk, mut bob) = Session::signup(Http::new(&url), "bob", "bob pw", Some(&code), "phone").unwrap();
+    let (bsk, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
     assert!(!bob.admin);
     assert_eq!(status(Session::signup(Http::new(&url), "carol", "pw", Some(&code), "x")), 403); // used up
     alice.sync().unwrap();
@@ -204,10 +214,10 @@ fn evil(url: &str) -> Evil {
 #[test]
 fn lying_server_and_hostile_users() {
     let (url, path) = server();
-    let (ask, mut alice) = Session::signup(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop").unwrap();
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
     let signup_keyring = alice.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().keyring;
     let code = alice.invite().unwrap();
-    let (_, mut bob) = Session::signup(Http::new(&url), "bob", "bob pw", Some(&code), "phone").unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
     alice.sync().unwrap();
     assert!(alice.keyring.contacts["bob"].verified);
     let local = alice.keyring_snapshot();
@@ -251,10 +261,10 @@ fn hosted_server_and_several_servers() {
     let (url, _) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
     let info = server_info(&Http::new(&url)).unwrap();
     assert!(info.open && !info.setup && !info.version.is_empty());
-    let (_, admin) = Session::signup(Http::new(&url), "admin", "admin pw", None, "t").unwrap();
+    let (_, admin) = join(Http::new(&url), "admin", "admin pw", None, "t");
     assert!(admin.admin);
-    let (_, mut carol) = Session::signup(Http::new(&url), "carol", "carol pw", None, "t").unwrap();
-    let (_, dave) = Session::signup(Http::new(&url), "dave", "dave pw", None, "t").unwrap();
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let (_, dave) = join(Http::new(&url), "dave", "dave pw", None, "t");
     assert!(!carol.admin);
     assert_eq!(admin.users().unwrap().len(), 3);
     assert!(carol.users().unwrap().is_empty(), "no customer list on an open server");
@@ -262,7 +272,7 @@ fn hosted_server_and_several_servers() {
     assert!(matches!(carol.pin_user("nobody"), Err(Error::NotFound(_))));
     // Anyone may invite there; the invitee is visible to (and verified by) the inviter.
     let code = carol.invite().unwrap();
-    let (_, erin) = Session::signup(Http::new(&url), "erin", "erin pw", Some(&code), "t").unwrap();
+    let (_, erin) = join(Http::new(&url), "erin", "erin pw", Some(&code), "t");
     assert!(erin.keyring.contacts["carol"].verified);
     carol.sync().unwrap();
     assert_eq!(carol.users().unwrap().len(), 1);
@@ -271,7 +281,7 @@ fn hosted_server_and_several_servers() {
     drop(dave);
 
     // A login relayed from a look-alike server doesn't open a session here.
-    let (sk, _) = Session::signup(Http::new(&url), "gina", "gina pw", None, "t").unwrap();
+    let (sk, _) = join(Http::new(&url), "gina", "gina pw", None, "t");
     let d = derive("gina pw", &sk);
     let relayed = plaintext_core::login_request(&d, now_ms(), "t", "vault.examp1e.com");
     assert_eq!(status(call::<_, LoginResponse>(&Http::new(&url), "POST", "/v1/login", None, Some(&relayed))), 401);
@@ -281,9 +291,20 @@ fn hosted_server_and_several_servers() {
     // signed for any other, such as the address of the machine itself.
     let (url2, _) = server_with(plaintext_server::Config { hosts: vec!["vault.example.com".into()], ..Default::default() });
     let proxied = || Named(Http::new(&url2), "vault.example.com");
-    let (sk2, _) = Session::signup(proxied(), "gina", "other pw", None, "t").unwrap();
+    let (sk2, _) = join(proxied(), "gina", "other pw", None, "t");
     assert!(Session::login(proxied(), &derive("other pw", &sk2), "t").is_ok());
     assert_eq!(status(Session::login(Http::new(&url2), &derive("other pw", &sk2), "t")), 401);
+}
+
+/// A proxy that rewrites `Host` makes the login after signup fail, but the
+/// account exists by then, so its Secret Key still comes back and works.
+#[test]
+fn secret_key_survives_a_failed_login_after_signup() {
+    let (url, _) = server_with(plaintext_server::Config { hosts: vec!["vault.example.com".into()], ..Default::default() });
+    let (sk, s) = Session::signup(Http::new(&url), "hana", "hana pw", None, "t").unwrap();
+    assert_eq!(status(s), 401, "the login signed for the wrong host is refused");
+    let s = Session::login(Named(Http::new(&url), "vault.example.com"), &derive("hana pw", &sk), "t").unwrap();
+    assert!(s.admin, "the account was created, as the server's first");
 }
 
 /// What a client behind a reverse proxy sees: its own name for the server.

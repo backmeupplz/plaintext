@@ -431,14 +431,24 @@ fn run(cli: Cli) -> Res<()> {
             let pw = password_twice()?;
             let cfg = Config { server: server.trim_end_matches('/').into(), username: username.clone() };
             let (sk, s) = Session::signup(Http::new(&cfg.server), &username, &pw, invite.as_deref(), &state::device())?;
-            state::save_config(&cfg)?;
-            state::save_secret_key(&cfg, &sk)?;
-            state::remember(&cfg, &s)?;
-            println!("Welcome, {username}.{}\n", if s.admin { " You're this server's admin." } else { "" });
+            // The account exists now: show its Secret Key before anything else can fail.
             println!("Your Secret Key: {}\n", sk.encode());
             println!("Write it down with your server address ({}) and keep it somewhere safe.", cfg.server);
-            println!("You need it with your password to sign in on a new device, and nobody can recover it for you.");
-            println!("It's saved in this computer's keychain.\nYour fingerprint: {}", s.me().fingerprint());
+            println!("You need it with your password to sign in on a new device, and nobody can recover it for you.\n");
+            state::save_config(&cfg)?;
+            state::save_secret_key(&cfg, &sk)?;
+            let mut s = s.map_err(|e| {
+                format!(
+                    "account created, but signing in failed: {e}; run `plaintext signin` \
+                     (if it keeps failing, the server's PLAINTEXT_URL may not match the address you use)"
+                )
+            })?;
+            state::remember(&cfg, &s)?;
+            println!("Welcome, {username}.{}", if s.admin { " You're this server's admin." } else { "" });
+            println!("Your Secret Key is saved on this computer.\nYour fingerprint: {}", s.me().fingerprint());
+            if let Some(code) = &invite {
+                s.trust_inviter(code)?;
+            }
         }
         Cmd::Signin { server, username } => {
             let old = state::load_config().ok();

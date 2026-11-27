@@ -140,24 +140,30 @@ pub struct Session<T: Transport> {
 
 impl<T: Transport> Session<T> {
     /// Create an account. The first user of a server becomes its admin and needs
-    /// no invite. Show the Secret Key to the user once.
-    pub fn signup(t: T, username: &str, password: &str, invite: Option<&str>, device: &str) -> Result<(SecretKey, Self)> {
+    /// no invite. Show the Secret Key to the user once, then, with an invite,
+    /// call `trust_inviter`.
+    ///
+    /// The outer error means no account was made. Once it exists the Secret Key
+    /// always comes back, even if signing in right after fails (the inner error).
+    pub fn signup(t: T, username: &str, password: &str, invite: Option<&str>, device: &str) -> Result<(SecretKey, Result<Self>)> {
         // Invite codes are `id.secret`; anything else is the server's setup code.
         let setup = invite.filter(|c| !c.contains('.'));
         let (sk, mut s) = plaintext_core::signup(username, password, invite.filter(|c| c.contains('.')))?;
         s.request.setup = setup.map(String::from);
         call::<_, ()>(&t, "POST", "/v1/signup", None, Some(&s.request))?;
-        let mut session = Self::login(t, &derive(password, &sk), device)?;
-        // The invite names who sent it and their fingerprint: pin and verify them.
-        if let Some((inviter, fp)) = invite.and_then(plaintext_core::identity::invite_sender) {
-            session.pin_user(&inviter)?;
-            if session.fingerprint(&inviter).map(|f| f.replace(' ', "")) == Some(fp) {
-                session.mark_verified(&inviter)?;
-            } else {
-                return Err(plaintext_core::Error::KeyChanged(inviter).into());
-            }
-        }
+        let session = Self::login(t, &derive(password, &sk), device);
         Ok((sk, session))
+    }
+
+    /// The invite names who sent it and their fingerprint: pin and verify them.
+    /// Setup codes name nobody and are ignored.
+    pub fn trust_inviter(&mut self, invite: &str) -> Result<()> {
+        let Some((inviter, fp)) = plaintext_core::identity::invite_sender(invite) else { return Ok(()) };
+        self.pin_user(&inviter)?;
+        if self.fingerprint(&inviter).map(|f| f.replace(' ', "")) != Some(fp) {
+            return Err(plaintext_core::Error::KeyChanged(inviter).into());
+        }
+        self.mark_verified(&inviter)
     }
 
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
