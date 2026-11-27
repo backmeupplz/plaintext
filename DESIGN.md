@@ -166,7 +166,7 @@ Agents are first-class accounts owned by a human, built for automation and AI to
 
 Types are in `core/src/api.rs`; ids are hex, blobs base64.
 
-Signed documents are limited as a whole, before anything in them is parsed: identities 2 KiB, rosters 512 KiB and 1000 members (each listed once), messages and manifests their sealed part in base64 plus 4 KiB. `GET /v1/messages` returns the oldest messages up to 32 MiB (at least one); the rest come once those are deleted. `HEAD` on a share link gets 405, so checking a link doesn't use up a view, and every response carries `Cache-Control: no-store`. Expired links, messages and sessions are never served, and are deleted every ten minutes.
+Signed documents are limited as a whole, before anything in them is parsed: identities 2 KiB, rosters 512 KiB and 1000 members (each listed once), messages and manifests their sealed part in base64 plus 4 KiB. `GET /v1/messages` returns the oldest messages up to 32 MiB (at least one); the rest come once those are deleted. `HEAD` on a share link gets 405, so checking a link doesn't use up a view, and every response carries `Cache-Control: no-store`, plus `Strict-Transport-Security: max-age=31536000` when a `PLAINTEXT_URL` address is `https://`. Expired links, messages and sessions are never served, and are deleted every ten minutes.
 
 Request bodies are limited to 64 KiB, except: the keyring, inbox messages and share links take 2 MiB; vault create, push and roster changes take 32 MiB; files take 64 MB. Those larger requests need a valid session, which the server checks before it reads the body. Removing a member re-seals every item in one request, so a vault whose items come to more than about 24 MB (32 MiB after base64) can't change its key until rotations are split.
 

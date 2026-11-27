@@ -17,7 +17,7 @@ Put it behind HTTPS at any address you like: your own domain, a LAN address or a
 | Variable | |
 |---|---|
 | `PLAINTEXT_SETUP_CODE` | On a server reachable from the internet, set it to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account. |
-| `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Without it, only `localhost` can sign in. |
+| `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Without it, only `localhost` can sign in. An `https://` address also makes every response send `Strict-Transport-Security`. |
 | `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, nobody but admins can list everyone, and each address gets at most 10 signups and 30 failed logins an hour. Needs `PLAINTEXT_SETUP_CODE` too. |
 | `PLAINTEXT_TRUST_PROXY=1` | The server sits behind one reverse proxy that sets `X-Forwarded-For`, so rate limits count the address the proxy saw rather than the proxy's own. Leave it unset if clients can reach the server directly, or they could pick their own address. |
 | `PLAINTEXT_QUOTA_MB` | How much each account may store: items and attachments in the vaults it created, and the share links and messages it and its agents sent. Writes past it are refused, while reading and deleting keep working. Unset means unlimited. |

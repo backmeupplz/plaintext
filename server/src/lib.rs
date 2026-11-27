@@ -161,6 +161,15 @@ pub struct Config {
     /// Behind a reverse proxy: rate-limit by the last `X-Forwarded-For` address
     /// (the one the proxy added) instead of the connection's.
     pub trust_proxy: bool,
+    /// Clients reach this server over HTTPS (a `PLAINTEXT_URL` entry starts with
+    /// `https://`): every response tells browsers to keep using it.
+    pub hsts: bool,
+}
+
+/// Whether any comma-separated `PLAINTEXT_URL` entry is an `https://` address
+/// (`Config::hsts`); read before `crypto::server_host` drops the scheme.
+pub fn https_url(urls: &str) -> bool {
+    urls.split(',').any(|u| u.trim().get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")))
 }
 
 /// Serve `app` with each connection's address, which the rate limits need.
@@ -180,6 +189,7 @@ fn app(db: Connection, cfg: Config) -> Router {
             std::thread::sleep(std::time::Duration::from_secs(600));
         }
     });
+    let hsts = cfg.hsts;
     let limits = axum::middleware::from_fn(rate_limit);
     let big = |n: usize| (axum::middleware::from_fn_with_state(db.clone(), signed_in), DefaultBodyLimit::max(n));
     Router::new()
@@ -216,6 +226,13 @@ fn app(db: Connection, cfg: Config) -> Router {
         .layer(axum::Extension(cfg))
         .layer(axum::Extension(Arc::new(Limiter::default())))
         .with_state(db)
+        // Outermost, so 404s and body-limit refusals carry it too.
+        .layer(axum::middleware::map_response(move |mut r: Response| async move {
+            if hsts {
+                r.headers_mut().insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
+            }
+            r
+        }))
 }
 
 /// Refuses a request without a valid session before its body is read.
@@ -1367,6 +1384,16 @@ mod tests {
             assert!(disabled, "a disabled person's agent");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn https_urls() {
+        for u in ["https://a", "http://a, https://b", " HTTPS://a/"] {
+            assert!(super::https_url(u), "{u}");
+        }
+        for u in ["http://a", "vault.example.com", "", "https:/a", "a,http://b"] {
+            assert!(!super::https_url(u), "{u}");
+        }
     }
 
     #[test]

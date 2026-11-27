@@ -596,6 +596,43 @@ fn request_size_limits() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A server reached over HTTPS sends Strict-Transport-Security on every
+/// response, including 404s and refused bodies; one without it never does.
+#[test]
+fn strict_transport_security() {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let hsts = |url: &str| {
+        let get = |path: &str| {
+            let r = agent.get(format!("{url}{path}")).call().unwrap();
+            (r.status().as_u16(), r.headers().get("strict-transport-security").map(|v| v.to_str().unwrap().to_owned()))
+        };
+        // Announces a body over the limit and sends only part of it, as `request_size_limits` does.
+        let big = {
+            use std::io::{Read, Write};
+            let host = url.trim_start_matches("http://");
+            let mut s = std::net::TcpStream::connect(host).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            write!(s, "POST /v1/signup HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 1 << 20).unwrap();
+            s.write_all(&vec![b' '; 65 << 10]).unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut b = [0u8];
+                s.read_exact(&mut b).unwrap();
+                head.push(b[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let hsts = head.lines().find_map(|l| l.strip_prefix("strict-transport-security: ")).map(String::from);
+            (head[9..12].parse().unwrap(), hsts)
+        };
+        [get("/health"), get("/nope"), big]
+    };
+    let on = Some("max-age=31536000".to_owned());
+    let (url, _) = server_with(plaintext_server::Config { hsts: plaintext_server::https_url("https://vault.example.com"), ..Default::default() });
+    assert_eq!(hsts(&url), [(200, on.clone()), (404, on.clone()), (413, on)]);
+    let (url, _) = server();
+    assert_eq!(hsts(&url), [(200, None), (404, None), (413, None)]);
+}
+
 // ---------- Attacks from the 2026-11 security audit, over real HTTP; each must stay fixed ----------
 
 use plaintext_core::api::{Kind, UserInfo, VaultPut};
