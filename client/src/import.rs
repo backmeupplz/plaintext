@@ -548,7 +548,7 @@ pub fn csv(text: &str) -> Result<Vec<Imported>, ImportError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
