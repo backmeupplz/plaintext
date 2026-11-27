@@ -40,11 +40,21 @@ identity enc key ◄──sealed to── Vault Key (random per vault and epoch)
 
 ## Login and sessions
 
-The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms`. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login, and returns a random bearer token, storing only its SHA-256. Sessions can be listed and ended; disabling an account ends them all.
+The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms ‖ host`, where `host` is the server address the user typed, reduced to lowercase host and port (`crypto::server_host`: no scheme, path or default port). The server accepts only its own host: the names in `PLAINTEXT_URL` (comma-separated) when set, otherwise the request's `Host` header. A look-alike server can't relay a login to the real one for a session, since the signature names the look-alike. Set `PLAINTEXT_URL` on any server whose port is also reachable directly, so an attacker can't present a matching `Host` header. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login, and returns a random bearer token, storing only its SHA-256. Sessions can be listed and ended; disabling an account ends them all.
+
+## Servers and accounts
+
+Every server is independent and can sit at any address: a family's own domain, an IP on the LAN, a Tailscale name, or a hosted service. Nothing in the protocol names a particular server. One person can hold accounts on several servers. Each account is its own (server, username, Secret Key), and apps hold one `Session` per account and show their vaults side by side. Vaults are shared only within a server. Moving items between accounts is a copy made by a client holding both accounts, which re-encrypts the items.
+
+`GET /v1/info` (no session) tells an app what to ask for before signup: `{version, open, setup}`. `open` means anyone may sign up; `setup` means the server has no accounts yet and the first one needs the setup code.
+
+A hosted server runs with `PLAINTEXT_SIGNUP=open`. On such a server:
+- anyone may sign up, and any person may create invites, which still verify both sides;
+- the directory doesn't list everyone: `GET /v1/users` returns only the people who joined with your invites (admins see everyone), and people are found by exact username (`GET /v1/users/{name}`). Otherwise a hosted server would hand every customer the list of all the others.
 
 ## Users, invites and verification
 
-- Usernames are per server (2–32 of `a-z 0-9 . _ -`). The first account is the admin (if the server was started with `PLAINTEXT_SETUP_CODE`, it must present that code); everyone else needs a one-use invite (7 days) from an admin. No emails are stored.
+- Usernames are per server (2–32 of `a-z 0-9 . _ -`). The first account is the admin (if the server was started with `PLAINTEXT_SETUP_CODE`, it must present that code). On an invite-only server, everyone else needs a one-use invite (7 days) from an admin. No emails are stored.
 - Each account publishes a self-signed identity `{username, kind: human|agent, owner?, sign_pk, enc_pk}`.
 - **Pinning.** A client pins a user's keys the first time it sees them (directory lookup, a vault roster, an inbox message) and refuses any later difference (`KeyChanged`). Pins live in the synced keyring.
 - **Verification** marks a pin as confirmed out of band. Two ways: compare the fingerprint (`fingerprint(username, sign_pk, enc_pk)`, 4 groups of 6) in person or by QR; or an invite, which verifies both sides. An invite code is `id.secret.inviter.fingerprint`. The inviter's keyring keeps the secret; the new user sends `HMAC(secret, identity)` at signup, and the inviter's devices check it and mark the new user verified (a server that substitutes the new user's identity can't produce the proof). The new user's client looks the inviter up and marks them verified only if their fingerprint matches the one in the code.
@@ -100,7 +110,7 @@ Each vault has a counter and a **manifest chain**. A manifest is a signed envelo
 
 - **Sharing one item with a user:** the item is sealed to their pinned key, signed, and placed in their inbox with an optional expiry. They save it into a vault or delete it.
 - **Access requests:** an agent sends its owner a sealed, signed request ("need the prod DB password for the migration"). The owner grants vault access or sends the item.
-- **Share links** for people without an account: the item's current fields (no password history, earlier versions, passkeys or attachments) are sealed with a random key that exists only in the link's `#fragment`; the server stores the blob with an expiry (≤ 30 days) and optional view limit, and serves it without authentication. The link opens a static viewer at `getplaintext.org/s/`, so the self-hosted server never serves the code that decrypts. Whoever controls getplaintext.org's hosting could, in principle, serve a malicious viewer; that page is static, open source and small.
+- **Share links** for people without an account: the item's current fields (no password history, earlier versions, passkeys or attachments) are sealed with a random key that exists only in the link's `#fragment`; the server stores the blob with an expiry (≤ 30 days) and optional view limit, and serves it without authentication. The link opens a static viewer page, `getplaintext.org/s/` by default, so the vault server never serves the code that decrypts. Self-hosters can put a copy of `docs/s/` on any domain of their own and point their apps at it (the CLI reads `PLAINTEXT_LINK_PAGE`). It must not be served by the vault server itself, because whoever serves that page's script can read the key. Whoever controls the viewer's hosting could, in principle, serve a malicious viewer; that page is static, open source and small.
 
 ## Agents
 
@@ -122,7 +132,9 @@ Agents are first-class accounts owned by a human, built for automation and AI to
 | `PUT /v1/account/keyring` | compare-and-swap on the keyring counter |
 | `POST /v1/account/password` | signed by the current login key |
 | `GET /v1/sessions`, `DELETE /v1/sessions/{id}` | |
-| `GET /v1/users`, `POST /v1/users/{name}/disable`, `POST /v1/invites` | directory; admin actions (owners may disable their agents) |
+| `GET /v1/info` | public: version, open signup, setup code needed |
+| `GET /v1/users`, `GET /v1/users/{name}` | directory (limited on open servers, see "Servers and accounts"); exact lookup |
+| `POST /v1/users/{name}/disable`, `POST /v1/invites` | admin actions (owners may disable their agents; anyone invites on open servers) |
 | `POST /v1/vaults` | new vault (roster v0, keys, first manifest) |
 | `GET`/`PUT /v1/vaults/{id}` | pull / push |
 | `POST /v1/vaults/{id}/roster` | grant, change or revoke (with rotation) |

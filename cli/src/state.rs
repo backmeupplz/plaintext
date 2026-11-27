@@ -3,10 +3,11 @@
 //! vault snapshots on disk are sealed with the Account Key.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use plaintext_client::plaintext_core::Account;
 use plaintext_client::plaintext_core::api::Hex;
-use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent};
+use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent, server_host};
 use plaintext_client::plaintext_core::vault::Vault;
 use plaintext_client::{Error, Http, Session, now};
 use serde::{Deserialize, Serialize};
@@ -18,11 +19,28 @@ pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// How long `plaintext` stays unlocked after you enter your password.
 const UNLOCKED_FOR: u64 = 12 * 3600;
 
-#[derive(Serialize, Deserialize)]
+/// One account: a username on a server. You can hold several, on different servers.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub server: String,
     pub username: String,
 }
+
+impl Config {
+    /// `alice@vault.example.com`
+    pub fn name(&self) -> String {
+        format!("{}@{}", self.username, server_host(&self.server))
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Accounts {
+    pub accounts: Vec<Config>,
+    pub current: usize,
+}
+
+/// The account picked with `--account` or PLAINTEXT_ACCOUNT (else the current one).
+pub static PICK: OnceLock<String> = OnceLock::new();
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
@@ -59,7 +77,7 @@ impl Store {
                 use std::io::Write;
                 #[cfg(unix)]
                 use std::os::unix::fs::OpenOptionsExt;
-                std::fs::create_dir_all(home())?;
+                std::fs::create_dir_all(p.parent().unwrap_or(&home()))?;
                 let mut o = std::fs::OpenOptions::new();
                 o.write(true).create(true).truncate(true);
                 #[cfg(unix)]
@@ -79,20 +97,69 @@ impl Store {
 
 fn entry(cfg: &Config, what: &str) -> Res<Store> {
     if std::env::var("PLAINTEXT_KEYCHAIN").is_ok_and(|v| v == "file") {
-        return Ok(Store::File(home().join(format!("{what}.secret"))));
+        let name: String = cfg.name().chars().map(|c| if c.is_ascii_alphanumeric() || "@.-_".contains(c) { c } else { '_' }).collect();
+        return Ok(Store::File(home().join("secrets").join(format!("{name} {what}"))));
     }
     Ok(Store::Os(keyring::Entry::new("plaintext", &format!("{}@{} {what}", cfg.username, cfg.server))?))
 }
 
-pub fn load_config() -> Res<Config> {
-    let raw = std::fs::read(home().join("config.json")).map_err(|_| "not signed in; run `plaintext signin` or set PLAINTEXT_AGENT_KEY")?;
-    Ok(serde_json::from_slice(&raw)?)
+pub fn load_accounts() -> Res<Accounts> {
+    let Ok(raw) = std::fs::read(home().join("config.json")) else { return Ok(Accounts::default()) };
+    // config.json from before several accounts held just one.
+    Ok(serde_json::from_slice(&raw).or_else(|_| serde_json::from_slice(&raw).map(|c| Accounts { accounts: vec![c], current: 0 }))?)
 }
 
-pub fn save_config(cfg: &Config) -> Res<()> {
+fn save_accounts(a: &Accounts) -> Res<()> {
     std::fs::create_dir_all(home())?;
-    std::fs::write(home().join("config.json"), serde_json::to_vec_pretty(cfg)?)?;
+    std::fs::write(home().join("config.json"), serde_json::to_vec_pretty(a)?)?;
     Ok(())
+}
+
+/// Which account `sel` means: `user@host`, a username, or a server address.
+pub fn pick(list: &[Config], sel: &str) -> Res<usize> {
+    let hits: Vec<usize> = (0..list.len())
+        .filter(|&i| list[i].name() == sel || list[i].username == sel || server_host(&list[i].server) == server_host(sel))
+        .collect();
+    match hits[..] {
+        [i] => Ok(i),
+        [] => Err(format!("no account {sel}; `plaintext account ls` lists them").into()),
+        _ => Err(format!("{sel} matches several accounts; use username@server").into()),
+    }
+}
+
+/// The account commands act on.
+pub fn load_config() -> Res<Config> {
+    let a = load_accounts()?;
+    if a.accounts.is_empty() {
+        return Err("not signed in; run `plaintext signin` or set PLAINTEXT_AGENT_KEY".into());
+    }
+    let i = match PICK.get() {
+        Some(sel) => pick(&a.accounts, sel)?,
+        None => a.current.min(a.accounts.len() - 1),
+    };
+    Ok(a.accounts[i].clone())
+}
+
+/// Add or update an account and make it the current one.
+pub fn save_config(cfg: &Config) -> Res<()> {
+    let mut a = load_accounts()?;
+    a.current = a.accounts.iter().position(|c| c.name() == cfg.name()).unwrap_or_else(|| {
+        a.accounts.push(cfg.clone());
+        a.accounts.len() - 1
+    });
+    a.accounts[a.current] = cfg.clone();
+    save_accounts(&a)
+}
+
+/// Sign this computer out of an account and forget its Secret Key here.
+pub fn remove_account(cfg: &Config) -> Res<()> {
+    let mut a = load_accounts()?;
+    forget(cfg);
+    entry(cfg, "secret-key")?.delete();
+    let cur = a.accounts.get(a.current).map(Config::name);
+    a.accounts.retain(|c| c.name() != cfg.name());
+    a.current = a.accounts.iter().position(|c| Some(c.name()) == cur).unwrap_or(0);
+    save_accounts(&a)
 }
 
 pub fn save_secret_key(cfg: &Config, sk: &SecretKey) -> Res<()> {
@@ -221,4 +288,25 @@ pub fn save(s: &S) -> Res<()> {
         write(id.to_string(), v.snapshot(&s.account))?;
     }
     write("keyring".into(), s.keyring_snapshot())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_accounts_across_servers() {
+        let c = |u: &str, s: &str| Config { server: s.into(), username: u.into() };
+        let list = [c("alice", "https://vault.family.org"), c("alice", "https://vault.getplaintext.org"), c("bob", "http://10.0.0.2:8080")];
+        assert_eq!(pick(&list, "alice@vault.getplaintext.org").unwrap(), 1);
+        assert_eq!(pick(&list, "https://vault.family.org/").unwrap(), 0);
+        assert_eq!(pick(&list, "bob").unwrap(), 2);
+        assert!(pick(&list, "alice").is_err(), "ambiguous");
+        assert!(pick(&list, "carol").is_err());
+        // An old single-account config.json still loads.
+        let old: Accounts = serde_json::from_slice::<Accounts>(br#"{"server":"https://x","username":"a"}"#)
+            .or_else(|_| serde_json::from_slice(br#"{"server":"https://x","username":"a"}"#).map(|c| Accounts { accounts: vec![c], current: 0 }))
+            .unwrap();
+        assert_eq!(old.accounts[0].name(), "a@x");
+    }
 }

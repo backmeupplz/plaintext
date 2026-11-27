@@ -11,7 +11,16 @@ docker build -t plaintext .
 docker run -d --name plaintext -v plaintext:/data -p 8080:8080 plaintext
 ```
 
-Put it behind HTTPS. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). On a server reachable from the internet, set `PLAINTEXT_SETUP_CODE` to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account.
+Put it behind HTTPS at any address you like: your own domain, a LAN address or a Tailscale name. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). Settings, all optional:
+
+| Variable | |
+|---|---|
+| `PLAINTEXT_SETUP_CODE` | On a server reachable from the internet, set it to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account. |
+| `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Set it whenever the server's port is reachable without going through your proxy. |
+| `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, and nobody but admins can list everyone. |
+| `PLAINTEXT_ADDR`, `PLAINTEXT_DB` | Listen address (`0.0.0.0:8080`) and database path (`plaintext.db`). |
+
+Share links open on a static page at getplaintext.org that decrypts in the browser; your server never sees the key. To use your own domain for that too, host a copy of `docs/s/` anywhere except the vault server itself and set `PLAINTEXT_LINK_PAGE=https://your.page/s/`.
 
 ### Backups
 
@@ -36,6 +45,8 @@ plaintext get github
 plaintext vault create Family && plaintext vault share Family bob --role writer
 plaintext import 1pux ~/Downloads/export.1pux    # also: bitwarden, csv
 ```
+
+You can have accounts on several servers, such as your family's and a work one. Each `signup` or `signin` adds an account and makes it the default. `plaintext account ls` lists them, `plaintext account use NAME` switches, and `--account alice@vault.example.com` (or `PLAINTEXT_ACCOUNT`) picks one for a single command.
 
 Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). `plaintext lock` forgets the session. On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
 

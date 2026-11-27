@@ -17,6 +17,9 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(name = "plaintext", version, about = "End-to-end encrypted password manager. Your server only ever sees ciphertext.")]
 struct Cli {
+    /// Which account to use when you have several: username@server, a username, or a server
+    #[arg(long, global = true, env = "PLAINTEXT_ACCOUNT")]
+    account: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -108,6 +111,9 @@ enum Cmd {
         #[arg(long)]
         breaches: bool,
     },
+    /// Your accounts, on one server or several
+    #[command(subcommand)]
+    Account(AccountCmd),
     #[command(subcommand)]
     Vault(VaultCmd),
     #[command(subcommand)]
@@ -223,6 +229,16 @@ struct Fields {
     /// label=value, hidden by default
     #[arg(long)]
     concealed: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// Accounts on this computer; * marks the one used by default
+    Ls,
+    /// Use this account by default
+    Use { account: String },
+    /// Sign out and forget this account's Secret Key on this computer
+    Remove { account: String },
 }
 
 #[derive(Subcommand)]
@@ -407,6 +423,9 @@ pub fn resolve(s: &S, reference: &str) -> Res<String> {
 }
 
 fn run(cli: Cli) -> Res<()> {
+    if let Some(a) = cli.account {
+        let _ = state::PICK.set(a);
+    }
     match cli.cmd {
         Cmd::Signup { server, username, invite } => {
             let pw = password_twice()?;
@@ -424,11 +443,11 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Signin { server, username } => {
             let old = state::load_config().ok();
             let cfg = Config {
-                server: server.or(old.as_ref().map(|c| c.server.clone())).ok_or("--server is needed the first time")?,
+                server: server.map(|s| s.trim_end_matches('/').into()).or(old.as_ref().map(|c| c.server.clone())).ok_or("--server is needed the first time")?,
                 username: username.or(old.map(|c| c.username)).ok_or("--username is needed the first time")?,
             };
-            state::save_config(&cfg)?;
             let s = state::sign_in(&cfg)?;
+            state::save_config(&cfg)?;
             println!("Signed in as {} until you run `plaintext lock` (or 12 hours pass).", s.username());
         }
         Cmd::Lock => {
@@ -537,6 +556,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
+        Cmd::Account(a) => account_cmd(a)?,
         Cmd::Vault(v) => vault_cmd(v)?,
         Cmd::User(u) => user_cmd(u)?,
         Cmd::Agent(AgentCmd::Create { name, vault, role: r, expires }) => {
@@ -562,7 +582,7 @@ fn run(cli: Cli) -> Res<()> {
             let s = state::open()?;
             let (_, _, it) = s.one(&item, None)?;
             let cfg = state::load_config()?;
-            println!("{}", s.create_link(&cfg.server, &it, now() + duration(&expires)?, views)?);
+            println!("{}", s.create_link(&std::env::var("PLAINTEXT_LINK_PAGE").unwrap_or_else(|_| plaintext_client::LINK_PAGE.into()), &cfg.server, &it, now() + duration(&expires)?, views)?);
             if !it.files.is_empty() || !it.passkeys.is_empty() {
                 eprintln!("Attachments and passkeys aren't included in share links.");
             }
@@ -739,6 +759,28 @@ fn run(cli: Cli) -> Res<()> {
             show(&item, "a share link");
         }
         Cmd::Mcp => mcp::serve()?,
+    }
+    Ok(())
+}
+
+fn account_cmd(a: AccountCmd) -> Res<()> {
+    let accts = state::load_accounts()?;
+    match a {
+        AccountCmd::Ls => {
+            for (i, c) in accts.accounts.iter().enumerate() {
+                println!("{} {:<40} {}", if i == accts.current { "*" } else { " " }, c.name(), c.server);
+            }
+        }
+        AccountCmd::Use { account } => {
+            let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
+            state::save_config(&c)?;
+            println!("Using {} by default.", c.name());
+        }
+        AccountCmd::Remove { account } => {
+            let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
+            state::remove_account(&c)?;
+            println!("Signed out of {} and forgot its Secret Key on this computer. Your data on the server is untouched.", c.name());
+        }
     }
     Ok(())
 }

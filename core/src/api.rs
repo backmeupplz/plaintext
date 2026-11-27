@@ -269,6 +269,16 @@ pub struct UserInfo {
     pub invite: Option<InviteProof>,
 }
 
+/// `GET /v1/info`, unauthenticated: what an app needs before showing the signup form.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ServerInfo {
+    pub version: String,
+    /// Anyone may sign up (`true`), or only with an invite.
+    pub open: bool,
+    /// No accounts yet and the first one needs the setup code.
+    pub setup: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NewInvite {
     pub id: Hex,

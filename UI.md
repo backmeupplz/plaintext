@@ -34,10 +34,24 @@ Plain, warm, specific. Full sentences in explanations; short labels on buttons (
 ### First run
 
 1. **Welcome**: wordmark, one sentence ("Your passwords, encrypted on your devices. Your server only ever sees ciphertext."), two buttons: *Create account* and *Sign in*.
-2. **Server**: a single field for the server address, with a note that this is the Plaintext server they or their family run. Remember recent servers. Validate by calling `/health` before moving on.
-3. **Create account**: username, then password with a live strength meter and a *Suggest one* button (memorable words). If the server needs an invite, an invite-code field (or the code arrives pre-filled from an invite link/QR).
+2. **Server**: two choices.
+   - **Plaintext Cloud**, which we host. It's a preset address, so there's nothing to type.
+   - **My own server**, a field for any address: a domain, an IP or a Tailscale name, with an optional port. The note under it says this is the Plaintext server they or their family run. `http://` is accepted only for localhost, private networks and `.local`/`.ts.net` names, with a one-line warning that anyone on the network can see which server they use.
+
+   Remember recent servers. Call `GET /v1/info` before moving on; it doubles as the reachability check.
+3. **Create account**: username, then password with a live strength meter and a *Suggest one* button (memorable words). What else it asks for depends on `/v1/info`:
+   - `setup`: a *Setup code* field, with a sentence saying it's the code the person who runs the server set.
+   - Not `open`: an invite-code field, or the code arrives pre-filled from an invite link/QR.
+   - `open`: an optional invite code, offered only when the user arrived from an invite link.
 4. **Emergency Kit**: the Secret Key in large monospace, server address and username, an explanation in two sentences of why it matters and that nobody can recover it. Actions: *Save as PDF*, *Print*, *I've saved it*. The PDF has a blank line to write the password on. Don't let them continue without one of those taps.
 5. **Unlock with Face ID / Touch ID / fingerprint**: offer it right away, with a one-line explanation.
+
+**Several accounts.** One app holds any number of accounts, on the same server or different ones (a family server, a work server, Plaintext Cloud). Settings → Accounts lists them by username and server, with *Add account* (the same Server → Create/Sign in flow) and *Sign out of this account*. Unlock opens all of them at once.
+
+- Home shows every account's vaults together. The vault picker groups them by account, and with more than one account each row's secondary line names the account.
+- New items go to the default vault of the account selected in the picker.
+- Sharing, people search and the Inbox are per account, because vaults can't be shared across servers.
+- *Move to vault* can move an item to another account's vault, which re-encrypts it there.
 
 **Sign in on a new device:** server → username → *Scan from another device* (QR shown by any signed-in device under Settings → Add a device, containing server, username and Secret Key) or *Enter Secret Key* → password. The QR path is the default; typing the key is the fallback.
 
@@ -76,7 +90,7 @@ Biometric prompt immediately on launch; a password field below it as the fallbac
 ### Vaults and sharing
 
 - Vault list shows name, icon, item count, member avatars and your role.
-- **Share vault** sheet: search users on the server, pick a role (*Can view*, *Can edit*, *Can manage*), optional expiry. Members list shows each person's role, expiry and a verified badge or a *Verify* button.
+- **Share vault** sheet: find people by username (on invite-only servers, also browse everyone), pick a role (*Can view*, *Can edit*, *Can manage*), optional expiry. Members list shows each person's role, expiry and a verified badge or a *Verify* button.
 - **Verify** screen: both people's fingerprints in large monospace plus a QR to scan; scanning the other person's QR marks them verified. Copy explains why in one sentence ("This makes sure your server can't swap their key for its own.").
 - Removing someone explains that the vault key will be replaced and runs it with a progress indicator.
 - **Share item** sheet: *Send to a person* (search, sealed to their key, optional expiry) or *Create a link* (expiry 1 hour – 30 days, *Only one view* toggle), then the system share sheet. Links show "Anyone with this link can see this item until it expires."
@@ -95,7 +109,7 @@ A summary card (counts of weak, reused, breached, unsecured, missing 2FA) and a 
 
 ### Settings
 
-Account (username, fingerprint, change password, Emergency Kit again, devices/sessions with sign-out), Security (auto-lock time, biometrics, clipboard clear time, hide on screen share), Autofill (enable instructions per platform), Import / Export, Agents, About (server version, open source link). Admins also get People (invite, disable) on the server.
+Accounts (each one's username and server), Account (username, fingerprint, change password, Emergency Kit again, devices/sessions with sign-out), Security (auto-lock time, biometrics, clipboard clear time, hide on screen share), Autofill (enable instructions per platform), Import / Export, Agents, Share links (the link page address, default `getplaintext.org/s/`, for self-hosters who host their own copy), About (server version, open source link). Admins also get People (invite, disable) on the server. On open servers everyone gets *Invite someone*.
 
 ## Autofill and the browser extension
 

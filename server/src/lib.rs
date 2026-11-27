@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use plaintext_core::api::*;
-use plaintext_core::crypto::{login_message, password_change_message, sha256, verify};
+use plaintext_core::crypto::{login_message, password_change_message, server_host, sha256, verify};
 use plaintext_core::identity::valid_username;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Deserialize;
@@ -67,12 +67,21 @@ pub fn backup_copy(db_path: &str) -> std::io::Result<std::path::PathBuf> {
     Ok(dest)
 }
 
-#[derive(Clone)]
-struct Setup(Option<String>);
+#[derive(Clone, Default)]
+pub struct Config {
+    /// If set, the first account must present it (so nobody can race you to
+    /// become admin of a fresh public server).
+    pub setup_code: Option<String>,
+    /// Anyone may sign up without an invite (a hosted server). The directory then
+    /// stops listing everyone: people are looked up by exact username.
+    pub open_signup: bool,
+    /// The hosts clients reach this server at (`crypto::server_host`). Logins
+    /// signed for any other host are refused. Empty: the request's Host header,
+    /// which is weaker if the port is also reachable directly.
+    pub hosts: Vec<String>,
+}
 
-/// `setup_code`: if set, the first account must present it (so nobody can race
-/// you to become admin of a fresh public server).
-pub fn app(db: Connection, setup_code: Option<String>) -> Router {
+pub fn app(db: Connection, cfg: Config) -> Router {
     let db: Db = Arc::new(Mutex::new(db));
     Router::new()
         .route("/v1/signup", post(signup))
@@ -84,7 +93,9 @@ pub fn app(db: Connection, setup_code: Option<String>) -> Router {
         .route("/v1/account/password", post(change_password))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", axum::routing::delete(end_session))
+        .route("/v1/info", get(info))
         .route("/v1/users", get(users))
+        .route("/v1/users/{name}", get(user))
         .route("/v1/users/{name}/disable", post(disable_user))
         .route("/v1/invites", post(create_invite))
         .route("/v1/vaults", post(create_vault))
@@ -98,7 +109,7 @@ pub fn app(db: Connection, setup_code: Option<String>) -> Router {
         .route("/v1/links/{id}", get(open_link).delete(delete_link))
         .route("/health", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(MAX_FILE + (1 << 20)))
-        .layer(axum::Extension(Setup(setup_code)))
+        .layer(axum::Extension(cfg))
         .with_state(db)
 }
 
@@ -246,17 +257,24 @@ fn insert_account(tx: &Transaction, req: &SignupRequest, kind: Kind, owner: Opti
     Ok(id)
 }
 
-async fn signup(State(db): State<Db>, axum::Extension(setup): axum::Extension<Setup>, Json(req): Json<SignupRequest>) -> R<StatusCode> {
+async fn info(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>) -> R<Json<ServerInfo>> {
+    let db = db.lock().expect("db lock");
+    let empty = db.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).map_err(db_err)? == 0;
+    Ok(Json(ServerInfo { version: env!("CARGO_PKG_VERSION").into(), open: cfg.open_signup, setup: empty && cfg.setup_code.is_some() }))
+}
+
+async fn signup(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, Json(req): Json<SignupRequest>) -> R<StatusCode> {
     let mut db = db.lock().expect("db lock");
     let tx = db.transaction().map_err(db_err)?;
     let first = tx.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).map_err(db_err)? == 0;
-    if first && let Some(code) = &setup.0 {
+    if first && let Some(code) = &cfg.setup_code {
         let given = req.setup.as_deref().unwrap_or_default();
         if !bool::from(subtle::ConstantTimeEq::ct_eq(given.as_bytes(), code.as_bytes())) {
             return Err((StatusCode::FORBIDDEN, "this server needs its setup code for the first account"));
         }
     }
-    if !first {
+    // On open servers an invite is optional, but one that's given must be valid.
+    if !first && (!cfg.open_signup || req.invite.is_some()) {
         let inv = req.invite.as_ref().ok_or((StatusCode::FORBIDDEN, "signups need an invite"))?;
         let used = tx
             .execute("UPDATE invites SET used = 1 WHERE id = ? AND used = 0 AND expires > ?", params![&inv.id.0[..], now()])
@@ -283,7 +301,7 @@ async fn create_agent(State(db): State<Db>, h: HeaderMap, Json(req): Json<Signup
     Ok(StatusCode::CREATED)
 }
 
-async fn login(State(db): State<Db>, Json(req): Json<LoginRequest>) -> R<Json<LoginResponse>> {
+async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap, Json(req): Json<LoginRequest>) -> R<Json<LoginResponse>> {
     let denied = (StatusCode::UNAUTHORIZED, "login failed");
     if req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS || req.device.len() > 200 {
         return Err(denied);
@@ -299,7 +317,9 @@ async fn login(State(db): State<Db>, Json(req): Json<LoginRequest>) -> R<Json<Lo
     let key = ed25519_dalek::VerifyingKey::from_bytes(&auth.try_into().map_err(|_| denied)?).map_err(|_| denied)?;
     let sig = ed25519_dalek::Signature::from_slice(&req.sig.0).map_err(|_| denied)?;
     // Strictly newer timestamps only: a captured login can't be replayed.
-    if req.ts <= last || key.verify_strict(&login_message(&req.account_id.0, req.ts), &sig).is_err() {
+    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).map(server_host);
+    let hosts = if cfg.hosts.is_empty() { host.into_iter().collect() } else { cfg.hosts.clone() };
+    if req.ts <= last || !hosts.iter().any(|host| key.verify_strict(&login_message(&req.account_id.0, req.ts, host), &sig).is_ok()) {
         return Err(denied);
     }
     let mut raw = [0u8; 32];
@@ -402,12 +422,32 @@ async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn users(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<UserInfo>>> {
+const USER_COLS: &str = "SELECT identity, admin, disabled, invite_id, invite_proof FROM accounts";
+
+/// The directory. On an open (hosted) server only admins see everyone; others
+/// see the people who joined with their invites, so their devices can verify them.
+async fn users(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap) -> R<Json<Vec<UserInfo>>> {
+    let db = db.lock().expect("db lock");
+    let c = caller(&db, &h)?;
+    let (filter, who) = if cfg.open_signup && !c.admin {
+        (" WHERE invite_id IN (SELECT id FROM invites WHERE created_by = ?1)", c.username)
+    } else {
+        (" WHERE ?1 = ?1", String::new())
+    };
+    Ok(Json(user_rows(&db, &format!("{USER_COLS}{filter} ORDER BY username"), &who)?))
+}
+
+/// One person by exact username, on any server.
+async fn user(State(db): State<Db>, h: HeaderMap, Path(name): Path<String>) -> R<Json<UserInfo>> {
     let db = db.lock().expect("db lock");
     caller(&db, &h)?;
-    let mut q = db.prepare("SELECT identity, admin, disabled, invite_id, invite_proof FROM accounts ORDER BY username").map_err(db_err)?;
+    user_rows(&db, &format!("{USER_COLS} WHERE username = ?1"), &name)?.pop().map(Json).ok_or((StatusCode::NOT_FOUND, "no such user"))
+}
+
+fn user_rows(db: &Connection, sql: &str, arg: &str) -> R<Vec<UserInfo>> {
+    let mut q = db.prepare(sql).map_err(db_err)?;
     let list = q
-        .query_map([], |r| {
+        .query_map([arg], |r| {
             let id: String = r.get(0)?;
             let inv: Option<Vec<u8>> = r.get(3)?;
             let proof: Option<Vec<u8>> = r.get(4)?;
@@ -420,7 +460,7 @@ async fn users(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<UserInfo>>> {
             Some(UserInfo { identity: serde_json::from_str(&id).ok()?, admin, disabled, invite })
         })
         .collect();
-    Ok(Json(list))
+    Ok(list)
 }
 
 async fn disable_user(State(db): State<Db>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {
@@ -438,10 +478,12 @@ async fn disable_user(State(db): State<Db>, h: HeaderMap, Path(name): Path<Strin
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn create_invite(State(db): State<Db>, h: HeaderMap, Json(req): Json<NewInvite>) -> R<StatusCode> {
+async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap, Json(req): Json<NewInvite>) -> R<StatusCode> {
     let db = db.lock().expect("db lock");
     let c = caller(&db, &h)?;
-    if !c.admin {
+    // Anyone may invite on an open server: signup needs no invite there, and an
+    // invite still verifies both people.
+    if !(c.admin || cfg.open_signup && c.human) {
         return Err(DENIED);
     }
     db.execute(

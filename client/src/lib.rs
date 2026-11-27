@@ -60,6 +60,8 @@ pub fn now_ms() -> u64 {
 /// How requests reach the server. `Http` for real use; tests and embedders may plug in others.
 pub trait Transport {
     fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)>;
+    /// The server's host as the user typed it (`crypto::server_host`); logins are signed for it.
+    fn host(&self) -> String;
 }
 
 pub struct Http {
@@ -89,6 +91,20 @@ impl Transport for Http {
         let bytes = resp.body_mut().with_config().limit(128 << 20).read_to_vec().map_err(|e| Error::Network(e.to_string()))?;
         Ok((status, bytes))
     }
+
+    fn host(&self) -> String {
+        plaintext_core::crypto::server_host(&self.base)
+    }
+}
+
+/// The share-link page. It's static and lives apart from every vault server: whoever
+/// serves the page's script could read the key in the link. Self-hosters can host
+/// `docs/s/` on their own domain and use that instead.
+pub const LINK_PAGE: &str = "https://getplaintext.org/s/";
+
+/// What the server allows before anyone signs in (open signup, setup code).
+pub fn server_info<T: Transport>(t: &T) -> Result<ServerInfo> {
+    call(t, "GET", "/v1/info", None, NONE)
 }
 
 fn call<T: Transport, R: DeserializeOwned>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<&impl Serialize>) -> Result<R> {
@@ -146,7 +162,7 @@ impl<T: Transport> Session<T> {
 
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
     pub fn login(t: T, d: &Derived, device: &str) -> Result<Self> {
-        let req = plaintext_core::login_request(d, now_ms(), device);
+        let req = plaintext_core::login_request(d, now_ms(), device, &t.host());
         let resp: LoginResponse = call(&t, "POST", "/v1/login", None, Some(&req))?;
         let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&resp.token), NONE)?;
         let (account, keyring) = plaintext_core::unlock(d, &acct)?;
@@ -302,6 +318,8 @@ impl<T: Transport> Session<T> {
 
     // ---------- Users ----------
 
+    /// Everyone on the server for admins and on invite-only servers; on open
+    /// (hosted) servers, only the people who joined with your invites.
     pub fn users(&self) -> Result<Vec<UserInfo>> {
         self.call("GET", "/v1/users", NONE)
     }
@@ -309,7 +327,16 @@ impl<T: Transport> Session<T> {
     /// Look a user up in the server directory and pin their keys (trust on first
     /// use; compare fingerprints to verify). Fails if they differ from a pin.
     pub fn pin_user(&mut self, username: &str) -> Result<Identity> {
-        let u = self.users()?.into_iter().find(|u| u.identity.signer == username).ok_or(Error::NotFound(format!("user {username}")))?;
+        if !plaintext_core::identity::valid_username(username) {
+            return Err(Error::NotFound(format!("user {username}")));
+        }
+        let u: UserInfo = match self.call("GET", &format!("/v1/users/{username}"), NONE) {
+            Err(Error::Server(404, _)) => return Err(Error::NotFound(format!("user {username}"))),
+            r => r?,
+        };
+        if u.identity.signer != username {
+            return Err(plaintext_core::Error::KeyChanged(username.into()).into());
+        }
         let before = self.keyring.contacts.contains_key(username);
         let id = self.keyring.pin_identity(&u.identity)?;
         self.keyring_dirty |= !before;
@@ -330,7 +357,7 @@ impl<T: Transport> Session<T> {
         self.save_keyring()
     }
 
-    /// An invite code for a new user (admins only). Send it to them yourself.
+    /// An invite code for a new user (admins; anyone on open servers). Send it to them yourself.
     pub fn invite(&mut self) -> Result<String> {
         let (id, code) = self.keyring.new_invite();
         self.keyring_dirty = true;
@@ -540,11 +567,11 @@ impl<T: Transport> Session<T> {
     }
 
     /// A link anyone can open, and the full URL to send them. The key is only in
-    /// the URL fragment; the viewer page is the static one at getplaintext.org.
-    pub fn create_link(&self, server: &str, item: &Item, expires: u64, max_views: Option<u32>) -> Result<String> {
+    /// the URL fragment, which browsers never send; `page` is usually `LINK_PAGE`.
+    pub fn create_link(&self, page: &str, server: &str, item: &Item, expires: u64, max_views: Option<u32>) -> Result<String> {
         let (link, fragment) = plaintext_core::create_link(item, expires, max_views);
         self.call::<()>("POST", "/v1/links", Some(&link))?;
-        Ok(format!("https://getplaintext.org/s/#{}/{}/{}", server.trim_end_matches('/'), link.id, fragment))
+        Ok(format!("{}#{}/{}/{}", page.split('#').next().unwrap_or_default(), server.trim_end_matches('/'), link.id, fragment))
     }
 }
 

@@ -143,8 +143,9 @@ pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup
     Ok((key, s))
 }
 
-pub fn login_request(d: &Derived, ts_ms: u64, device: &str) -> LoginRequest {
-    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms).to_vec()), device: device.into() }
+/// `host` is `crypto::server_host` of the address the client connects to.
+pub fn login_request(d: &Derived, ts_ms: u64, device: &str, host: &str) -> LoginRequest {
+    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms, host).to_vec()), device: device.into() }
 }
 
 /// Decrypt the Account Key and keyring. Fails on a wrong password or Secret Key.

@@ -12,8 +12,13 @@ async fn main() {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     });
-    let setup = std::env::var("PLAINTEXT_SETUP_CODE").ok().filter(|s| !s.is_empty());
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let cfg = plaintext_server::Config {
+        setup_code: env("PLAINTEXT_SETUP_CODE"),
+        open_signup: env("PLAINTEXT_SIGNUP").is_some_and(|v| v == "open"),
+        hosts: env("PLAINTEXT_URL").map(|v| v.split(',').map(plaintext_core::crypto::server_host).collect()).unwrap_or_default(),
+    };
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     println!("plaintext listening on {addr}, database {db_path}");
-    axum::serve(listener, plaintext_server::app(db, setup)).await.expect("serve");
+    axum::serve(listener, plaintext_server::app(db, cfg)).await.expect("serve");
 }

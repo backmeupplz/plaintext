@@ -458,3 +458,17 @@ fn agent_and_fingerprint_vectors() {
     assert_eq!(hex::encode(d.auth.verifying_key().to_bytes()), "c4fad018f30f508ab8f9d287954471fb8c8fdf4b6a1b028bb6eb9072f8d10bfa");
     assert_eq!(fingerprint("alice", &[1u8; 32], &[2u8; 32]), "K45K00 6D7D9J H3NF4F PN9AAK");
 }
+
+#[test]
+fn server_host_normalizes() {
+    use crate::crypto::server_host;
+    for (url, host) in [
+        ("https://Vault.Example.com/", "vault.example.com"),
+        ("https://vault.example.com:443/x?y#z", "vault.example.com"),
+        ("http://192.168.1.5:8080", "192.168.1.5:8080"),
+        ("vault.example.com", "vault.example.com"),
+        ("http://[::1]:80", "[::1]"),
+    ] {
+        assert_eq!(server_host(url), host, "{url}");
+    }
+}

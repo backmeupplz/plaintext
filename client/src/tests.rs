@@ -6,6 +6,10 @@ use plaintext_core::crypto::{AgentKey, derive_agent};
 use plaintext_core::item::Item;
 
 fn server() -> (String, std::path::PathBuf) {
+    server_with(plaintext_server::Config { setup_code: Some("first-run-code".into()), ..Default::default() })
+}
+
+fn server_with(cfg: plaintext_server::Config) -> (String, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("plaintext-e2e-{}.db", hex::encode(plaintext_core::crypto::random::<8>())));
     let db = plaintext_server::open_db(path.to_str().unwrap()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -14,7 +18,7 @@ fn server() -> (String, std::path::PathBuf) {
         rt.block_on(async move {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(l.local_addr().unwrap()).unwrap();
-            axum::serve(l, plaintext_server::app(db, Some("first-run-code".into()))).await.unwrap();
+            axum::serve(l, plaintext_server::app(db, cfg)).await.unwrap();
         });
     });
     (format!("http://{}", rx.recv().unwrap()), path)
@@ -119,7 +123,7 @@ fn family_agent_and_sharing() {
     alice.send("bob", &Content::Item(Box::new(item("Wifi", "hunter2hunter2"))), Some(now() + 60)).unwrap();
     let got = bob.inbox().unwrap();
     assert!(matches!(&got[0].1, Ok((_, Content::Item(i))) if i.password == "hunter2hunter2"));
-    let link = alice.create_link(&url, &item("Door code", "4711-door"), now() + 600, Some(1)).unwrap();
+    let link = alice.create_link(LINK_PAGE, &url, &item("Door code", "4711-door"), now() + 600, Some(1)).unwrap();
     let rest = link.split('#').nth(1).unwrap();
     let parts: Vec<&str> = rest.rsplitn(3, '/').collect();
     let (frag, lid) = (parts[0], parts[1].parse::<Hex>().unwrap());
@@ -187,6 +191,10 @@ impl Transport for Evil {
         }
         Ok((status, bytes))
     }
+
+    fn host(&self) -> String {
+        self.inner.host()
+    }
 }
 
 fn evil(url: &str) -> Evil {
@@ -234,4 +242,59 @@ fn lying_server_and_hostile_users() {
     *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
     assert!(matches!(a3.sync(), Err(Error::Core(plaintext_core::Error::Rollback))));
     let _ = std::fs::remove_file(&path);
+}
+
+/// A hosted server: anyone signs up, nobody can list the customers, people are
+/// found by exact username, and a login signed for another host is refused.
+#[test]
+fn hosted_server_and_several_servers() {
+    let (url, _) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let info = server_info(&Http::new(&url)).unwrap();
+    assert!(info.open && !info.setup && !info.version.is_empty());
+    let (_, admin) = Session::signup(Http::new(&url), "admin", "admin pw", None, "t").unwrap();
+    assert!(admin.admin);
+    let (_, mut carol) = Session::signup(Http::new(&url), "carol", "carol pw", None, "t").unwrap();
+    let (_, dave) = Session::signup(Http::new(&url), "dave", "dave pw", None, "t").unwrap();
+    assert!(!carol.admin);
+    assert_eq!(admin.users().unwrap().len(), 3);
+    assert!(carol.users().unwrap().is_empty(), "no customer list on an open server");
+    carol.pin_user("dave").unwrap();
+    assert!(matches!(carol.pin_user("nobody"), Err(Error::NotFound(_))));
+    // Anyone may invite there; the invitee is visible to (and verified by) the inviter.
+    let code = carol.invite().unwrap();
+    let (_, erin) = Session::signup(Http::new(&url), "erin", "erin pw", Some(&code), "t").unwrap();
+    assert!(erin.keyring.contacts["carol"].verified);
+    carol.sync().unwrap();
+    assert_eq!(carol.users().unwrap().len(), 1);
+    assert!(carol.keyring.contacts["erin"].verified);
+    assert_eq!(status(Session::signup(Http::new(&url), "frank", "pw", Some(&code), "t")), 403, "a used invite is still refused");
+    drop(dave);
+
+    // A login relayed from a look-alike server doesn't open a session here.
+    let (sk, _) = Session::signup(Http::new(&url), "gina", "gina pw", None, "t").unwrap();
+    let d = derive("gina pw", &sk);
+    let relayed = plaintext_core::login_request(&d, now_ms(), "t", "vault.examp1e.com");
+    assert_eq!(status(call::<_, LoginResponse>(&Http::new(&url), "POST", "/v1/login", None, Some(&relayed))), 401);
+    login(&url, "gina pw", &sk);
+
+    // A server that names its public address (behind a proxy) refuses logins
+    // signed for any other, such as the address of the machine itself.
+    let (url2, _) = server_with(plaintext_server::Config { hosts: vec!["vault.example.com".into()], ..Default::default() });
+    let proxied = || Named(Http::new(&url2), "vault.example.com");
+    let (sk2, _) = Session::signup(proxied(), "gina", "other pw", None, "t").unwrap();
+    assert!(Session::login(proxied(), &derive("other pw", &sk2), "t").is_ok());
+    assert_eq!(status(Session::login(Http::new(&url2), &derive("other pw", &sk2), "t")), 401);
+}
+
+/// What a client behind a reverse proxy sees: its own name for the server.
+struct Named(Http, &'static str);
+
+impl Transport for Named {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        self.0.send(method, path, token, body)
+    }
+
+    fn host(&self) -> String {
+        self.1.into()
+    }
 }

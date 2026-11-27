@@ -272,12 +272,23 @@ pub fn password_change_message(account_id: &Id, ts: u64, new_auth: &[u8], new_ac
     [b"plaintext/v1/password-change".as_slice(), account_id, &ts.to_be_bytes(), new_auth, &sha256(new_account_key)].concat()
 }
 
-pub fn login_message(account_id: &Id, ts: u64) -> Vec<u8> {
-    [b"plaintext/v1/login".as_slice(), account_id, &ts.to_be_bytes()].concat()
+/// A server address reduced to what both sides can agree on: lowercase host and
+/// port, no scheme, path or default port. `https://Vault.Example.com:443/` and the
+/// `Host` header `vault.example.com` both give `vault.example.com`.
+pub fn server_host(url: &str) -> String {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase();
+    host.strip_suffix(":443").or_else(|| host.strip_suffix(":80")).map(String::from).unwrap_or(host)
 }
 
-pub fn sign_login(d: &Derived, ts: u64) -> [u8; 64] {
-    d.auth.sign(&login_message(&d.account_id, ts)).to_bytes()
+/// Signed at login. The host binds the signature to the server the client meant
+/// to reach, so a look-alike server can't relay it to the real one for a session.
+pub fn login_message(account_id: &Id, ts: u64, host: &str) -> Vec<u8> {
+    [b"plaintext/v1/login".as_slice(), account_id, &ts.to_be_bytes(), host.as_bytes()].concat()
+}
+
+pub fn sign_login(d: &Derived, ts: u64, host: &str) -> [u8; 64] {
+    d.auth.sign(&login_message(&d.account_id, ts, host)).to_bytes()
 }
 
 // ---------- Sealed blobs ----------
