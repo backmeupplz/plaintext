@@ -2,16 +2,19 @@
 
 Plaintext is a self-hosted password manager whose server is assumed hostile. A stolen database, a malicious admin or a compromised host must not be able to read a vault, crack a password offline, or change a vault without the clients noticing. The name is the joke: the server only ever sees ciphertext.
 
+This document is the protocol (v1). `core/` implements all of it and is the only implementation: every app reaches it through `client/` (Rust), UniFFI (Swift, Kotlin) or WASM (browser), never a reimplementation. Feature coverage against 1Password is in [PARITY.md](PARITY.md).
+
 ## Threat model
 
-The server is untrusted, not merely the database dump. It can lie in any response, replay old data, drop or reorder items, and log everything it receives. The clients are trusted: they are native apps and signed store builds, and the server never serves code that touches keys, so there is no web vault served from the server.
+The server is untrusted, not merely the database dump. It can lie in any response, replay old data, drop or reorder items, hand out wrong public keys, and log everything it receives. The clients are trusted: native apps and signed store builds. The server never serves code that touches keys (no server-hosted web vault).
 
 | The server can | The server cannot |
 |---|---|
-| See how many items and vaults an account has, rough blob sizes (padded to 256 bytes), write times, device names, IPs | Read any item, title, URL, username or note |
-| Refuse service, delete everything | Brute-force the password offline (it would also need the 128-bit Secret Key) |
-| Serve a brand-new device an old but genuine vault state; fork two devices onto different branches (see Known limits) | Swap, add or alter items, or roll a device back to an older state it already verified, without the client detecting it |
-| | Downgrade the KDF or cipher (it supplies neither) |
+| See usernames, who is in which vault with which role, item counts, padded blob sizes, write times, device names, IPs | Read any item, title, URL, note, vault name, inbox message or attachment |
+| Refuse service, delete everything | Brute-force a password offline (it would also need the 128-bit Secret Key) |
+| Serve a brand-new device an old but genuine vault; keep two devices on different branches forever (see Known limits) | Swap, drop, add or alter items, roll a device back, or splice two branches, without the client detecting it |
+| Introduce a fake user to someone who hasn't verified anyone yet (trust on first use) | Replace the keys of a user you have pinned or verified; give you a vault key the owner didn't commit to |
+| Let a reader or removed member write on the server side | Make other members accept that write: manifests are signed and checked against the roster |
 
 ## Secrets and keys
 
@@ -21,78 +24,134 @@ password ──NFKD──► Argon2id(m=64 MiB, t=3, p=1, salt=SHA256("plaintext
 Secret Key SK (128 random bits, A1-XXXXXXX-XXXXXXX-XXXXXXX-XXXXXXX) ──────────► HKDF-SHA256(salt = SK)
                                                                          ├─ "plaintext/v1/unlock" → Account Unlock Key (AUK)
                                                                          └─ "plaintext/v1/auth"   → Ed25519 login key
-SK ── HKDF "plaintext/v1/account-id" → account id (16 bytes, how the server finds the account)
+SK ── HKDF "plaintext/v1/account-id" → account id
 
-AUK ──wraps──► Account Key (random 256-bit) ──wraps──► Vault Key (random, one per vault) ──seals──► items, manifest
+AUK ──seals──► Account Key (random) ──seals──► keyring: identity keys (Ed25519 sign, X25519 enc) + pinned contacts + invite secrets
+                                            └─► device snapshots of vaults
+identity enc key ◄──sealed to── Vault Key (random per vault and epoch) ──seals──► items, manifest (vault name inside)
 ```
 
-- **Secret Key.** It is generated on the first device and never sent anywhere. Each device keeps it in the OS keychain (Apple Keychain, Android Keystore, Windows Credential Manager/DPAPI, Linux Secret Service), and the user keeps it in an Emergency Kit. A new device gets it by QR from an existing device or by typing it. Because it is mixed into every derived key, the server holds nothing that a weak password protects alone. The last two characters are a checksum, so a typo is caught before any key is derived.
-- **Nothing server-chosen feeds a key.** The salt comes from the Secret Key and the Argon2 parameters are fixed per protocol version, so there is no prelogin call to lie in. The account id is a function of the Secret Key, which is why the server stores no email.
-- **Password change** re-wraps the Account Key and replaces the login public key; items are untouched. *(Not built yet.)*
-- **No recovery.** If the password, or the Secret Key together with every device, is lost, the data is gone. That is the cost of the threat model, and the UI must say so at signup.
+- **Secret Key.** Generated on the first device, never sent anywhere. Devices keep it in the OS keychain; the user keeps it in an Emergency Kit. The last two characters are a checksum.
+- **Agents** have a 256-bit `ptk_…` key instead of password + Secret Key: `HKDF(salt="plaintext/v1/agent", ikm=key)` gives the same three outputs, with no Argon2 because the key has full entropy.
+- **Nothing server-chosen feeds a key.** Salt and Argon2 parameters are fixed per protocol version; there is no prelogin call to lie in.
+- **Identity keys are random**, not derived from the password, so a password change keeps the identity, the pins others made of it, and every vault.
+- **Password change** re-seals the Account Key under the new AUK and replaces the login public key, signed by the old login key. Other sessions end.
+- **No recovery.** Lose the password, or the Secret Key along with every device, and the data is gone. Admin or family recovery would be key escrow, the attack class in the table below, so there is none.
 
-## Login
+## Login and sessions
 
-The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms` with the Ed25519 key. The server stores only the public key, accepts a timestamp (milliseconds) within ±120 s that is strictly newer than the account's last login (so a captured login can't be replayed), and returns a random bearer token. It stores only the token's SHA-256. The server never receives anything password-equivalent, and its stored public key can't be attacked without the Secret Key. A PAKE would add nothing here, because the server's verifier is already out of reach.
+The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms`. The server stores only the public key, accepts a timestamp within ±120 s that is strictly newer than the account's last login, and returns a random bearer token, storing only its SHA-256. Sessions can be listed and ended; disabling an account ends them all.
+
+## Users, invites and verification
+
+- Usernames are per server (2–32 of `a-z 0-9 . _ -`). The first account is the admin (if the server was started with `PLAINTEXT_SETUP_CODE`, it must present that code); everyone else needs a one-use invite (7 days) from an admin. No emails are stored.
+- Each account publishes a self-signed identity `{username, kind: human|agent, owner?, sign_pk, enc_pk}`.
+- **Pinning.** A client pins a user's keys the first time it sees them (directory lookup, a vault roster, an inbox message) and refuses any later difference (`KeyChanged`). Pins live in the synced keyring.
+- **Verification** marks a pin as confirmed out of band. Two ways: compare the fingerprint (`fingerprint(username, sign_pk, enc_pk)`, 4 groups of 6) in person or by QR; or the invite proof. An invite code is `id.secret`; the inviter's keyring keeps the secret; the new user sends `HMAC(secret, identity)` at signup; the inviter's devices check it and mark the new user verified. A server that substitutes the new user's identity can't produce the proof.
+- Apps show "not verified" next to anyone unverified, everywhere it matters (sharing, vault members, inbox).
+
+## Vaults, roles and sharing
+
+A vault's membership is a **roster**, a signed and hash-chained document:
+
+`Roster {vault_id, version, prev = SHA256(previous signed body), epoch, key_check, members: [{username, sign_pk, enc_pk, role: reader|writer|owner, expires?}]}`
+
+- Version 0 is signed by an owner listed in it; every later version is signed by an owner of the previous version. Clients verify the whole chain from version 0 the first time they see a vault, then each new version. Every member's keys are pinned on sight.
+- The **vault key** for each epoch is sealed to each member's X25519 key (`ephemeral ECDH → HKDF → XChaCha20-Poly1305`, AD names vault, epoch and username). Because anyone can seal to a public key, the roster carries `key_check = HMAC(vault key, "plaintext/v1/key-check" ‖ vault_id ‖ epoch)`, signed by the owner. A member accepts an unwrapped key only if it matches.
+- **Granting** (add someone, change a role or expiry) is a new roster version; a new member also gets the current vault key and can read the vault's history.
+- **Revoking** starts a new epoch: a fresh vault key, sealed to the remaining members, and every item re-sealed in the same request. Nothing written afterwards is readable with the old key. Attachments keep their own keys (below), so they are not re-uploaded; a removed member who saved an item's file key while they had access can still decrypt that one file if they also kept its download.
+- **Roles.** Readers hold the vault key, so they could produce a valid blob; what stops them is that every manifest must be signed by a writer or owner in the current roster, and clients reject any other. The server enforces roles too, for honest deployments.
+- **Expiry** (for people and agents) makes a member count as removed after the time; it doesn't rotate the key. Use revoke when the key must change.
 
 ## Blobs
 
-All encryption uses one construction: `0x01 ‖ nonce(24) ‖ XChaCha20-Poly1305(plaintext)`, with the version byte included in the associated data. There is no second cipher and no legacy path to downgrade to. The associated data names what a blob is and where it belongs:
+One construction everywhere: `0x01 ‖ nonce(24) ‖ XChaCha20-Poly1305(plaintext)`, version byte in the AD. No second cipher, no legacy path. Item JSON is padded with spaces to a multiple of 256 bytes. Unknown JSON fields are preserved, so an older client never drops data written by a newer one.
 
 | Blob | Key | AD |
 |---|---|---|
 | Account Key | AUK | `plaintext/v1/account-key ‖ account_id` |
-| Vault Key | Account Key | `plaintext/v1/vault-key ‖ vault_id` |
-| Manifest | Vault Key | `plaintext/v1/manifest ‖ vault_id` |
+| Keyring | Account Key | `plaintext/v1/keyring ‖ account_id` |
+| Vault key (per member) | sealed to member's X25519 | `plaintext/v1/vault-key ‖ vault_id ‖ epoch ‖ username` |
+| Manifest contents | Vault Key | `plaintext/v1/manifest ‖ vault_id` |
 | Item | Vault Key | `plaintext/v1/item ‖ vault_id ‖ item_id` |
+| Attachment | its own random key (stored in the item) | `plaintext/v1/file ‖ vault_id ‖ file_id` |
+| Inbox message | sealed to recipient's X25519 | `plaintext/v1/message ‖ message_id ‖ recipient` |
+| Share link | random key, only in the URL fragment | `plaintext/v1/link ‖ link_id` |
+| Device snapshot | Account Key | `plaintext/v1/vault-snapshot ‖ account_id ‖ vault_id` |
 
-An item is a single JSON object sealed as one blob, so fields can't be swapped between items or between fields of one item. The JSON is padded with spaces to a multiple of 256 bytes. Unknown JSON fields are preserved, so an older client never drops data written by a newer one.
+Signatures are Ed25519 over `plaintext/v1/<domain> ‖ body` with domains `identity`, `roster`, `manifest`, `message`, so a signature for one purpose is never valid for another. Signed documents travel as `{body, signer, sig}` with the exact signed bytes.
+
+## Items
+
+An item is one JSON object: `kind` (login, password, note, card, identity, document, bank, database, server, ssh_key, api_credential, wifi, passport, driver_license, membership, crypto_wallet, …), `title`, the login designations (`username`, `password`, `urls`, `totp`), `notes`, free sections of typed fields (text, concealed, url, email, phone, date, month_year, otp, address, menu, card_number, card_type, ssh_key, boolean), `tags`, `favorite`, `archived`, `files`, `passkeys`, `password_history`, and up to 10 earlier versions in `history`. This mirrors 1Password's model so imports are lossless.
 
 ## Sync
 
-Each vault has a counter and an encrypted **manifest** holding `{counter, item_id → SHA-256(item blob)}`. Only holders of the Vault Key can produce one.
+Each vault has a counter and a **manifest chain**. A manifest is a signed envelope `{vault_id, counter, epoch, prev = SHA256(previous manifest's signed body), sealed}`, where `sealed` holds the vault name and `{item_id → SHA256(item blob)}`.
 
-- **Pull.** `GET /v1/vaults/{id}?since=N` returns the manifest and every item written after counter N. The client checks that every received blob matches its manifest hash and that every other manifest entry matches a blob it already holds. It also checks that the manifest's counter equals the server's counter and is not lower than the last counter this device verified. Any mismatch rejects the whole response and leaves local state untouched.
-- **Push.** `PUT /v1/vaults/{id}` carries `expected_counter`, the new manifest, upserts and deletes. The server applies it only if the counter still matches, and otherwise answers 409. On a 409 the client pulls, keeps its own unpushed edits, and pushes again.
-- **The rollback guard** is the per-device last-verified counter, persisted with the device's encrypted `VaultSnapshot`. A manifest with a lower counter is refused. A manifest at the same counter must describe exactly what the device already verified, which catches a server that stored a push it answered with an error and serves it later.
-- **Concurrent edits of the same item:** the device that pushes second wins on its retry. There is no conflict copy yet.
+- **Pull** `GET /v1/vaults/{id}?since=N&roster=V` returns every roster after V, every manifest after N, the caller's wrapped key for the current epoch, and every item written after N. The client checks: the roster chain; the key against `key_check`; that the manifests are consecutive, each links to the one before (starting from the last one this device verified), and each is signed by someone who could write; that the latest is under the current epoch and signed by a current, unexpired writer; and that every item blob matches the latest manifest's hash. Any failure rejects the whole response and changes nothing.
+- **Push** `PUT /v1/vaults/{id}` carries `expected_counter`, a new signed manifest, upserts and deletes. The server applies it only if the counter matches and the manifest extends its chain; otherwise 409, and the client pulls, merges and retries.
+- **Merge.** Local unpushed edits win. If the server's copy of an item also changed since the local edit began, it is kept as a conflict copy ("… (conflict)") so nothing is lost.
+- **Rollback guard.** Each device persists its last verified counter and manifest hash (in its sealed snapshot). The server can't serve an older state, or a different branch, to a device that has seen a newer one: the hash chain won't link.
 
-## Known limits
+## Inbox, requests and links
 
-- **Forks.** The server can hide device A's write from device B, let B push on top, and then serve B's branch to A, where A's item looks deleted. Each device's own history stays consistent, but two devices can be split. Detecting this needs devices to compare state with each other (for example a manifest hash shown on both, or devices gossiping their last manifest through the vault itself). The ETH Zurich paper below calls full rollback protection without trusted state an open problem.
-- **A new device trusts its first sync.** It has no counter yet, so it can be shown an old but genuine state.
-- **Metadata.** The server sees item counts, padded sizes, write times, device names and IPs.
+- **Sharing one item with a user:** the item is sealed to their pinned key, signed, and placed in their inbox with an optional expiry. They save it into a vault or delete it.
+- **Access requests:** an agent sends its owner a sealed, signed request ("need the prod DB password for the migration"). The owner grants vault access or sends the item.
+- **Share links** for people without an account: the item is sealed with a random key that exists only in the link's `#fragment`; the server stores the blob with an expiry (≤ 30 days) and optional view limit, and serves it without authentication. The link opens a static viewer at `getplaintext.org/s/`, so the self-hosted server never serves the code that decrypts. Whoever controls getplaintext.org's hosting could, in principle, serve a malicious viewer; that page is static, open source and small.
+
+## Agents
+
+Agents are first-class accounts owned by a human, built for automation and AI tools:
+
+- `plaintext agent create ci-bot --vault CI --role reader --expires 30d` makes the account, pins and verifies it for the owner, grants access, and prints the `ptk_…` key once.
+- Access is per vault, with a role and an expiry, enforced by keys (an agent only ever receives the keys of vaults it's in). Agents can't create vaults, invite people or create agents. The owner (or an admin) can disable an agent instantly.
+- Every agent read and every write is in the vault's audit log, visible to its owners.
+- **Use without seeing:** `plaintext run -- cmd` and `plaintext inject` resolve `pt://Vault/Item/field` references into environment variables or files. The MCP server (`plaintext mcp`) gives AI agents search, non-secret fields, `run_with_secrets` (secrets go into the command's environment and are scrubbed from its output), `create_item` with a generated password the model never sees, and `request_access`. Returning secret values to the model at all needs `PLAINTEXT_MCP_REVEAL=1`.
 
 ## Wire API
 
 | | |
 |---|---|
-| `POST /v1/signup` | `{account_id, auth_key, account_key, vault:{id, vault_key, manifest}}`. The first account needs nothing; later ones need `x-invite: $PLAINTEXT_INVITE`. |
-| `POST /v1/login` | `{account_id, ts, sig, device}` → `{token}` |
-| `POST /v1/logout` | Ends the session. |
-| `GET /v1/account` | `{account_key, vaults:[{id, vault_key, counter}]}` |
-| `GET /v1/vaults/{id}?since=N` | `{counter, manifest, items:[{id, blob}]}` |
-| `PUT /v1/vaults/{id}` | `{expected_counter, manifest, upserts, deletes}` → 204, or 409 |
+| `POST /v1/signup` | `SignupRequest`; first account free, then an invite proof |
+| `POST /v1/agents` | `SignupRequest` for an agent, by its owner's session |
+| `POST /v1/login`, `/v1/logout` | |
+| `GET /v1/account` | username, admin, sealed Account Key and keyring, vault ids |
+| `PUT /v1/account/keyring` | compare-and-swap on the keyring counter |
+| `POST /v1/account/password` | signed by the current login key |
+| `GET /v1/sessions`, `DELETE /v1/sessions/{id}` | |
+| `GET /v1/users`, `POST /v1/users/{name}/disable`, `POST /v1/invites` | directory; admin actions (owners may disable their agents) |
+| `POST /v1/vaults` | new vault (roster v0, keys, first manifest) |
+| `GET`/`PUT /v1/vaults/{id}` | pull / push |
+| `POST /v1/vaults/{id}/roster` | grant, change or revoke (with rotation) |
+| `GET /v1/vaults/{id}/audit` | owners |
+| `PUT`/`GET`/`DELETE /v1/vaults/{id}/files/{fid}` | sealed attachments, up to 64 MB |
+| `GET`/`POST /v1/messages`, `DELETE /v1/messages/{id}` | inbox |
+| `POST /v1/links`, `GET`/`DELETE /v1/links/{id}` | share links (GET is public, CORS open) |
 
-Ids are hex and blobs are base64. Types are in `core/src/api.rs`.
+Types are in `core/src/api.rs`; ids are hex, blobs base64.
 
 ## Code layout
 
-- **`core/`** (`plaintext-core`) holds every crypto and sync rule, sans-IO: clients move the request and response types over their own HTTP stack. It is the only crypto implementation. Native apps get it through UniFFI (Swift, Kotlin) and extensions through WASM, so no platform reimplements it. `tools/kat.py` is an independent Python implementation of the key derivation, which pins the known-answer vectors in the core tests.
-- **`server/`** (`plaintext-server`) is one binary on axum + SQLite, the same stack as Tugport. It enforces only ownership, sizes and the counter compare-and-swap.
+| Crate | What |
+|---|---|
+| `core/` | crypto, keys, rosters, sync rules, items, generator, TOTP, Watchtower. Sans-IO. Known-answer vectors cross-checked by `tools/kat.py` (Python + libsodium). |
+| `client/` | sync orchestration over a `Transport` (ureq by default), importers. Used by the CLI and the app bindings. End-to-end test over real HTTP. |
+| `server/` | axum + SQLite, one binary, the same stack as Tugport. |
+| `cli/` | the `plaintext` command and MCP server. |
 
-## Clients (planned)
+## Apps
 
 | Platform | Shape | Unlock |
 |---|---|---|
-| iOS + iPadOS | SwiftUI app, AutoFill credential provider extension, passkey provider | Face ID / Touch ID releasing the Account Key from the Keychain (Secure Enclave-bound) |
+| iOS + iPadOS | SwiftUI; AutoFill credential provider and passkey provider extension | Face ID / Touch ID releases the Account Key from the Keychain (Secure Enclave-bound access control) |
 | macOS | SwiftUI app hosting the Safari Web Extension; native-messaging host for Chrome and Firefox | Touch ID, Keychain |
-| Android | Compose app, Autofill service, Credential Manager passkey provider | BiometricPrompt + Keystore (StrongBox if present) |
-| Windows, Linux | Small Rust tray app; native-messaging host for the extensions | Windows Hello + DPAPI; Secret Service (libsecret) |
-| Chrome, Firefox | MV3 extension, core via WASM | The desktop host unlocks via the OS keychain; without a host, password + Secret Key in extension storage |
-| Safari | Safari Web Extension inside the macOS/iOS app, sharing its keychain group | Same as the host app |
+| Android | Compose; Autofill service; Credential Manager passkey provider | BiometricPrompt + Android Keystore (StrongBox when present) |
+| Windows, Linux | the CLI plus a small desktop app; native-messaging host for the extensions | Windows Hello + Credential Manager; Secret Service |
+| Chrome, Firefox | MV3 extension on core compiled to WASM | the desktop app's host when present; otherwise password + Secret Key |
+| Safari | Safari Web Extension inside the Apple app, sharing its keychain group | same as the app |
 
-Quick unlock always means that the Account Key is kept in the OS keychain behind biometrics. The master password is never stored. Clients never fetch icons or anything else by an item's URL (Bitwarden's BW06 leak).
+Quick unlock always means the Account Key sits in the OS keychain behind biometrics; the master password is never stored. Clients never fetch icons or anything else by an item's URL (Bitwarden's BW06 leak). UI rules for every app are in [UI.md](UI.md).
 
 ## Lessons from Vaultwarden and Bitwarden
 
@@ -100,23 +159,18 @@ Vaultwarden (read at `dbd7829`) is a faithful Bitwarden server, so it inherits t
 
 | Bitwarden/Vaultwarden | Attack | Plaintext |
 |---|---|---|
-| The server returns KDF type and iterations at prelogin; email is the salt | BW07 KDF downgrade | No prelogin; parameters pinned by the client; salt from the Secret Key |
-| The login hash is PBKDF2(master key, password); the server re-hashes it | A DB leak allows offline guessing of weak passwords | The verifier is an Ed25519 public key that also needs the 128-bit Secret Key |
-| Each field is a separate EncString; metadata (type, folder, flags) in clear | BW04/BW05 field and item swapping | One AEAD blob per item, with ids in the AD |
-| Legacy AES-CBC (type 0, no MAC) is still decryptable | BW11/BW12 padding oracle, key recovery | A single AEAD with a version byte; no legacy path |
+| The server returns KDF type and iterations at prelogin; email is the salt | BW07 KDF downgrade | No prelogin; parameters pinned; salt from the Secret Key |
+| The login hash is derived from the password; the server re-hashes it | A DB leak allows offline guessing of weak passwords | The verifier is an Ed25519 public key that also needs the 128-bit Secret Key |
+| Each field is a separate EncString; metadata in clear | BW04/BW05 field and item swapping | One AEAD blob per item, ids in the AD, every blob committed to by a signed manifest |
+| Legacy AES-CBC (type 0, no MAC) still decryptable | BW11/BW12 | One AEAD, a version byte, no legacy path |
 | Per-item keys can be switched off by the server | BW10 | No server-controlled crypto flags |
-| Org keys are RSA-wrapped to server-supplied public keys; auto-enrolment escrow | BW01/02/08/09 key escrow and injection | No sharing yet. When it comes, see below. |
-| The server serves the web vault JS | Malicious code reads keys | No web vault from the server |
-| The TOTP 2FA secret is stored on the server | 2FA protects login, not data | The Secret Key does what 2FA can't: it protects the data itself |
+| Org keys RSA-wrapped to server-supplied public keys; auto-enrolment escrow | BW01/02/08/09 key escrow and injection | Pinned identities, invite proofs and fingerprints; owner-signed rosters; `key_check` on every wrapped key; no escrow or admin recovery |
+| Emergency access waits are enforced only by the server | trust in the server | Not offered |
+| The server serves the web vault JS | malicious code reads keys | No server-hosted vault; link viewer is static on getplaintext.org |
 
-**Sharing, when built.** Every account gets an Ed25519 signing key and an X25519 key. Public keys are pinned on first use and shown as a fingerprint to compare in person or by QR. Wrapped vault keys and membership changes are signed by the sender. There is no auto-enrolment, no admin recovery, and no server-timed emergency access (a timer only the server enforces is trust in the server).
+## Known limits
 
-## Milestones
-
-1. **Core and server.** Done: key derivation, blobs, sync, signup/login, e2e test showing the database holds no plaintext.
-2. Password change, device list and revocation, attachments, deployment image, a public instance for dogfooding.
-3. CLI (`plaintext`) on the core, plus an importer for Bitwarden JSON, 1Password 1PUX and CSV.
-4. UniFFI bindings, then iOS + macOS app with Safari extension and AutoFill.
-5. Android app with Autofill service.
-6. Chrome and Firefox extensions (WASM) plus a native-messaging host for OS-keychain unlock on Windows, Linux and macOS.
-7. Passkeys (store and serve as provider), TOTP codes, sharing (above), and a security audit before 1.0.
+- **Forks between devices.** The server can keep device A's writes from device B indefinitely. Each device's own history is consistent and can never be spliced with the other branch, but they stay split until the server reunites them. Detecting a permanent split needs devices to compare state out of band (comparing a vault's latest manifest hash, which the apps can show).
+- **A new device trusts its first sync,** and a user who hasn't verified anyone trusts the directory on first use. Invites and fingerprints close the second gap.
+- **Metadata** (usernames, memberships, sizes, timing) is visible to the server.
+- **Manifest history** is kept in full so any device can verify the chain from where it left off. Signed checkpoints can trim it if it ever gets large.

@@ -144,12 +144,132 @@ pub fn derive(password: &str, sk: &SecretKey) -> Derived {
         .hash_password_into(password.as_bytes(), &salt, &mut stretched[..])
         .expect("argon2");
     // The Secret Key is the HKDF salt: without it, the password alone yields nothing.
-    let hk = Hkdf::<Sha256>::new(Some(&sk.0[..]), &stretched[..]);
+    expand_keys(&Hkdf::<Sha256>::new(Some(&sk.0[..]), &stretched[..]), account_id(sk))
+}
+
+fn expand_keys(hk: &Hkdf<Sha256>, account_id: Id) -> Derived {
     let mut unlock_key = Zeroizing::new([0u8; 32]);
     let mut auth_seed = Zeroizing::new([0u8; 32]);
     hk.expand(b"plaintext/v1/unlock", &mut unlock_key[..]).expect("valid length");
     hk.expand(b"plaintext/v1/auth", &mut auth_seed[..]).expect("valid length");
-    Derived { account_id: account_id(sk), unlock_key, auth: SigningKey::from_bytes(&auth_seed) }
+    Derived { account_id, unlock_key, auth: SigningKey::from_bytes(&auth_seed) }
+}
+
+// ---------- Agent keys ----------
+
+/// An agent's whole credential: 256 random bits, shown once as `ptk_…`. It has
+/// full entropy, so it needs no password stretching.
+#[derive(Clone)]
+pub struct AgentKey(pub Zeroizing<[u8; 32]>);
+
+impl AgentKey {
+    pub fn generate() -> Self {
+        Self(Zeroizing::new(random()))
+    }
+
+    pub fn encode(&self) -> String {
+        format!("ptk_{}", base32(&self.0[..]).to_lowercase())
+    }
+
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        let body = s.trim().strip_prefix("ptk_").ok_or(Error::BadSecretKey)?.to_ascii_uppercase();
+        if body.len() != 52 {
+            return Err(Error::BadSecretKey);
+        }
+        let mut out = Zeroizing::new([0u8; 32]);
+        let (mut acc, mut n, mut i) = (0u32, 0, 0);
+        for c in body.bytes() {
+            let v = CROCKFORD.iter().position(|&x| x == c).ok_or(Error::BadSecretKey)? as u32;
+            acc = (acc << 5) | v;
+            n += 5;
+            if n >= 8 {
+                n -= 8;
+                out[i] = (acc >> n) as u8;
+                i += 1;
+            }
+        }
+        let k = AgentKey(out);
+        if k.encode()[4..] != body.to_lowercase() {
+            return Err(Error::BadSecretKey);
+        }
+        Ok(k)
+    }
+}
+
+pub fn derive_agent(k: &AgentKey) -> Derived {
+    let hk = Hkdf::<Sha256>::new(Some(b"plaintext/v1/agent"), &k.0[..]);
+    let mut id = [0u8; 16];
+    hk.expand(b"plaintext/v1/account-id", &mut id).expect("valid length");
+    expand_keys(&hk, id)
+}
+
+// ---------- Public-key crypto ----------
+
+pub fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut m = <hmac::Hmac<Sha256> as Mac>::new_from_slice(key).expect("any key length");
+    m.update(data);
+    m.finalize().into_bytes().into()
+}
+
+/// Sign `plaintext/v1/<domain> ‖ msg`, so a signature for one purpose is never valid for another.
+pub fn sign(key: &SigningKey, domain: &str, msg: &[u8]) -> [u8; 64] {
+    key.sign(&[format!("plaintext/v1/{domain}").as_bytes(), msg].concat()).to_bytes()
+}
+
+pub fn verify(pk: &[u8], domain: &str, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+    let pk: [u8; 32] = pk.try_into().map_err(|_| Error::BadSignature)?;
+    let pk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| Error::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_slice(sig).map_err(|_| Error::BadSignature)?;
+    pk.verify_strict(&[format!("plaintext/v1/{domain}").as_bytes(), msg].concat(), &sig)
+        .map_err(|_| Error::BadSignature)
+}
+
+/// Seal to an X25519 public key: `ephemeral_pk(32) ‖ seal(k, ad, pt)` where k comes
+/// from ECDH with a fresh ephemeral key. Anyone can seal, so authenticity comes
+/// from whatever signs or commits to the result.
+pub fn seal_to(recipient: &[u8], ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
+    let rpk: [u8; 32] = recipient.try_into().map_err(|_| Error::Tampered)?;
+    let eph = x25519_dalek::StaticSecret::from(random::<32>());
+    let epk = x25519_dalek::PublicKey::from(&eph);
+    let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(rpk));
+    if !shared.was_contributory() {
+        return Err(Error::Tampered);
+    }
+    let k = seal_to_key(shared.as_bytes(), epk.as_bytes(), &rpk);
+    Ok([&epk.as_bytes()[..], &seal(&k, ad, pt)].concat())
+}
+
+pub fn open_from(sk: &x25519_dalek::StaticSecret, ad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if blob.len() < 32 {
+        return Err(Error::Tampered);
+    }
+    let epk: [u8; 32] = blob[..32].try_into().expect("32 bytes");
+    let shared = sk.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
+    if !shared.was_contributory() {
+        return Err(Error::Tampered);
+    }
+    let rpk = x25519_dalek::PublicKey::from(sk);
+    open(&seal_to_key(shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[32..])
+}
+
+fn seal_to_key(shared: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
+    let mut k = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(&[&epk[..], &rpk[..]].concat()), shared)
+        .expand(b"plaintext/v1/seal-to", &mut k[..])
+        .expect("valid length");
+    k
+}
+
+/// What two people compare to be sure they see each other's real keys.
+pub fn fingerprint(username: &str, sign_pk: &[u8], enc_pk: &[u8]) -> String {
+    let h = sha256(&[b"plaintext/v1/fingerprint".as_slice(), username.as_bytes(), &[0], sign_pk, enc_pk].concat());
+    let s = base32(&h[..15]);
+    (0..4).map(|i| &s[i * 6..i * 6 + 6]).collect::<Vec<_>>().join(" ")
+}
+
+pub fn password_change_message(account_id: &Id, ts: u64, new_auth: &[u8], new_account_key: &[u8]) -> Vec<u8> {
+    [b"plaintext/v1/password-change".as_slice(), account_id, &ts.to_be_bytes(), new_auth, &sha256(new_account_key)].concat()
 }
 
 pub fn login_message(account_id: &Id, ts: u64) -> Vec<u8> {

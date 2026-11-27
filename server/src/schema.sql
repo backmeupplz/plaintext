@@ -1,0 +1,106 @@
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS accounts(
+  id BLOB PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,                -- human | agent
+  owner TEXT,                        -- for agents: the human who controls it
+  identity TEXT NOT NULL,            -- self-signed Identity (Signed JSON)
+  auth_key BLOB NOT NULL,            -- Ed25519 login public key
+  account_key BLOB NOT NULL,         -- sealed with the Account Unlock Key
+  keyring BLOB NOT NULL,             -- sealed with the Account Key
+  keyring_counter INTEGER NOT NULL DEFAULT 0,
+  admin INTEGER NOT NULL DEFAULT 0,
+  disabled INTEGER NOT NULL DEFAULT 0,
+  invite_id BLOB,
+  invite_proof BLOB,
+  last_login INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash BLOB PRIMARY KEY,
+  account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device TEXT NOT NULL,
+  created INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS invites(
+  id BLOB PRIMARY KEY,
+  created_by TEXT NOT NULL,
+  expires INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0);
+
+CREATE TABLE IF NOT EXISTS vaults(
+  id BLOB PRIMARY KEY,
+  counter INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  roster_version INTEGER NOT NULL,
+  roster_hash BLOB,
+  manifest_hash BLOB);
+
+CREATE TABLE IF NOT EXISTS rosters(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  signed TEXT NOT NULL,
+  PRIMARY KEY(vault_id, version));
+
+-- Derived from the current roster, for access checks.
+CREATE TABLE IF NOT EXISTS members(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  username TEXT NOT NULL,
+  role TEXT NOT NULL,
+  expires INTEGER,
+  PRIMARY KEY(vault_id, username));
+CREATE INDEX IF NOT EXISTS members_user ON members(username);
+
+CREATE TABLE IF NOT EXISTS vault_keys(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  username TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  key BLOB NOT NULL,
+  PRIMARY KEY(vault_id, username, epoch));
+
+-- ponytail: every manifest is kept so any device can verify the chain from where
+-- it left off; add signed checkpoints if this ever gets large.
+CREATE TABLE IF NOT EXISTS manifests(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  counter INTEGER NOT NULL,
+  signed TEXT NOT NULL,
+  PRIMARY KEY(vault_id, counter));
+
+CREATE TABLE IF NOT EXISTS items(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  id BLOB NOT NULL,
+  blob BLOB NOT NULL,
+  counter INTEGER NOT NULL,
+  PRIMARY KEY(vault_id, id));
+CREATE INDEX IF NOT EXISTS items_since ON items(vault_id, counter);
+
+CREATE TABLE IF NOT EXISTS files(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  id BLOB NOT NULL,
+  blob BLOB NOT NULL,
+  PRIMARY KEY(vault_id, id));
+
+CREATE TABLE IF NOT EXISTS messages(
+  id BLOB PRIMARY KEY,
+  to_user TEXT NOT NULL,
+  signed TEXT NOT NULL,
+  expires INTEGER,
+  created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_to ON messages(to_user);
+
+CREATE TABLE IF NOT EXISTS links(
+  id BLOB PRIMARY KEY,
+  creator TEXT NOT NULL,
+  blob BLOB NOT NULL,
+  expires INTEGER NOT NULL,
+  views_left INTEGER);
+
+CREATE TABLE IF NOT EXISTS audit(
+  vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  action TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS audit_vault ON audit(vault_id, ts);

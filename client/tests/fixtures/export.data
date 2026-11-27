@@ -1,0 +1,1148 @@
+{
+ "accounts": [
+  {
+   "attrs": {
+    "accountName": "Team KeePassXC",
+    "name": "Team KeePassXC",
+    "avatar": "",
+    "email": "team@keepassxc.org",
+    "uuid": "HYA3UQDZFDFDDI34BLBPSDDM7PU",
+    "domain": "https://my.1password.com/"
+   },
+   "vaults": [
+    {
+     "attrs": {
+      "uuid": "afavodj54il573njyybmf55ew4",
+      "desc": "GYkuBJsjEZmMUuiP",
+      "name": "Personal",
+      "type": "P"
+     },
+     "items": [
+      {
+       "uuid": "55qbj3r6ftglrawryv46obdotq",
+       "favIndex": 1,
+       "createdAt": 1663642010,
+       "updatedAt": 1668287305,
+       "state": "active",
+       "categoryUuid": "001",
+       "details": {
+        "loginFields": [
+         {
+          "value": "password",
+          "id": "",
+          "name": "password",
+          "fieldType": "P",
+          "designation": "password"
+         },
+         {
+          "value": "team@keepassxc.org",
+          "id": "",
+          "name": "username",
+          "fieldType": "T",
+          "designation": "username"
+         }
+        ],
+        "notesPlain": "Note to self",
+        "sections": [
+         {
+          "title": "Extra Data",
+          "name": "add more",
+          "fields": [
+           {
+            "title": "one-time password",
+            "id": "TOTP_yod37o45gdg4juy3ojwqm7cpfy",
+            "value": {
+             "totp": "DFDFDEF"
+            },
+            "indexAtSource": 0,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "no",
+             "capitalization": "none"
+            }
+           },
+           {
+            "title": "one-time password",
+            "id": "TOTP_neajzkinxpmbr3bq2ftyosgovy",
+            "value": {
+             "totp": "DFDFDEFDEF"
+            },
+            "indexAtSource": 1,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "no",
+             "capitalization": "none"
+            }
+           },
+           {
+            "title": "phone",
+            "id": "si2lkhqh75f2ydu27djoauryki",
+            "value": {
+             "phone": "555-123-45678"
+            },
+            "indexAtSource": 2,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "namePhonePad",
+             "correction": "no",
+             "capitalization": "none"
+            }
+           },
+           {
+            "title": "email",
+            "id": "jefg6pvocdgvurevqqanhne2qm",
+            "value": {
+             "email": {
+              "email_address": "team@keepassxc.org",
+              "provider": null
+             }
+            },
+            "indexAtSource": 3,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "emailAddress",
+             "correction": "no",
+             "capitalization": "none"
+            }
+           }
+          ]
+         }
+        ],
+        "passwordHistory": []
+       },
+       "overview": {
+        "subtitle": "team@keepassxc.org",
+        "icons": null,
+        "urls": [
+         {
+          "label": "website",
+          "url": "https://keepassxc.org"
+         },
+         {
+          "label": "website",
+          "url": "https://twitter.com"
+         }
+        ],
+        "tags": [
+         "website"
+        ],
+        "title": "Login",
+        "url": "https://keepassxc.org",
+        "ps": 1,
+        "pbe": 0,
+        "pgrng": false,
+        "watchtowerExclusions": {
+         "compromised": false,
+         "vulnerable": true,
+         "reused": true,
+         "weak": true,
+         "unsecured": false,
+         "inactiveMfa": false,
+         "expiring": false
+        }
+       }
+      },
+      {
+       "uuid": "yfxysaw4lpqj5ytlvzpbshr7y4",
+       "favIndex": 0,
+       "createdAt": 1671029303,
+       "updatedAt": 1688987066,
+       "state": "active",
+       "categoryUuid": "001",
+       "details": {
+        "loginFields": [
+         {
+          "value": "john@wick.com",
+          "id": "",
+          "name": "username",
+          "fieldType": "T",
+          "designation": "username"
+         },
+         {
+          "value": "password",
+          "id": "",
+          "name": "password",
+          "fieldType": "P",
+          "designation": "password"
+         }
+        ],
+        "notesPlain": "",
+        "sections": [
+         {
+          "title": "",
+          "name": "Section_gvt3f65duiuzd2kiqumvzhhp6a",
+          "fields": [
+           {
+            "title": "one-time password",
+            "id": "TOTP_qentd6akion3aqgj6hjuto42s4",
+            "value": {
+             "totp": "base32secret3232"
+            },
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         },
+         {
+          "title": "",
+          "name": "Section_bom2l746m2noam5olvce7iuj34",
+          "fields": [
+           {
+            "title": "one-time password",
+            "id": "TOTP_vtjhhrv3fb6hqotlg6m5dvrjcq",
+            "value": {
+             "totp": "otpauth://totp/generator?secret=base32secret3232"
+            },
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         },
+         {
+          "title": "",
+          "name": "add more",
+          "fields": [
+           {
+            "title": "text extra field label",
+            "id": "boctfetvgqfk53mk5s2rebkyri",
+            "value": {
+             "string": "text extra field content"
+            },
+            "guarded": false,
+            "multiline": true,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "no",
+             "capitalization": "sentences"
+            }
+           }
+          ]
+         }
+        ],
+        "passwordHistory": []
+       },
+       "overview": {
+        "subtitle": "john@wick.com",
+        "icons": null,
+        "urls": [
+         {
+          "label": "website",
+          "url": "http://localhost:7777/dashboard/",
+          "mode": "default"
+         }
+        ],
+        "title": "Login item with two TOTP and one text extra fields",
+        "url": "http://localhost:7777/dashboard/",
+        "ps": 1,
+        "pbe": 0,
+        "pgrng": false,
+        "watchtowerExclusions": null
+       }
+      },
+      {
+       "uuid": "6nwvsgspsi7etacnyme75cypoq",
+       "favIndex": 0,
+       "createdAt": 1663642267,
+       "updatedAt": 1668287167,
+       "state": "active",
+       "categoryUuid": "002",
+       "details": {
+        "loginFields": [],
+        "notesPlain": "",
+        "sections": [
+         {
+          "title": "Credit Card Fields",
+          "fields": [
+           {
+            "title": "cardholder name",
+            "id": "cardholder",
+            "value": {
+             "string": "KeePassXC"
+            },
+            "indexAtSource": 0,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "type",
+            "id": "type",
+            "value": {
+             "creditCardType": "mc"
+            },
+            "indexAtSource": 1,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "number",
+            "id": "ccnum",
+            "value": {
+             "creditCardNumber": "1234567890"
+            },
+            "indexAtSource": 2,
+            "guarded": true,
+            "clipboardFilter": "0123456789",
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "numberPad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "verification number",
+            "id": "cvv",
+            "value": {
+             "concealed": "123"
+            },
+            "indexAtSource": 3,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": true,
+            "inputTraits": {
+             "keyboard": "numberPad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "expiry date",
+            "id": "expiry",
+            "value": {
+             "monthYear": 202206
+            },
+            "indexAtSource": 4,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "valid from",
+            "id": "validFrom",
+            "value": {
+             "monthYear": 202206
+            },
+            "indexAtSource": 5,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         },
+         {
+          "title": "Contact Information",
+          "name": "contactInfo",
+          "fields": [
+           {
+            "title": "issuing bank",
+            "id": "bank",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 0,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "phone (local)",
+            "id": "phoneLocal",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 1,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "namePhonePad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "phone (toll free)",
+            "id": "phoneTollFree",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 2,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "namePhonePad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "phone (intl)",
+            "id": "phoneIntl",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 3,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "namePhonePad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "website",
+            "id": "website",
+            "value": {
+             "url": ""
+            },
+            "indexAtSource": 4,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         },
+         {
+          "title": "Additional Details",
+          "name": "details",
+          "fields": [
+           {
+            "title": "PIN",
+            "id": "pin",
+            "value": {
+             "concealed": ""
+            },
+            "indexAtSource": 0,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": true,
+            "inputTraits": {
+             "keyboard": "numberPad",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "credit limit",
+            "id": "creditLimit",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 1,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "numbersAndPunctuation",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "cash withdrawal limit",
+            "id": "cashLimit",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 2,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "numbersAndPunctuation",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "interest rate",
+            "id": "interest",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 3,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "numbersAndPunctuation",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "issue number",
+            "id": "issuenumber",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 4,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "no",
+             "capitalization": "default"
+            }
+           }
+          ]
+         }
+        ],
+        "passwordHistory": []
+       },
+       "overview": {
+        "subtitle": "1234 **** 7890",
+        "icons": null,
+        "title": "Credit Card",
+        "url": "",
+        "watchtowerExclusions": null
+       }
+      },
+      {
+       "uuid": "fkfngfia2rvrrmtcbs5xvwud3i",
+       "favIndex": 0,
+       "createdAt": 1663642167,
+       "updatedAt": 1663642167,
+       "state": "active",
+       "categoryUuid": "003",
+       "details": {
+        "loginFields": [],
+        "notesPlain": "This is a note",
+        "sections": [],
+        "passwordHistory": []
+       },
+       "overview": {
+        "subtitle": "This is a note",
+        "icons": null,
+        "tags": [
+         "Note",
+         "Secret Stuff"
+        ],
+        "title": "Secure Note",
+        "url": "",
+        "watchtowerExclusions": null
+       }
+      },
+      {
+       "uuid": "r65otlsr34ad43aofc647oe2b4",
+       "favIndex": 0,
+       "createdAt": 1663642338,
+       "updatedAt": 1668364769,
+       "state": "active",
+       "categoryUuid": "004",
+       "details": {
+        "loginFields": [],
+        "notesPlain": "",
+        "sections": [
+         {
+          "title": "Identification",
+          "name": "name",
+          "fields": [
+           {
+            "title": "first name",
+            "id": "firstname",
+            "value": {
+             "string": "KeePass"
+            },
+            "indexAtSource": 0,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "initial",
+            "id": "initial",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 1,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "last name",
+            "id": "lastname",
+            "value": {
+             "string": "XC"
+            },
+            "indexAtSource": 2,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "gender",
+            "id": "gender",
+            "value": {
+             "string": "male"
+            },
+            "indexAtSource": 3,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "birth date",
+            "id": "birthdate",
+            "value": {
+             "date": 1451649660
+            },
+            "indexAtSource": 4,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "occupation",
+            "id": "occupation",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 5,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "company",
+            "id": "company",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 6,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "department",
+            "id": "department",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 7,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           },
+           {
+            "title": "job title",
+            "id": "jobtitle",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 8,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "words"
+            }
+           }
+          ]
+         },
+         {
+          "title": "Address",
+          "name": "address",
+          "fields": [
+           {
+            "title": "address",
+            "id": "address",
+            "value": {
+             "address": {
+              "street": "123 Avenue Rd",
+              "city": "Boston",
+              "country": "us",
+              "zip": "12345",
+              "state": "MA"
+             }
+            },
+            "indexAtSource": 0,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "sentences"
+            }
+           },
+           {
+            "title": "default phone",
+            "id": "defphone",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 1,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "home",
+            "id": "homephone",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 2,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "cell",
+            "id": "cellphone",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 3,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "business",
+            "id": "busphone",
+            "value": {
+             "phone": ""
+            },
+            "indexAtSource": 4,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         },
+         {
+          "title": "Internet Details",
+          "name": "internet",
+          "fields": [
+           {
+            "title": "username",
+            "id": "username",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 0,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "reminder question",
+            "id": "reminderq",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 1,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "reminder answer",
+            "id": "remindera",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 2,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "email",
+            "id": "email",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 3,
+            "guarded": true,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "emailAddress",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "website",
+            "id": "website",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 4,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "uRL",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "ICQ",
+            "id": "icq",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 5,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "skype",
+            "id": "skype",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 6,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "AOL/AIM",
+            "id": "aim",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 7,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "Yahoo",
+            "id": "yahoo",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 8,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "MSN",
+            "id": "msn",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 9,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           },
+           {
+            "title": "forum signature",
+            "id": "forumsig",
+            "value": {
+             "string": ""
+            },
+            "indexAtSource": 10,
+            "guarded": false,
+            "multiline": false,
+            "dontGenerate": false,
+            "inputTraits": {
+             "keyboard": "default",
+             "correction": "default",
+             "capitalization": "default"
+            }
+           }
+          ]
+         }
+        ],
+        "passwordHistory": []
+       },
+       "overview": {
+        "subtitle": "KeePass XC",
+        "icons": null,
+        "title": "Identity",
+        "url": "",
+        "watchtowerExclusions": null
+       }
+      },
+      {
+       "uuid": "hi2yujyuaccm77iyl2ohrb7ymq",
+       "favIndex": 0,
+       "createdAt": 1670260822,
+       "updatedAt": 1670260879,
+       "state": "active",
+       "categoryUuid": "006",
+       "details": {
+        "loginFields": [],
+        "notesPlain": "",
+        "sections": [],
+        "passwordHistory": [],
+        "documentAttributes": {
+         "fileName": "keepassxc.png",
+         "documentId": "oakiw7lqbp53fgqrxrk63su2gu",
+         "decryptedSize": 18422
+        }
+       },
+       "overview": {
+        "subtitle": "18 KB",
+        "icons": null,
+        "title": "KeePassXC Logo",
+        "url": "",
+        "ps": 0,
+        "pbe": 0,
+        "pgrng": false,
+        "watchtowerExclusions": null
+       }
+      },
+      {
+       "uuid": "spthmzubd34dwdqmguxhhkcp3a",
+       "favIndex": 0,
+       "createdAt": 1655535022,
+       "updatedAt": 1688983483,
+       "state": "active",
+       "categoryUuid": "005",
+       "details": {
+        "loginFields": [],
+        "notesPlain": "",
+        "sections": [],
+        "passwordHistory": [],
+        "password": "f@LGRHG7BEcByVy--xTV8X4U"
+       },
+       "overview": {
+        "subtitle": "2022-06-18 08:50 AM",
+        "icons": null,
+        "title": "Login item with Password only",
+        "url": "",
+        "ps": 100,
+        "pbe": 0,
+        "pgrng": false,
+        "watchtowerExclusions": null
+       }
+      }
+     ]
+    },
+    {
+     "attrs": {
+      "uuid": "gblfiqppqcl7fpcq6nbfzy6vee",
+      "desc": "",
+      "avatar": "hi4lmi4h6jgl5hhubjhcovrhiu.png",
+      "name": "Shared",
+      "type": "U"
+     },
+     "items": [
+      {
+       "uuid": "ntcwvemxscv73f5venaa2vqs44",
+       "favIndex": 0,
+       "createdAt": 1683720664,
+       "updatedAt": 1688990961,
+       "state": "archived",
+       "categoryUuid": "001",
+       "details": {
+        "loginFields": [
+         {
+          "value": "archived",
+          "id": "",
+          "name": "username",
+          "fieldType": "T",
+          "designation": "username"
+         },
+         {
+          "value": "password",
+          "id": "",
+          "name": "password",
+          "fieldType": "P",
+          "designation": "password"
+         }
+        ],
+        "notesPlain": "",
+        "sections": [],
+        "passwordHistory": [
+         {
+          "value": "trashedpassword",
+          "time": 1683720732
+         },
+         {
+          "value": "archived",
+          "time": 1688990961
+         }
+        ]
+       },
+       "overview": {
+        "subtitle": "archived",
+        "icons": null,
+        "title": "Login item archived",
+        "url": "",
+        "ps": 1,
+        "watchtowerExclusions": null
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,19 @@
+[package]
+name = "plaintext-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+plaintext-core = { path = "../core" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+plaintext-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+axum = "0.8"
