@@ -40,6 +40,7 @@ import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Password
+import androidx.compose.material.icons.rounded.Group
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Star
@@ -196,7 +197,7 @@ private fun VaultMenu() {
                 model.vaults.filter { it.accountId == a.id }.forEach { v ->
                     DropdownMenuItem(
                         { Text(v.name.ifEmpty { "Untitled vault" }) }, { pick(Filter.Vault(v.accountId, v.id)) },
-                        leadingIcon = { Icon(if (v.members.size > 1) Icons.Rounded.Person else Icons.Rounded.Lock, null) },
+                        leadingIcon = { Icon(if (v.members.size > 1) Icons.Rounded.Group else Icons.Rounded.Lock, null) },
                         trailingIcon = { Text("${v.itemCount}", color = P.muted) },
                     )
                 }

@@ -51,7 +51,7 @@ fun Root() {
     val model = LocalContext.current.model
     Box(Modifier.fillMaxSize().background(P.bg)) {
         when {
-            model.known.isEmpty() -> Onboarding()
+            model.known.isEmpty() || model.onboarding -> Onboarding()
             model.locked -> UnlockScreen()
             else -> Main()
         }

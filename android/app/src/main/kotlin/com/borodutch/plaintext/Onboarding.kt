@@ -30,12 +30,14 @@ import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -95,6 +97,9 @@ private class Flow {
 fun Onboarding(adding: Boolean = false, onClose: (() -> Unit)? = null) {
     val flow = remember { Flow() }
     val step = flow.path.lastOrNull()
+    val model = LocalContext.current.model
+    // Closed before finishing (say, Add account cancelled on the kit step, or the app locked there).
+    DisposableEffect(Unit) { onDispose { model.settingUp = false } }
     // The kit and biometrics steps can't be backed out of: the account already exists.
     BackHandler(enabled = step != null || onClose != null) {
         when {
@@ -249,7 +254,7 @@ private fun CreateStep(flow: Flow) {
         val (server, username, password, invite) = listOf(flow.server, flow.username.lowercase().trim(), flow.password, flow.invite.trim())
         scope.launch {
             try {
-                flow.signup = model.call { it.signup(server, username, password, invite.ifEmpty { null }) }
+                flow.signup = model.call { it.signup(server, username, password, invite.ifEmpty { null }) }.also { model.remember(it.account, it.secretKey) }
                 flow.password = ""
                 flow.go(Step.Kit)
             } catch (e: Exception) {
@@ -286,7 +291,7 @@ private fun CreateStep(flow: Flow) {
             }
         }
         if (setup) {
-            Field("Setup code", flow.invite, { flow.invite = it }, kind = Input.Secret, note = "The code the person who runs this server set, so nobody else can claim it first.")
+            Field("Setup code", flow.invite, { flow.invite = it }, mono = true, note = "The code the person who runs this server set, so nobody else can claim it first.")
         } else if (needsInvite) {
             Field("Invite code", flow.invite, { flow.invite = it }, mono = true, placeholder = "Paste the invite code", note = "From the person who invited you. It also confirms who they are.")
         }
@@ -331,6 +336,7 @@ private fun KitStep(flow: Flow) {
         }
         LabeledValue("Server", r.account.server)
         LabeledValue("Username", r.account.username)
+        r.warning?.let { Note(it, icon = Icons.Rounded.Warning) }
     }
 }
 
@@ -407,7 +413,7 @@ private fun PasswordStep(flow: Flow) {
         val (server, sk, pw) = Triple(flow.server, flow.secretKey, flow.password)
         scope.launch {
             try {
-                flow.login = model.call { it.login(server, sk, pw) }
+                flow.login = model.call { it.login(server, sk, pw) }.also { model.remember(it.account, sk) }
                 flow.password = ""
                 flow.go(Step.Biometrics)
             } catch (e: Exception) {

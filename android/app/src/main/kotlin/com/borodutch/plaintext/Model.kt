@@ -115,8 +115,10 @@ class Model(val context: Context) {
     /** Hidden from lists while their undo toast is up. */
     private val deleting = mutableSetOf<String>()
 
-    /** What unlocks each open account, kept while unlocked so turning biometrics on needs no password. */
-    private val unlocks = mutableMapOf<String, UnlockData>()
+    /** First run, between signup (or sign-in) and the end of onboarding: [known] is no longer empty. */
+    var onboarding by mutableStateOf(false)
+    /** An account was just added and its session isn't stored yet: a lock now mustn't end it. */
+    var settingUp = false
     private var lastTouch = System.currentTimeMillis()
     private var idleJob: Job? = null
 
@@ -156,23 +158,39 @@ class Model(val context: Context) {
         vault.known = v
     }
 
-    /** After signup or sign-in: remember the account and what unlocks it. */
-    fun added(info: AccountInfo, unlock: UnlockData, secretKey: String) {
-        storeKnown(known.filter { it.id != info.id } + KnownAccount(info.id, info.server, info.username))
+    /** Right after signup or sign-in, before the Emergency Kit is on screen: keep the account and its Secret Key (the app may be killed there). */
+    fun remember(info: AccountInfo, secretKey: String) {
+        val k = KnownAccount(info.id, info.server, info.username)
+        if (known.isEmpty()) onboarding = true
+        settingUp = true
+        // Same name on the same server: an old account of a reset server is gone.
+        known.filter { it.id != k.id && it.name == k.name }.forEach { vault.forget(it.id) }
+        storeKnown(known.filter { it.id != k.id && it.name != k.name } + k)
         vault.saveSecretKey(info.id, secretKey)
+    }
+
+    /** Onboarding is done: store what unlocks the account and open it. */
+    fun added(info: AccountInfo, unlock: UnlockData, secretKey: String) {
+        remember(info, secretKey)
+        onboarding = false
+        settingUp = false
         saveSession(info.id, unlock)
         unlocked()
     }
 
+    /** Nothing on this device can resume a session without the password. */
+    private val sessionsStored get() = vault.biometrics && Vault.biometricsAvailable(context)
+
     private fun saveSession(id: String, u: UnlockData) {
-        unlocks[id] = u
-        if (vault.biometrics && Vault.biometricsAvailable(context)) vault.saveSession(id, u) else vault.forgetSession(id)
+        if (sessionsStored) vault.saveSession(id, u) else vault.forgetSession(id)
+        u.accountKey.fill(0)
     }
 
     /** Re-store every open account's session after the biometrics setting changes. */
     fun biometricsChanged(on: Boolean) {
         vault.biometrics = on
-        if (!on) vault.forgetAllSessions() else unlocks.forEach { (id, u) -> vault.saveSession(id, u) }
+        if (!on) vault.forgetAllSessions()
+        else accounts.forEach { a -> runCatching { core.unlockData(a.id) }.onSuccess { saveSession(a.id, it) } }
     }
 
     /** After a successful biometric prompt: open every account with a stored session. */
@@ -195,7 +213,6 @@ class Model(val context: Context) {
                 if (account(k.id) != null) continue
                 try {
                     call { it.resume(k.server, u) }
-                    unlocks[k.id] = u
                 } catch (e: PlaintextException.SignedOut) {
                     vault.forgetSession(k.id)
                     errors += "${k.name} was signed out. Enter its password to sign in again."
@@ -203,6 +220,7 @@ class Model(val context: Context) {
                     errors += errorText(e)
                 }
             }
+            sessions.values.forEach { it.accountKey.fill(0) }
             unlocking = false
             reload()
             if (accounts.isNotEmpty()) unlocked()
@@ -250,9 +268,8 @@ class Model(val context: Context) {
     fun lock() {
         if (locked && accounts.isEmpty()) return
         idleJob?.cancel()
-        core.lock()
-        unlocks.values.forEach { it.accountKey.fill(0) }
-        unlocks.clear()
+        // Without a stored session the next unlock signs in again, so end these; not for an account being added, though.
+        core.lock(!sessionsStored && !settingUp)
         accounts = emptyList(); items = emptyList(); vaults = emptyList(); watch = emptyList()
         inbox = emptyMap(); breached = emptyMap()
         stack.clear()
@@ -272,7 +289,6 @@ class Model(val context: Context) {
     fun signOut(id: String) = scope.launch {
         withContext(Dispatchers.IO) { core.signOut(id) }
         vault.forget(id)
-        unlocks.remove(id)?.accountKey?.fill(0)
         storeKnown(known.filter { it.id != id })
         inbox = inbox - id
         wipeCache()
@@ -311,7 +327,8 @@ class Model(val context: Context) {
                         Triple(id, null, runCatching { core.inbox(id) }.getOrNull())
                     } catch (e: Exception) {
                         // The server ended this session: drop it here too (the password signs in again).
-                        if (e is PlaintextException.SignedOut) core.signOut(id)
+                        // Keep this device's copies: they hold the rollback guard and pins.
+                        if (e is PlaintextException.SignedOut) core.forget(id)
                         Triple(id, e, null)
                     }
                 }
@@ -321,10 +338,9 @@ class Model(val context: Context) {
             for ((id, err, entries) in results) {
                 if (entries != null) box[id] = entries
                 when (err) {
-                    null, is PlaintextException.Network -> {}
+                    null, is PlaintextException.Network, is PlaintextException.Locked -> {}
                     is PlaintextException.SignedOut -> {
                         vault.forgetSession(id)
-                        unlocks.remove(id)?.accountKey?.fill(0)
                         first = first ?: err
                     }
                     else -> first = first ?: err
@@ -333,7 +349,11 @@ class Model(val context: Context) {
             if (!locked) inbox = box
             syncing = false
             reload()
-            first?.let { show(it) }
+            // The server signed this device out of its only open account.
+            if (accounts.isEmpty() && !locked) lock()
+            // What the sync couldn't do; the client's text can end with a CLI hint, and the app has its own Verify screen.
+            val problem = accounts.flatMap { it.problems }.firstOrNull()?.substringBefore(" (plaintext ")?.replaceFirstChar { it.uppercase() }
+            if (first != null) show(first!!) else if (problem != null) banner = problem
         }
     }
 
