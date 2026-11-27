@@ -11,9 +11,17 @@ fn secret_key_roundtrip_and_typos() {
     assert_eq!(s.len(), 3 + 4 * 7 + 3);
     assert_eq!(SecretKey::parse(&s).unwrap().0, sk.0);
     assert_eq!(SecretKey::parse(&s.to_lowercase().replace('-', " ")).unwrap().0, sk.0);
+    // The check pair is 10 bits of SHA-256, so a data-character typo slips past it
+    // 1 time in 1024 by design. A typo in a check character always fails (the data,
+    // and so the expected check pair, is unchanged); a data typo is tested on a
+    // fixed key below so the test can't flake.
     let mut typo: Vec<char> = s.chars().collect();
-    typo[5] = if typo[5] == 'X' { 'Y' } else { 'X' };
+    let last = typo.len() - 1;
+    typo[last] = if typo[last] == 'X' { 'Y' } else { 'X' };
     assert!(SecretKey::parse(&typo.into_iter().collect::<String>()).is_err());
+    let fixed = "A1-60RK4CS-M6MV3EE-1SC5H66-S35CRKK";
+    assert!(SecretKey::parse(fixed).is_ok());
+    assert!(SecretKey::parse(&fixed.replacen("60RK", "60XK", 1)).is_err());
 }
 
 #[test]
