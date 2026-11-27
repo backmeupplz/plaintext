@@ -694,8 +694,9 @@ fn large_pushes() {
     alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
     let stale = VaultPut { upserts: vec![], staged: Some(Staged { id: a, count: 1 }), ..put };
     assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&stale))), 409);
-    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0, "a failed push drops what its member staged");
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 1, "a failed push drops only the stage it named");
     alice.sync_vault(&personal).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0, "and the next push drops what's left over");
     assert!(!alice.vaults[&personal].has_changes());
 
     // A request over the limit gets 413, unlike a full account (507).
@@ -749,6 +750,17 @@ fn leaving_a_vault() {
     alice.sync().unwrap();
     let r = alice.vaults[&fam].roster.clone().unwrap();
     assert_eq!((r.epoch, r.members.len()), (1, 1));
+    // Every roster keeps an owner and a real key check.
+    let me = alice.me();
+    let tweak = |f: &dyn Fn(&mut Roster)| {
+        let u = alice.vaults[&fam].grant(&me, &alice.keyring, "carol", Role::Reader, None, now()).unwrap();
+        let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
+        f(&mut r);
+        RosterUpdate { roster: me.sign_doc("roster", &r), ..u }
+    };
+    for u in [tweak(&|r| r.members.iter_mut().for_each(|m| m.role = Role::Reader)), tweak(&|r| r.key_check = B64(vec![0; 1000]))] {
+        assert_eq!(status(alice.call::<()>("POST", &format!("/v1/vaults/{fam}/roster"), Some(&u))), 400);
+    }
     // A creator who leaves hands the vault to an owner who stays.
     let club = carol.create_vault("Club").unwrap();
     carol.share_vault(&club, "alice", Role::Owner, None).unwrap();

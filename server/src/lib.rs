@@ -1100,7 +1100,7 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     let pushed: u64 = tx
         .query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ? AND counter = ?", params![vault, env.counter], |r| r.get(0))
         .map_err(db_err)?;
-    if pushed > plaintext_core::api::MAX_PUSH as u64 {
+    if pushed > MAX_PUSH as u64 {
         return Err(TOO_BIG);
     }
     for d in &put.deletes {
@@ -1194,7 +1194,7 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
-    // Roster members the server no longer serves: their accounts were deleted.
+    // Roster members the server no longer serves: they left, or their accounts were deleted.
     let (roster,): (String,) = db
         .query_row(
             "SELECT signed FROM rosters WHERE vault_id = ?1 AND version = (SELECT roster_version FROM vaults WHERE id = ?1)",
@@ -1235,8 +1235,8 @@ async fn put_vault(
     })();
     // A failed push is never retried with the same stage (the client stages
     // anew), so its staged items would only take up room.
-    if res.is_err() && put.staged.is_some() {
-        db.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![&vault[..], c.username]).map_err(db_err)?;
+    if let (Err(_), Some(st)) = (&res, put.staged.as_ref()) {
+        let _ = db.execute("DELETE FROM staged WHERE vault_id = ? AND username = ? AND stage = ?", params![&vault[..], c.username, &st.id.0[..]]);
     }
     res.map(|()| StatusCode::NO_CONTENT)
 }
@@ -1342,9 +1342,13 @@ async fn update_roster(
             tx.query_row("SELECT signed FROM rosters WHERE vault_id = ? AND version = ?", params![&vault[..], version], |row| row.get(0)).map_err(db_err)?;
         let prev: Roster = parse(&serde_json::from_str::<Signed>(&prev).map_err(db_err)?)?;
         let had = |name: &str| prev.members.iter().any(|m| m.username == name);
-    if !r.members.iter().any(|m| m.username == c.username) {
-        return Err((BAD, "to stop using a vault, leave it"));
-    }
+        if !r.members.iter().any(|m| m.username == c.username) {
+            return Err((BAD, "to stop using a vault, leave it"));
+        }
+        // Without an owner nobody could change its key or members again.
+        if !r.members.iter().any(|m| m.role == Role::Owner) {
+            return Err((BAD, "a vault needs an owner"));
+        }
         // Someone who left (or was deleted) stays out unless an owner adds them anew: a
         // roster built before they left, still listing them, mustn't bring them back.
         for m in r.members.iter().filter(|m| had(&m.username)) {
@@ -1383,8 +1387,8 @@ async fn update_roster(
     })();
     // A failed push is never retried with the same stage (the client stages
     // anew), so its staged items would only take up room.
-    if res.is_err() && u.rotation.as_ref().is_some_and(|p| p.staged.is_some()) {
-        db.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![&vault[..], c.username]).map_err(db_err)?;
+    if let (Err(_), Some(st)) = (&res, u.rotation.as_ref().and_then(|p| p.staged.as_ref())) {
+        let _ = db.execute("DELETE FROM staged WHERE vault_id = ? AND username = ? AND stage = ?", params![&vault[..], c.username, &st.id.0[..]]);
     }
     res.map(|()| StatusCode::NO_CONTENT)
 }

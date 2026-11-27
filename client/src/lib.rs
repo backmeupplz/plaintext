@@ -115,7 +115,11 @@ impl Transport for Http {
         let req = req.body(body.unwrap_or_default()).map_err(|e| Error::Network(e.to_string()))?;
         let mut resp = self.agent.run(req).map_err(|e| Error::Network(e.to_string()))?;
         let status = resp.status().as_u16();
-        let bytes = resp.body_mut().with_config().limit(128 << 20).read_to_vec().map_err(|e| Error::Network(e.to_string()))?;
+        let bytes = resp.body_mut().with_config().limit(128 << 20).read_to_vec().map_err(|e| match e {
+            // Like a vault too big to pull: that vault waits, the others still sync.
+            ureq::Error::BodyExceedsLimit(_) => Error::Server(413, "the server's answer is bigger than this app takes in one go".into()),
+            e => Error::Network(e.to_string()),
+        })?;
         Ok((status, bytes))
     }
 
@@ -366,7 +370,7 @@ impl<T: Transport> Session<T> {
         let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
         if items > MAX_PUSH {
             // The server would refuse it after every part was sent (as if it had said so).
-            return Err(Error::Server(413, "more items than a device can pull in one go: push fewer at a time".into()));
+            return Err(Error::Server(413, "not sent: more items than a device can pull in one go; push fewer at a time".into()));
         }
         if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
             return Ok(None);
@@ -627,7 +631,7 @@ impl<T: Transport> Session<T> {
         // Members who left have to go first, with a new key, which waits for the unsent changes.
         if let Some(who) = self.gone.get(id).and_then(|g| g.first()).filter(|_| v.has_changes()) {
             return Err(Error::Refused(format!(
-                "{who} left {}; its key has to change first, which needs your unsent changes to it sent (make room) or deleted",
+                "{who} left {} (or was deleted); its key has to change first, which needs your unsent changes to it sent (make room) or deleted",
                 v.meta.name
             )));
         }

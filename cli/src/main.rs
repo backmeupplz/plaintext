@@ -836,12 +836,23 @@ fn run(cli: Cli) -> Res<()> {
                 };
                 targets.push((vid, v.items));
             }
-            // Every item goes into this device's copy before it's pushed, so a failed
-            // push loses nothing; pushes go every 32 MiB, as one may write at most 64.
-            // Once an upload fails, the remaining attachments are left out and listed.
+            // A device pulls a vault's items in one response, so a vault holds at most
+            // one push's worth (sealed: padded to 256 bytes, plus 41).
+            let sealed = |it: &Item| serde_json::to_vec(it).map_or(0, |j| j.len().div_ceil(256) * 256 + 41);
+            let mut size = std::collections::BTreeMap::<_, usize>::new();
+            for (vid, items) in &targets {
+                let have = || s.vaults.get(vid).map_or(0, |v| v.items().map(|(_, i)| sealed(i)).sum());
+                *size.entry(*vid).or_insert_with(have) += items.iter().map(|(it, _)| sealed(it)).sum::<usize>();
+            }
+            if let Some((vid, _)) = size.iter().find(|(_, n)| **n > plaintext_client::plaintext_core::api::MAX_PUSH) {
+                let name = s.vaults.get(vid).map_or(String::new(), |v| v.meta.name.clone());
+                return Err(format!("that's more than {name} can hold (64 MiB of items); import into several vaults (--vault)").into());
+            }
+            // Every item goes into this device's copy before anything is pushed, so a
+            // failed push loses nothing. Once an upload fails, the remaining
+            // attachments are left out and listed.
             let (mut upload_err, mut skipped, mut vids, mut sync_err) = (None, Vec::new(), Vec::new(), None);
             for (vid, items) in targets {
-                let mut unsent = 0;
                 for (mut it, files) in items {
                     for (name, bytes) in files {
                         if upload_err.is_none() {
@@ -855,14 +866,7 @@ fn run(cli: Cli) -> Res<()> {
                         }
                         skipped.push(format!("{}: {name}", it.title));
                     }
-                    unsent += serde_json::to_vec(&it)?.len();
                     s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
-                    if unsent > plaintext_client::plaintext_core::api::MAX_PUSH / 2 && sync_err.is_none() {
-                        unsent = 0;
-                        if let Err(e) = s.sync_vault(&vid) {
-                            sync_err = Some(e);
-                        }
-                    }
                 }
                 if !vids.contains(&vid) {
                     vids.push(vid);
