@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://getplaintext.org/sitemap.xml

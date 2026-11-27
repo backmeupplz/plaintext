@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plaintext: a self-hosted password manager your server can't read</title>
+<meta name="description" content="Plaintext is an open-source, self-hosted password manager. Everything is encrypted on your devices with your password and a Secret Key the server never sees, so a stolen or hostile server holds nothing but ciphertext.">
+<link rel="canonical" href="https://getplaintext.org/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fbfbf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111110" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Plaintext">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://getplaintext.org/">
+<meta property="og:title" content="Plaintext: a self-hosted password manager your server can't read">
+<meta property="og:description" content="Open-source and self-hosted. Your vault is encrypted on your devices with your password and a Secret Key the server never sees, so even a stolen server holds only ciphertext.">
+<meta property="og:image" content="https://getplaintext.org/og.png">
+<meta property="og:image:secure_url" content="https://getplaintext.org/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Plaintext: the only place your passwords exist in plaintext is your own device. The server only ever sees ciphertext.">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@backmeupplz">
+<meta name="twitter:creator" content="@backmeupplz">
+<meta name="twitter:title" content="Plaintext: a self-hosted password manager your server can't read">
+<meta name="twitter:description" content="Open-source and self-hosted. Your vault is encrypted on your devices with your password and a Secret Key the server never sees, so even a stolen server holds only ciphertext.">
+<meta name="twitter:image" content="https://getplaintext.org/og.png">
+<meta name="twitter:image:alt" content="Plaintext: the only place your passwords exist in plaintext is your own device. The server only ever sees ciphertext.">
+
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Plaintext", "url": "https://getplaintext.org/",
+ "description": "Open-source, self-hosted, end-to-end encrypted password manager with a Rust server.",
+ "applicationCategory": "SecurityApplication", "codeRepository": "https://git.borodutch.com/backmeupplz/plaintext",
+ "license": "https://opensource.org/licenses/MIT", "image": "https://getplaintext.org/og.png",
+ "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+ "author": {"@type": "Person", "name": "Nikita Kolmogorov", "url": "https://borodutch.com"}}
+</script>
+<style>
+:root {
+  --bg: #fbfbf8; --fg: #1b1b19; --muted: #66665f; --line: #e4e3dc; --card: #f3f2ec;
+  --code: #efeee7; --accent: #1f7a4d; --accent-fg: #ffffff;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111110; --fg: #ecebe5; --muted: #9a9991; --line: #282825; --card: #191917;
+    --code: #1d1d1b; --accent: #4cc38a; --accent-fg: #0d1f16; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 var(--sans); }
+a { color: inherit; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+code, pre { font-family: var(--mono); }
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+.mark { font: 700 22px var(--mono); letter-spacing: -0.5px; text-decoration: none; }
+.mark span { color: var(--accent); }
+nav a { white-space: nowrap; margin-left: 22px; font-size: 15px; color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--fg); }
+.hero { padding: 64px 0 48px; }
+h1 { font-size: clamp(34px, 6vw, 54px); line-height: 1.08; letter-spacing: -1.5px; margin: 0 0 22px; font-weight: 750; }
+h1 em { font-style: normal; color: var(--accent); }
+.lead { font-size: 20px; color: var(--muted); max-width: 720px; margin: 0 0 30px; }
+.ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn { display: inline-block; font: 600 15px var(--sans); border-radius: 10px; padding: 11px 18px; text-decoration: none;
+  border: 1px solid var(--line); background: var(--card); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn.primary:hover { color: var(--accent-fg); opacity: .9; }
+.status { margin: 26px 0 0; max-width: 720px; font-size: 15px; color: var(--muted); border-left: 3px solid var(--accent); padding: 2px 0 2px 14px; }
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+h2 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 14px; }
+.sub { color: var(--muted); max-width: 720px; margin: 0 0 30px; }
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 22px 20px; }
+.card h3 { margin: 0 0 8px; font-size: 18px; }
+.card p { margin: 0; color: var(--muted); font-size: 15.5px; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+  font-size: 14px; line-height: 1.7; overflow-x: auto; margin: 0; max-width: 720px; }
+pre .c { color: var(--muted); }
+pre .g { color: var(--accent); font-weight: 650; }
+table { border-collapse: collapse; width: 100%; max-width: 720px; font-size: 15.5px; }
+td, th { text-align: left; padding: 11px 12px 11px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; white-space: nowrap; }
+td { color: var(--muted); }
+ul.plain { padding-left: 20px; margin: 0; max-width: 720px; }
+ul.plain li { margin: 0 0 12px; }
+footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--muted); font-size: 15px; }
+@media (max-width: 640px) {
+  body { font-size: 16px; }
+  .hero { padding: 36px 0 32px; }
+  .lead { font-size: 18px; }
+  .cards { grid-template-columns: 1fr; }
+  nav a { margin-left: 12px; font-size: 14px; }
+  pre { font-size: 12.5px; }
+  th { white-space: normal; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <a class="mark" href="/">plain<span>text</span></a>
+  <nav><a href="#how">How it works</a><a href="#self-host">Self-host</a><a href="https://git.borodutch.com/backmeupplz/plaintext">Source</a></nav>
+</header>
+
+<main>
+<div class="hero">
+  <h1>The only place your passwords are ever in <em>plaintext</em> is your own device.</h1>
+  <p class="lead">Plaintext is an open-source password manager that you host yourself. Your vault is encrypted on your phone and computer with your password and a Secret Key that never leaves them, so the server, and anyone who breaks into it, only ever holds ciphertext.</p>
+  <div class="ctas">
+    <a class="btn primary" href="https://git.borodutch.com/backmeupplz/plaintext/src/branch/main/DESIGN.md">Read the design</a>
+    <a class="btn" href="https://git.borodutch.com/backmeupplz/plaintext">Browse the source</a>
+  </div>
+  <p class="status">Plaintext is in early development. The encryption core and the server work and are tested today, and the apps for iPhone, Mac, Android and the browser extensions are being built next.</p>
+</div>
+
+<section id="how">
+  <h2>Built for a server you don't trust</h2>
+  <p class="sub">Most password managers protect your vault from outsiders but trust their own server. Plaintext assumes the server itself may be hostile, which also covers a stolen backup, a curious host and a breach you never hear about.</p>
+  <div class="cards">
+    <div class="card"><h3>Two secrets, not one</h3><p>Your keys come from your password combined with a 128-bit Secret Key that is created on your first device and kept in its keychain. A stolen database can't be cracked by guessing passwords, because the Secret Key was never in it.</p></div>
+    <div class="card"><h3>Nothing for the server to weaken</h3><p>The salt and the Argon2id settings are fixed by the app itself, so a malicious server has no way to talk your devices into weaker encryption. The server doesn't even store your email.</p></div>
+    <div class="card"><h3>Each item sealed as a whole</h3><p>Every login is encrypted as one XChaCha20-Poly1305 blob that is bound to its own id, so fields and items can't be swapped around or quietly edited by the server.</p></div>
+    <div class="card"><h3>Tampering gets noticed</h3><p>Each vault carries an encrypted index of every item. Your devices refuse a server that drops an item, adds one, or serves an older copy of a vault they have already seen.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>How your keys fit together</h2>
+  <p class="sub">The design follows what the 2026 ETH Zurich study of cloud password managers found broken elsewhere, and <a href="https://git.borodutch.com/backmeupplz/plaintext/src/branch/main/DESIGN.md">DESIGN.md</a> walks through every attack it describes and what Plaintext does about it.</p>
+<pre><span class="c"># on your device only</span>
+password + <span class="g">Secret Key</span>
+  └─► Argon2id + HKDF
+        ├─► unlock key ─► account key ─► vault keys ─► items
+        └─► login key (the server keeps only its public half)
+
+<span class="c"># on the server</span>
+a public login key, sealed keys, sealed items
+and one counter per vault</pre>
+</section>
+
+<section id="self-host">
+  <h2>Run your own server</h2>
+  <p class="sub">The server is one small Rust binary on SQLite that stores sealed blobs and checks who may read them. It needs no other services, so a small VPS or a box at home is enough.</p>
+<pre>git clone https://git.borodutch.com/backmeupplz/plaintext
+cd plaintext
+docker build -t plaintext .
+docker run -d -v plaintext:/data -p 8080:8080 plaintext</pre>
+  <p class="sub" style="margin-top:18px">The first account signs up freely and claims the server; set <code>PLAINTEXT_INVITE</code> to let family or teammates join with an invite code, and put the server behind HTTPS.</p>
+</section>
+
+<section>
+  <h2>Where it's going</h2>
+  <p class="sub">Every app is native and shares one Rust core for all of its cryptography, so there is exactly one implementation to audit.</p>
+  <table>
+    <tr><th>iPhone and iPad</th><td>A SwiftUI app with AutoFill and passkeys, unlocked with Face ID through the Keychain.</td></tr>
+    <tr><th>Mac and Safari</th><td>A native app that carries the Safari extension and unlocks with Touch ID.</td></tr>
+    <tr><th>Android</th><td>A Compose app with the system Autofill service and passkeys, unlocked through the Android Keystore.</td></tr>
+    <tr><th>Chrome and Firefox</th><td>Lightweight extensions that unlock through your operating system's keychain on Windows, macOS and Linux.</td></tr>
+  </table>
+</section>
+</main>
+
+<footer>
+  Plaintext is MIT-licensed and made by <a href="https://borodutch.com">Borodutch</a>. The code lives on <a href="https://git.borodutch.com/backmeupplz/plaintext">git.borodutch.com</a> with a mirror on <a href="https://github.com/backmeupplz/plaintext">GitHub</a>.
+</footer>
+</div>
+</body>
+</html>

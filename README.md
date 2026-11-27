@@ -2,7 +2,7 @@
 
 A self-hosted password manager for a server you don't trust. Every item is encrypted on your devices with a key derived from your password and a 128-bit Secret Key that never leaves them, so a stolen database, a curious admin or a compromised host sees only ciphertext and can't brute-force your password offline. The server is one small Rust binary on SQLite.
 
-Status: the core crypto library and the server work and are tested end to end; the apps and extensions come next. Read [DESIGN.md](DESIGN.md) for the threat model, key hierarchy and protocol.
+Site: https://getplaintext.org. Status: the core crypto library and the server work and are tested end to end; the apps and extensions come next. Read [DESIGN.md](DESIGN.md) for the threat model, key hierarchy and protocol.
 
 ## Run the server
 
