@@ -20,7 +20,7 @@ Put it behind HTTPS at any address you like: your own domain, a LAN address or a
 | `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, and nobody but admins can list everyone. |
 | `PLAINTEXT_ADDR`, `PLAINTEXT_DB` | Listen address (`0.0.0.0:8080`) and database path (`plaintext.db`). |
 
-Share links open on a static page at getplaintext.org that decrypts in the browser; your server never sees the key. To use your own domain for that too, host a copy of `docs/s/` anywhere except the vault server itself and set `PLAINTEXT_LINK_PAGE=https://your.page/s/`.
+Share links open on a static page at getplaintext.org that decrypts in the browser; your server never sees the key. To use your own domain for that too, host a copy of `docs/s/` anywhere except the vault server itself and set `PLAINTEXT_LINK_PAGE=https://your.page/s/`. Keep the trailing `/`, since the page loads its files from next to itself.
 
 ### Backups
 
@@ -73,4 +73,7 @@ plaintext inject -i config.tpl -o config.yml       # {{ pt://Infra/Prod DB/passw
 ```sh
 cargo test                      # core, client end-to-end over HTTP, importers
 python3 tools/kat.py            # independent check of the crypto vectors (argon2-cffi, cryptography, pynacl)
+wasm/build.sh                   # rebuild the browser core into docs/s/ (CI checks it matches)
 ```
+
+The share-link viewer at `getplaintext.org/s/` is `docs/s/`: a static page that decrypts with the core compiled to WebAssembly. `wasm/build.sh` builds on linux/amd64 like CI (in Docker elsewhere), so the committed `.wasm` matches byte for byte.

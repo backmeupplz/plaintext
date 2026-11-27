@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src *; script-src 'self' 'wasm-unsafe-eval'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Shared item · Plaintext</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fbfbf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111110" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="viewer.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header><a class="mark" href="https://getplaintext.org/" target="_blank" rel="noopener noreferrer">plain<span>text</span></a></header>
+  <main id="main">
+    <div class="state bad fallback"><h1>This page didn't load</h1><p>The item is decrypted right here in your browser, which takes JavaScript and WebAssembly. Make sure JavaScript is on, then reload the page, or open the link in an up-to-date browser.</p></div>
+  </main>
+  <p id="live" class="toast" role="status" aria-live="polite"></p>
+  <footer>
+    <p>Decrypted in this browser. The key is only in the link, so the server that stored this item never saw what's inside.</p>
+    <p><a href="https://getplaintext.org/" target="_blank" rel="noopener noreferrer">Plaintext</a> is an open-source, self-hosted password manager.</p>
+  </footer>
+</div>
+</body>
+</html>

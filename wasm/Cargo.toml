@@ -1,0 +1,17 @@
+[package]
+name = "plaintext-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.22"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+plaintext-core = { path = "../core" }
+serde_json = "1"
+# Must match the wasm-bindgen CLI that build.sh downloads.
+wasm-bindgen = "=0.2.130"

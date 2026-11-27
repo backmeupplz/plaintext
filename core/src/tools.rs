@@ -125,9 +125,11 @@ fn base32_rfc4648(s: &str) -> Option<Vec<u8>> {
 /// the seconds it stays valid.
 pub fn totp(spec: &str, now: u64) -> Option<(String, u64)> {
     let (mut secret, mut digits, mut period, mut algo) = (spec.trim().to_string(), 6u32, 30u64, "SHA1".to_string());
-    if let Some(q) = spec.trim().strip_prefix("otpauth://totp/").and_then(|r| r.split_once('?')).map(|(_, q)| q) {
+    let t = spec.trim();
+    let uri = t.get(..15).is_some_and(|p| p.eq_ignore_ascii_case("otpauth://totp/"));
+    if let Some((_, q)) = uri.then(|| t[15..].split_once('?')).flatten() {
         for kv in q.split('&') {
-            let (k, v) = kv.split_once('=')?;
+            let Some((k, v)) = kv.split_once('=') else { continue };
             let v = v.replace("%3D", "=");
             match k.to_lowercase().as_str() {
                 "secret" => secret = v,
@@ -253,6 +255,8 @@ mod tests {
         assert_eq!(totp(&uri("SHA256", sha256), 59).unwrap().0, "46119246");
         let (code, left) = totp(sha1, 59).unwrap();
         assert_eq!((code.as_str(), left), ("287082", 1));
+        // A trailing `&`, a bare flag and an upper-case scheme still parse.
+        assert_eq!(totp(&format!("OTPAuth://TOTP/x?secret={sha1}&flag&"), 59).unwrap().0, "287082");
     }
 
     #[test]
