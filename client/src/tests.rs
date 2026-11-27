@@ -1102,10 +1102,12 @@ fn server_hardening() {
 
     // Sessions end on the server: a login may ask for less than 30 days.
     let mut short = plaintext_core::login_request(&d, now_ms(), "t", &host);
-    short.ttl = Some(1);
+    // 3 s, not 1: expiry is in whole seconds, so a 1 s session can lapse before
+    // the first check on a slow runner.
+    short.ttl = Some(3);
     let token = call::<_, LoginResponse>(&Http::new(&url), "POST", "/v1/login", None, Some(&short)).unwrap().token;
     assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 200);
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    std::thread::sleep(std::time::Duration::from_millis(4100));
     assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 401);
 
     // Links and messages count against the sender's quota.
