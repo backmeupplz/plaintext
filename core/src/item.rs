@@ -90,6 +90,19 @@ pub struct FileRef {
     pub hash: B64,
 }
 
+/// An attachment's name made safe to use as a file name: its last path part
+/// only, without control characters, and never empty, `.` or `..`. Names come
+/// from whoever saved the item (anyone who can write to a shared vault) and from
+/// import files, so never join one to a directory as it is.
+pub fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
+    match clean.trim() {
+        "" | "." | ".." => "attachment".into(),
+        n => n.into(),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Passkey {
     pub rp_id: String,
@@ -113,7 +126,42 @@ pub struct OldPassword {
 
 const HISTORY: usize = 10;
 
+/// Field kinds whose values are secrets (never shown to an AI agent, never searched for it).
+pub const SECRET_KINDS: &[&str] = &["concealed", "password", "ssh_key", "card_number", "otp", "pin"];
+
 impl Item {
+    /// Like `matches`, but only on what an AI agent may see: not notes, not secret fields.
+    pub fn matches_shown(&self, query: &str) -> bool {
+        let q = query.to_lowercase();
+        let hit = |s: &str| s.to_lowercase().contains(&q);
+        hit(&self.title)
+            || hit(&self.username)
+            || self.urls.iter().any(|u| hit(u))
+            || self.tags.iter().any(|t| hit(t))
+            || self.sections.iter().flat_map(|s| &s.fields).any(|f| !SECRET_KINDS.contains(&f.kind.as_str()) && (hit(&f.label) || hit(&f.value)))
+    }
+
+    /// What leaves an account when an item is shared (a link, someone's inbox):
+    /// its current fields, without password history, earlier versions, passkey
+    /// private keys, attachment keys, flags or unknown fields (`extra`, which a
+    /// newer client may have used for anything).
+    pub fn shareable(&self) -> Item {
+        Item {
+            kind: self.kind.clone(),
+            title: self.title.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            urls: self.urls.clone(),
+            totp: self.totp.clone(),
+            notes: self.notes.clone(),
+            sections: self.sections.clone(),
+            tags: self.tags.clone(),
+            created: self.created,
+            updated: self.updated,
+            ..Default::default()
+        }
+    }
+
     /// Replace this item with `next`, keeping the old version in `history` and the
     /// old password in `password_history`.
     pub fn edit(&mut self, mut next: Item, now_ms: u64) {

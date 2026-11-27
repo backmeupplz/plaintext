@@ -375,7 +375,7 @@ fn invites_verify_both_sides() {
     let (_, code) = admin.new_invite();
     let (_, s) = signup("newbie", "pw", Some(&code)).unwrap();
     let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone() };
-    assert_eq!(admin.verify_invitees(std::slice::from_ref(&user)), vec!["newbie".to_string()]);
+    assert_eq!(admin.verify_invitees(std::slice::from_ref(&user)).0, vec!["newbie".to_string()]);
     assert!(admin.contacts["newbie"].verified && admin.invites.is_empty());
 
     // A server substituting the new user's identity can't produce the proof.
@@ -383,7 +383,7 @@ fn invites_verify_both_sides() {
     let (_, code2) = admin2.new_invite();
     let (_, s2) = signup("newbie", "pw", Some(&code2)).unwrap();
     let swapped = UserInfo { identity: Keyring::new("newbie").identity(Kind::Human, None), invite: s2.request.invite.clone(), ..user };
-    assert!(admin2.verify_invitees(&[swapped]).is_empty());
+    assert!(admin2.verify_invitees(&[swapped]).0.is_empty());
 }
 
 #[test]
@@ -478,5 +478,271 @@ fn server_host_normalizes() {
         ("http://[::1]:80", "[::1]"),
     ] {
         assert_eq!(server_host(url), host, "{url}");
+    }
+}
+
+// ---------- Attacks from the 2026-11 security audit; each must stay fixed ----------
+
+/// Advance an owner's own vault after a roster change it signed.
+fn adopt(v: &mut Vault, log: &Log, u: &RosterUpdate, kr: &mut Keyring) {
+    v.apply(&VaultResponse { counter: log.manifests.len() as u64, rosters: vec![u.roster.clone()], ..Default::default() }, kr, 0).unwrap();
+}
+
+#[test]
+fn audit_rejected_roster_still_pins() {
+    let (mut a, _) = pair();
+    let am = a.me();
+    let (v, nv) = Vault::create(&am, "x").unwrap();
+    let mut d = Vault::new(v.id);
+    d.apply(&Log::new(&nv).full("alice"), &mut a, 0).unwrap();
+    // The server appends roster v1 "signed by alice", adding its own "carol"; alice never signed it.
+    let mut server_carol = Keyring::new("carol");
+    let mut r: Roster = serde_json::from_slice(&nv.roster.body.0).unwrap();
+    r.version = 1;
+    r.prev = B64(sha256(&nv.roster.body.0).to_vec());
+    r.members.push(server_carol.me().member(Role::Reader));
+    let mut forged = server_carol.me().sign_doc("roster", &r);
+    forged.signer = "alice".into();
+    assert_eq!(d.apply(&VaultResponse { counter: 1, rosters: vec![forged], ..Default::default() }, &mut a, 0), Err(Error::BadSignature));
+    // Rejected, but the keyring was already changed. What alice sends "carol" now is the server's.
+    server_carol.pin_identity(&a.identity(Kind::Human, None)).unwrap();
+    let leaked = send(&am, &a, "carol", &Content::Request("prod DB password is hunter2".into()), None)
+        .ok()
+        .and_then(|m| receive(&server_carol, &m, 0).ok())
+        .map(|(_, c)| c);
+    assert!(!a.contacts.contains_key("carol"), "a rejected roster pinned carol to the server's key; server then read {leaked:?}");
+}
+
+#[test]
+fn audit_agent_accepts_vault_from_servers_own_owner() {
+    let mut owner = Keyring::new("alice");
+    let (_, agent) = create_agent(&mut owner, "ci-bot").unwrap();
+    let mut agent_kr = agent.keyring; // the agent's keyring as stored at signup
+    assert!(agent_kr.contacts["alice"].verified && agent_kr.owner.as_deref() == Some("alice"));
+    // The server's own "alice" makes a vault "CI" holding the real agent as a writer.
+    let mut fake = Keyring::new("alice");
+    fake.pin_identity(&agent.request.identity).unwrap();
+    let fm = fake.me();
+    let (mut fv, fnv) = Vault::create(&fm, "CI").unwrap();
+    let mut log = Log::new(&fnv);
+    let g = fv.grant(&fm, &fake, "ci-bot", Role::Writer, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut fv, &log, &g, &mut fake);
+    fv.put(new_item_id(), login("Deploy token", "attacker-chosen-token"));
+    let p = fv.push(&fm, 0).unwrap();
+    fv.pushed(&p);
+    log.put(&p);
+    let mut av = Vault::new(fv.id);
+    // The agent knows its owner's real keys, so the look-alike "alice" is caught.
+    assert_eq!(av.apply(&log.full("ci-bot"), &mut agent_kr, 0).err(), Some(Error::KeyChanged("alice".into())));
+}
+
+#[test]
+fn audit_new_device_stays_on_pre_revocation_epoch() {
+    let (mut a, mut b) = pair();
+    let (am, bm) = (a.me(), b.me());
+    let (mut v, nv) = Vault::create(&am, "Team").unwrap();
+    let mut log = Log::new(&nv);
+    let g = v.grant(&am, &a, "bob", Role::Writer, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut v, &log, &g, &mut a);
+    let mut fork = Log { rosters: log.rosters.clone(), manifests: log.manifests.clone(), keys: log.keys.clone(), items: log.items.clone() };
+    let mut vb = Vault::new(v.id);
+    vb.apply(&fork.full("bob"), &mut b, 0).unwrap();
+    // Alice removes bob: new epoch, new key, every item re-sealed. Her device
+    // pulls the new roster, which records it in her (synced) keyring.
+    let r = v.revoke(&am, "bob", 0).unwrap();
+    log.roster(&r);
+    let rot = r.rotation.as_ref().unwrap();
+    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone() };
+    v.apply(&delta, &mut a, 0).unwrap();
+    // Removed bob writes on the old branch; the server serves that branch to alice's new phone.
+    vb.put(new_item_id(), login("Bank", "planted-by-removed-bob"));
+    let pb = vb.push(&bm, 0).unwrap();
+    vb.pushed(&pb);
+    fork.put(&pb);
+    let mut phone = Vault::new(v.id);
+    // The phone gets the keyring: a server still serving the old branch is caught.
+    // (A server that also serves the phone an old keyring isn't: see DESIGN, Known limits.)
+    assert_eq!(phone.apply(&fork.full("alice"), &mut a, 0), Err(Error::Rollback));
+}
+
+#[test]
+fn audit_server_drops_concurrent_edit_without_conflict_copy() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let id = new_item_id();
+    v1.put(id, login("bank", "one"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    let mut v2 = Vault::new(v1.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v1.put(id, login("bank", "rotated-on-device-1"));
+    let p1 = v1.push(&me, 0).unwrap();
+    v1.pushed(&p1);
+    log.put(&p1);
+    v2.put(id, login("bank", "stale-edit-on-device-2"));
+    // Same response as concurrent_edit_keeps_conflict_copy, minus the changed item's blob.
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![] };
+    // Refused: the other edit would otherwise vanish instead of becoming a conflict copy.
+    assert_eq!(v2.apply(&resp, &mut a, 0), Err(Error::ManifestMismatch));
+}
+
+#[test]
+fn audit_message_resigned_by_other_sender() {
+    let (a, mut b) = pair();
+    let mallory = Keyring::new("mallory");
+    b.pin_identity(&mallory.identity(Kind::Human, None)).unwrap();
+    let msg = send(&a.me(), &a, "bob", &Content::Item(Box::new(login("Prod DB", "s3cret-from-alice"))), None).unwrap();
+    // Whoever holds the envelope (the server) re-signs alice's ciphertext as mallory.
+    let body: Message = serde_json::from_slice(&msg.body.0).unwrap();
+    let resigned = mallory.me().sign_doc("message", &body);
+    let got = receive(&b, &resigned, 0);
+    assert!(got.is_err(), "bob accepts alice's item as sent by {}: {:?}", resigned.signer, got.map(|(_, c)| c));
+}
+
+#[test]
+fn audit_unpadded_message_and_keyring_lengths() {
+    let (a, _) = pair();
+    let len = |pw: &str| {
+        let s = send(&a.me(), &a, "bob", &Content::Item(Box::new(login("wifi", pw))), None).unwrap();
+        serde_json::from_slice::<Message>(&s.body.0).unwrap().sealed.0.len()
+    };
+    let acct = Account { id: random(), account_key: random_key() };
+    let mut k = a.clone();
+    let before = k.seal(&acct).len();
+    k.mark_verified("bob");
+    let after = k.seal(&acct).len();
+    assert!(len("12345678") == len("123456789") && before == after,
+        "message: 8-char pw {} bytes, 9-char pw {} bytes; keyring {} bytes before verifying bob, {} after", len("12345678"), len("123456789"), before, after);
+}
+
+#[test]
+fn audit_expired_owner_makes_history_unverifiable() {
+    let (mut a, mut b) = pair();
+    let (am, bm) = (a.me(), b.me());
+    let (mut v, nv) = Vault::create(&am, "Team").unwrap();
+    // Owners can't expire: a roster they signed has to stay checkable forever.
+    assert_eq!(v.grant(&am, &a, "bob", Role::Owner, Some(100), 0).err(), Some(Error::OwnerExpiry));
+    let mut log = Log::new(&nv);
+    let g = v.grant(&am, &a, "bob", Role::Owner, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut v, &log, &g, &mut a);
+    // While he is an owner, bob adds carol; later alice removes bob.
+    let carol = Keyring::new("carol");
+    b.pin_identity(&carol.identity(Kind::Human, None)).unwrap();
+    let mut vb = Vault::new(v.id);
+    vb.apply(&log.full("bob"), &mut b, 50).unwrap();
+    let g2 = vb.grant(&bm, &b, "carol", Role::Reader, None, 50).unwrap();
+    log.roster(&g2);
+    v.apply(&VaultResponse { counter: log.manifests.len() as u64, rosters: vec![g2.roster.clone()], ..Default::default() }, &mut a, 60).unwrap();
+    let r = v.revoke(&am, "bob", 200).unwrap();
+    log.roster(&r);
+    let later = Vault::new(v.id).apply(&log.full("alice"), &mut a, 300);
+    assert!(later.is_ok(), "a fresh device of the vault's creator after bob left: {later:?}");
+}
+
+#[test]
+fn audit_invite_proof_loses_to_server_prepin() {
+    let mut admin = Keyring::new("admin");
+    let (_, code) = admin.new_invite();
+    // Before the invitee signs up, the server lists a vault of its own in admin's account,
+    // roster v0 signed by its own "newbie". Syncing it pins "newbie" with no user action.
+    let mut fake = Keyring::new("newbie");
+    fake.pin_identity(&admin.identity(Kind::Human, None)).unwrap();
+    let fm = fake.me();
+    let (fv, fnv) = Vault::create(&fm, "Welcome").unwrap();
+    let mut log = Log::new(&fnv);
+    let g = fv.grant(&fm, &fake, "admin", Role::Reader, None, 0).unwrap();
+    log.roster(&g);
+    Vault::new(fv.id).apply(&log.full("admin"), &mut admin, 0).unwrap();
+    // The real newbie signs up with the code; the proof checks out.
+    let (_, s) = signup("newbie", "pw", Some(&code)).unwrap();
+    let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone() };
+    // Neither wins silently: the proof only shows that whoever held the code made
+    // this identity, and the server chose which name it's listed under.
+    let (done, conflicts) = admin.verify_invitees(&[user]);
+    assert!(done.is_empty());
+    assert_eq!(conflicts, vec!["newbie".to_string()], "the conflict is reported");
+    assert_eq!(admin.contacts["newbie"].sign_pk, fm.sign_pk(), "the earlier pin is kept until the user compares fingerprints");
+    assert!(!admin.invites.is_empty(), "the invite stays, so it verifies once the pin is fixed");
+}
+
+#[test]
+fn audit_agent_only_obeys_vaults_its_owner_signed() {
+    let mut owner = Keyring::new("alice");
+    let (_, agent) = create_agent(&mut owner, "ci-bot").unwrap();
+    let mut agent_kr = agent.keyring;
+    // A server-made "mallory" shares a vault with the agent: refused.
+    let mut mallory = Keyring::new("mallory");
+    mallory.pin_identity(&agent.request.identity).unwrap();
+    let mm = mallory.me();
+    let (mut fv, fnv) = Vault::create(&mm, "CI").unwrap();
+    let mut log = Log::new(&fnv);
+    let g = fv.grant(&mm, &mallory, "ci-bot", Role::Writer, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut fv, &log, &g, &mut mallory);
+    assert_eq!(Vault::new(fv.id).apply(&log.full("ci-bot"), &mut agent_kr, 0).err(), Some(Error::NotFromOwner));
+    // Bob's vault, which alice co-owns, shared with the agent by alice: accepted.
+    let mut bob = Keyring::new("bob");
+    bob.pin_identity(&owner.identity(Kind::Human, None)).unwrap();
+    owner.pin_identity(&bob.identity(Kind::Human, None)).unwrap();
+    let bm = bob.me();
+    let (mut bv, bnv) = Vault::create(&bm, "Infra").unwrap();
+    let mut log = Log::new(&bnv);
+    let g = bv.grant(&bm, &bob, "alice", Role::Owner, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut bv, &log, &g, &mut bob);
+    let mut av = Vault::new(bv.id);
+    av.apply(&log.full("alice"), &mut owner, 0).unwrap();
+    let g2 = av.grant(&owner.me(), &owner, "ci-bot", Role::Reader, None, 0).unwrap();
+    log.roster(&g2);
+    assert!(Vault::new(bv.id).apply(&log.full("ci-bot"), &mut agent_kr, 0).is_ok());
+}
+
+#[test]
+fn audit_delayed_rotation_undoes_a_delete() {
+    let (mut a, _) = pair();
+    let am = a.me();
+    let (mut v, nv) = Vault::create(&am, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let id = new_item_id();
+    v.put(id, login("leaked api key", "compromised"));
+    let p = v.push(&am, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+    let g = v.grant(&am, &a, "bob", Role::Reader, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut v, &log, &g, &mut a);
+    // Alice's second device, in sync.
+    let mut d2 = Vault::new(v.id);
+    d2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    // The laptop removes bob (key rotation); the server holds that back from device 2 for now.
+    let r = v.revoke(&am, "bob", 0).unwrap();
+    log.roster(&r);
+    // Device 2 deletes the item, then pulls before pushing (as sync_vault does).
+    d2.delete(id);
+    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone() };
+    d2.apply(&resp, &mut a, 0).unwrap();
+    assert!(d2.get(&id).is_none() && d2.has_changes(), "delete undone by a re-seal: item back = {:?}, pending delete = {}", d2.get(&id).map(|i| &i.title), d2.has_changes());
+}
+
+#[test]
+fn attachment_names_are_never_paths() {
+    use crate::item::safe_file_name;
+    for (name, safe) in [
+        ("passport.pdf", "passport.pdf"),
+        ("../../Library/Preferences/x.plist", "x.plist"),
+        ("/etc/passwd", "passwd"),
+        ("C:\\Windows\\evil.dll", "evil.dll"),
+        ("..", "attachment"),
+        ("dir/..", "attachment"),
+        ("", "attachment"),
+        ("a\u{1b}]52;c;x\u{7}b.txt", "a]52;c;xb.txt"),
+    ] {
+        assert_eq!(safe_file_name(name), safe, "{name:?}");
     }
 }

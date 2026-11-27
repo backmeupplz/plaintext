@@ -8,7 +8,6 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use x25519_dalek::StaticSecret;
-use zeroize::Zeroizing;
 
 use crate::Error;
 use crate::api::*;
@@ -38,6 +37,14 @@ pub struct Keyring {
     /// unless told otherwise (never a vault someone else shared).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_vault: Option<Hex>,
+    /// For an agent: the person who made it. Pinned and verified from the start,
+    /// and the only one whose vaults the agent accepts (see `Vault::apply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The newest roster version (and its hash) seen for each vault, so a new
+    /// device can't be shown a vault as it was before someone was removed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rosters: BTreeMap<Hex, (u64, B64)>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -99,6 +106,8 @@ impl Keyring {
             contacts: BTreeMap::new(),
             invites: BTreeMap::new(),
             default_vault: None,
+            owner: None,
+            rosters: BTreeMap::new(),
             extra: Default::default(),
         }
     }
@@ -110,8 +119,7 @@ impl Keyring {
     }
 
     pub fn seal(&self, account: &crate::Account) -> Vec<u8> {
-        let json = Zeroizing::new(serde_json::to_vec(self).expect("serializable"));
-        seal(&account.account_key, &ad("keyring", &[&account.id]), &json)
+        crate::seal_json(&account.account_key, &ad("keyring", &[&account.id]), self)
     }
 
     pub fn open(account: &crate::Account, blob: &[u8]) -> Result<Keyring, Error> {
@@ -152,12 +160,20 @@ impl Keyring {
 
     /// Check a user's self-signed identity and pin it.
     pub fn pin_identity(&mut self, signed: &Signed) -> Result<Identity, Error> {
-        let unverified: Identity = serde_json::from_slice(&signed.body.0).map_err(|_| Error::BadJson)?;
-        let id: Identity = verify_doc(signed, "identity", &unverified.sign_pk.0)?;
-        if signed.signer != id.username {
-            return Err(Error::BadSignature);
-        }
+        let id = check_identity(signed)?;
         self.pin(&id.username, &id.sign_pk, &id.enc_pk)?;
+        Ok(id)
+    }
+
+    /// Replace whatever is pinned for this user with `signed`, marked verified.
+    /// Only for keys confirmed out of band (a fingerprint compared in person, an
+    /// invite proof): it overrides the refusal that protects every other path.
+    pub fn repin_verified(&mut self, signed: &Signed) -> Result<Identity, Error> {
+        let id = check_identity(signed)?;
+        if id.username == self.username {
+            return Err(Error::KeyChanged(id.username));
+        }
+        self.contacts.insert(id.username.clone(), Contact { sign_pk: id.sign_pk.clone(), enc_pk: id.enc_pk.clone(), verified: true });
         Ok(id)
     }
 
@@ -178,7 +194,19 @@ impl Keyring {
         if self.default_vault.is_none() {
             self.default_vault = other.default_vault;
         }
-        self.contacts != other.contacts || self.invites != other.invites || self.default_vault != other.default_vault
+        if self.owner.is_none() {
+            self.owner.clone_from(&other.owner);
+        }
+        for (id, (v, h)) in &other.rosters {
+            if self.rosters.get(id).is_none_or(|(mine, _)| v > mine) {
+                self.rosters.insert(*id, (*v, h.clone()));
+            }
+        }
+        self.contacts != other.contacts
+            || self.invites != other.invites
+            || self.default_vault != other.default_vault
+            || self.owner != other.owner
+            || self.rosters != other.rosters
     }
 
     pub fn mark_verified(&mut self, username: &str) -> bool {
@@ -196,23 +224,42 @@ impl Keyring {
     }
 
     /// Mark users who signed up with one of our invites as verified, using the
-    /// proof only the invite link's holder could make. Returns who was verified.
-    pub fn verify_invitees(&mut self, users: &[UserInfo]) -> Vec<String> {
-        let mut done = Vec::new();
+    /// proof only the invite link's holder could make. Returns who was verified,
+    /// and the names where the proof checks out but different keys are already
+    /// pinned. Neither side wins those silently: a first-use pin is the server's
+    /// word, and an invite proof only shows that someone holding the code made
+    /// that identity, not that the name is theirs (the server lists the names).
+    /// The user settles it by comparing fingerprints; the invite stays until then.
+    pub fn verify_invitees(&mut self, users: &[UserInfo]) -> (Vec<String>, Vec<String>) {
+        let (mut done, mut conflicts) = (Vec::new(), Vec::new());
         for u in users {
             let Some(inv) = &u.invite else { continue };
             let Some(secret) = self.invites.get(&inv.id) else { continue };
             if hmac(&secret.0, &u.identity.body.0)[..] != inv.proof.0[..] {
                 continue;
             }
-            if self.pin_identity(&u.identity).is_ok() {
-                self.mark_verified(&u.identity.signer);
-                self.invites.remove(&inv.id);
-                done.push(u.identity.signer.clone());
+            match self.pin_identity(&u.identity) {
+                Ok(_) => {
+                    self.mark_verified(&u.identity.signer);
+                    self.invites.remove(&inv.id);
+                    done.push(u.identity.signer.clone());
+                }
+                Err(Error::KeyChanged(name)) => conflicts.push(name),
+                Err(_) => {}
             }
         }
-        done
+        (done, conflicts)
     }
+}
+
+/// A self-signed identity, checked: signed by its own key, under its own name.
+pub fn check_identity(signed: &Signed) -> Result<Identity, Error> {
+    let unverified: Identity = serde_json::from_slice(&signed.body.0).map_err(|_| Error::BadJson)?;
+    let id: Identity = verify_doc(signed, "identity", &unverified.sign_pk.0)?;
+    if signed.signer != id.username {
+        return Err(Error::BadSignature);
+    }
+    Ok(id)
 }
 
 /// Who sent an invite code and their fingerprint, if the code carries them.

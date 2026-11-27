@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use plaintext_core::item::{Field, Item, OldPassword, Section};
+use plaintext_core::item::{Field, Item, OldPassword, Section, safe_file_name};
 use serde_json::{Value, json};
 
 /// One vault's worth of imported items, with attachment bytes to upload.
@@ -121,8 +121,8 @@ fn onepux_item(it: &Value) -> Item {
         notes: s(d, "notesPlain"),
         favorite: it.get("favIndex").and_then(Value::as_i64).is_some_and(|i| i > 0),
         archived: s(it, "state") == "archived",
-        created: it.get("createdAt").and_then(Value::as_u64).unwrap_or_default() * 1000,
-        updated: it.get("updatedAt").and_then(Value::as_u64).unwrap_or_default() * 1000,
+        created: it.get("createdAt").and_then(Value::as_u64).unwrap_or_default().saturating_mul(1000),
+        updated: it.get("updatedAt").and_then(Value::as_u64).unwrap_or_default().saturating_mul(1000),
         tags: ov.get("tags").and_then(Value::as_array).map(|t| t.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
         ..Default::default()
     };
@@ -175,25 +175,46 @@ fn onepux_item(it: &Value) -> Item {
     item.password_history = d
         .get("passwordHistory")
         .and_then(Value::as_array)
-        .map(|h| h.iter().map(|p| OldPassword { password: s(p, "value"), changed: p.get("time").and_then(Value::as_u64).unwrap_or_default() * 1000 }).collect())
+        .map(|h| h.iter().map(|p| OldPassword { password: s(p, "value"), changed: p.get("time").and_then(Value::as_u64).unwrap_or_default().saturating_mul(1000) }).collect())
         .unwrap_or_default();
     item
 }
 
+const MAX_EXPORT_DATA: u64 = 256 << 20;
+const MAX_ATTACHMENT: u64 = 64_000_000;
+// (small in tests, so the cap is cheap to exercise)
+const MAX_ATTACHMENTS_TOTAL: u64 = if cfg!(test) { 8 << 20 } else { 512 << 20 };
+
 /// A 1Password export (.1pux: a zip with export.data and files/).
 pub fn onepux(zip_bytes: &[u8]) -> Result<Vec<Imported>, ImportError> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| err(format!("not a .1pux file ({e})")))?;
+    // Reads are capped, so a crafted zip can't inflate into all of memory.
     let mut data = String::new();
-    zip.by_name("export.data").map_err(|_| err("no export.data in the .1pux file"))?.read_to_string(&mut data).map_err(|e| err(e.to_string()))?;
+    zip.by_name("export.data")
+        .map_err(|_| err("no export.data in the .1pux file"))?
+        .take(MAX_EXPORT_DATA + 1)
+        .read_to_string(&mut data)
+        .map_err(|e| err(e.to_string()))?;
+    if data.len() as u64 > MAX_EXPORT_DATA {
+        return Err(err("export.data is larger than 256 MB"));
+    }
     let export: Value = serde_json::from_str(&data).map_err(|e| err(format!("export.data isn't valid JSON ({e})")))?;
     let mut files: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
+    let mut total = 0u64;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(|e| err(e.to_string()))?;
-        let Some(name) = f.name().strip_prefix("files/").map(String::from) else { continue };
+        let Some(name) = f.name().ok().and_then(|n| n.strip_prefix("files/").map(String::from)) else { continue };
         if let Some((doc_id, file_name)) = name.split_once("__") {
             let mut bytes = Vec::new();
-            f.read_to_end(&mut bytes).map_err(|e| err(e.to_string()))?;
-            files.insert(doc_id.to_string(), (file_name.trim_start_matches('_').to_string(), bytes));
+            (&mut f).take(MAX_ATTACHMENT + 1).read_to_end(&mut bytes).map_err(|e| err(e.to_string()))?;
+            if bytes.len() as u64 > MAX_ATTACHMENT {
+                return Err(err(format!("{file_name} is larger than 64 MB, the most an attachment can be")));
+            }
+            total += bytes.len() as u64;
+            if total > MAX_ATTACHMENTS_TOTAL {
+                return Err(err("the attachments add up to more than 512 MB; import them in smaller exports"));
+            }
+            files.insert(doc_id.to_string(), (safe_file_name(file_name.trim_start_matches('_')), bytes));
         }
     }
     let mut out = Vec::new();
@@ -348,7 +369,9 @@ pub fn to_bitwarden(items: &[&Item]) -> Value {
 
 // ---------- CSV ----------
 
-/// RFC 4180 rows: quoted fields may hold commas, quotes ("") and newlines.
+/// RFC 4180 rows: quoted fields may hold commas, quotes ("") and newlines. A
+/// quote inside an unquoted field is just a character (as most exporters mean
+/// it), so one stray quote can't swallow the rows after it into one password.
 fn csv_rows(text: &str) -> Vec<Vec<String>> {
     let (mut rows, mut row, mut cell) = (Vec::new(), Vec::new(), String::new());
     let mut chars = text.trim_start_matches('\u{feff}').chars().peekable();
@@ -361,7 +384,7 @@ fn csv_rows(text: &str) -> Vec<Vec<String>> {
             }
             (true, '"') => quoted = false,
             (true, c) => cell.push(c),
-            (false, '"') => quoted = true,
+            (false, '"') if cell.is_empty() => quoted = true,
             (false, ',') => row.push(std::mem::take(&mut cell)),
             (false, '\r') => {}
             (false, '\n') => {
@@ -393,6 +416,9 @@ pub fn csv(text: &str) -> Result<Vec<Imported>, ImportError> {
     let notes = col(&["notes", "note", "extra", "comment"]);
     let totp = col(&["otpauth", "totp", "login_totp", "otp", "otp_auth"]);
     let tags = col(&["tags", "folder", "grouping"]);
+    // Bitwarden's custom fields: "name: value" lines. The CSV doesn't say which
+    // are secret, so they all come in concealed.
+    let custom = col(&["fields"]);
     let fav = col(&["favorite", "fav"]);
     if pass.is_none() && notes.is_none() {
         return Err(err("couldn't find a password or notes column in the header"));
@@ -416,6 +442,17 @@ pub fn csv(text: &str) -> Result<Vec<Imported>, ImportError> {
         if it.title.is_empty() {
             it.title = url_v.split("//").nth(1).unwrap_or(&url_v).split('/').next().unwrap_or_default().to_string();
         }
+        let fields: Vec<Field> = get(r, custom)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let (k, v) = l.split_once(':').unwrap_or(("field", l));
+                field(k.trim(), "concealed", v.trim().to_string())
+            })
+            .collect();
+        if !fields.is_empty() {
+            it.sections.push(Section { title: String::new(), fields });
+        }
         items.push((it, vec![]));
     }
     Ok(vec![Imported { name: String::new(), items }])
@@ -425,6 +462,58 @@ pub fn csv(text: &str) -> Result<Vec<Imported>, ImportError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn csv_stray_quotes_and_bitwarden_fields() {
+        // A quote in an unquoted cell is just a character, not the start of a
+        // quoted run that swallows the next rows into one password.
+        let t = "name,url,username,password\nA,https://a.example,alice,pa\"ss1\nB,https://b.example,bob,secret-b\nC,,carol,\"ok,2\"\n";
+        let items = &csv(t).unwrap()[0].items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0.password, "pa\"ss1");
+        assert_eq!(items[2].0.password, "ok,2");
+        let bw = "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\n,,login,Bank PIN,,\"PIN: 4831\nSecurity answer: tuesday\",0,https://bank.example,me,pw,\n";
+        let it = &csv(bw).unwrap()[0].items[0].0;
+        assert_eq!(it.field("PIN"), Some("4831"));
+        assert_eq!(it.field("Security answer"), Some("tuesday"));
+        assert_eq!(it.sections[0].fields[0].kind, "concealed");
+    }
+
+    #[test]
+    fn onepux_is_capped_and_names_are_safe() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let o = zip::write::SimpleFileOptions::default();
+            z.start_file("export.data", o).unwrap();
+            z.write_all(br#"{"accounts":[{"vaults":[{"attrs":{"name":"V"},"items":[{"createdAt":18446744073709551615,"overview":{"title":"t"},"details":{"documentAttributes":{"documentId":"d1"}}}]}]}]}"#).unwrap();
+            z.start_file("files/d1__../../evil.plist", o).unwrap();
+            z.write_all(b"x").unwrap();
+            z.finish().unwrap();
+        }
+        let got = onepux(&buf).unwrap();
+        let (it, files) = &got[0].items[0];
+        assert_eq!(it.created, u64::MAX, "no overflow panic");
+        assert_eq!(files[0].0, "evil.plist");
+        // Many big entries add up: refused before they fill memory.
+        let mut big = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut big));
+            let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            z.start_file("export.data", o).unwrap();
+            z.write_all(b"{}").unwrap();
+            let chunk = vec![0u8; 1 << 20];
+            for n in 0..3 {
+                z.start_file(format!("files/d{n}__f{n}"), o).unwrap();
+                for _ in 0..4 {
+                    z.write_all(&chunk).unwrap();
+                }
+            }
+            z.finish().unwrap();
+        }
+        assert!(onepux(&big).is_err());
+    }
 
     #[test]
     fn csv_formats() {

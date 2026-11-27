@@ -52,22 +52,44 @@ fn arg<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
     a.get(k).and_then(Value::as_str)
 }
 
+use plaintext_client::plaintext_core::item::SECRET_KINDS;
+
 fn hide(item: &Item, vault: &str) -> Value {
     let reference = |f: &str| format!("pt://{vault}/{}/{f}", item.title);
     let mut fields = vec![];
     for s in &item.sections {
         for f in &s.fields {
-            let v = if f.kind == "concealed" { json!({"secret": reference(&f.label)}) } else { json!(f.value) };
+            let v = if SECRET_KINDS.contains(&f.kind.as_str()) { json!({"secret": reference(&f.label)}) } else { json!(f.value) };
             fields.push(json!({"label": f.label, "value": v}));
         }
     }
+    // Notes hold recovery codes, keys and the like as often as not, and are the
+    // whole secret of a secure note: a reference too.
     json!({
         "title": item.title, "kind": item.kind, "vault": vault, "username": item.username, "urls": item.urls,
         "password": (!item.password.is_empty()).then(|| reference("password")),
         "one_time_code": (!item.totp.is_empty()).then(|| reference("totp")),
-        "fields": fields, "tags": item.tags, "notes": item.notes,
+        "fields": fields, "tags": item.tags,
+        "notes": (!item.notes.is_empty()).then(|| reference("notes")),
         "files": item.files.iter().map(|f| &f.name).collect::<Vec<_>>(),
     })
+}
+
+/// A secret as it may appear in a command's output: as is, base64-encoded (as in
+/// an HTTP Basic header, alone or as `username:secret`), or percent-encoded.
+fn spellings(secret: &str, username: &str) -> Vec<String> {
+    use base64::Engine;
+    let e = base64::engine::general_purpose::STANDARD;
+    let u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut out = vec![secret.to_string()];
+    for raw in [secret.to_string(), format!("{username}:{secret}")] {
+        out.push(e.encode(&raw));
+        out.push(e.encode(&raw).trim_end_matches('=').to_string());
+        out.push(u.encode(&raw));
+    }
+    let pct: String = secret.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+    out.push(pct);
+    out
 }
 
 fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
@@ -85,7 +107,14 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
         }
         "search_items" => {
             let hits: Vec<Value> = match arg(a, "query") {
-                Some(q) => s.find(q, vault.as_ref()).into_iter().map(|(v, _, i)| json!({"title": i.title, "vault": s.vaults[&v].meta.name, "username": i.username, "urls": i.urls, "kind": i.kind})).collect(),
+                // Only on what the model may see: searching notes or secret fields would
+                // let it learn them a character at a time.
+                Some(q) => s
+                    .vaults
+                    .iter()
+                    .filter(|(id, _)| vault.is_none_or(|w| w == **id))
+                    .flat_map(|(_, v)| v.items().filter(|(_, i)| i.matches_shown(q)).map(move |(_, i)| json!({"title": i.title, "vault": v.meta.name, "username": i.username, "urls": i.urls, "kind": i.kind})))
+                    .collect(),
                 None => s
                     .vaults
                     .iter()
@@ -96,6 +125,7 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
             serde_json::to_string_pretty(&hits)?
         }
         "get_item" => {
+            // (secret values come back as pt:// references; see `hide`)
             let (vid, _, it) = s.one(arg(a, "item").ok_or("item is required")?, vault.as_ref())?;
             serde_json::to_string_pretty(&hide(&it, &s.vaults[&vid].meta.name))?
         }
@@ -112,11 +142,14 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
             let mut secrets = Vec::new();
             for (k, r) in env {
                 let v = crate::resolve(s, &r)?;
-                secrets.push(v.clone());
+                let username = crate::resolve(s, &format!("{}/username", r.rsplit_once('/').map_or(r.as_str(), |(item, _)| item))).unwrap_or_default();
+                secrets.extend(spellings(&v, &username));
                 c.env(k, v);
             }
             let out = c.output()?;
             let mut text = format!("exit code {}\n{}{}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            // Longest first, so a secret inside a longer encoded form doesn't break the match.
+            secrets.sort_by_key(|v| std::cmp::Reverse(v.len()));
             for v in secrets.iter().filter(|v| v.len() >= 4) {
                 text = text.replace(v.as_str(), "[secret]");
             }
@@ -158,6 +191,11 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
 }
 
 pub fn serve() -> Res<()> {
+    // Only ever as an agent: a person's own session would hand the model every
+    // vault they have, so it isn't offered here (it's tied to a terminal anyway).
+    if std::env::var("PLAINTEXT_AGENT_KEY").is_err() {
+        return Err("plaintext mcp runs as an agent: set PLAINTEXT_SERVER and PLAINTEXT_AGENT_KEY (make a key with `plaintext agent create NAME --vault VAULT`)".into());
+    }
     let mut s = state::open()?;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
@@ -196,4 +234,20 @@ pub fn serve() -> Res<()> {
         out.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scrubs_encoded_secrets() {
+        let curl_v = "> Authorization: Basic YWxpY2U6aHVudGVyMi1pcy1sb25n\n> GET /?token=s3cr%3At HTTP/1.1";
+        let mut text = curl_v.to_string();
+        let mut all = super::spellings("hunter2-is-long", "alice");
+        all.extend(super::spellings("s3cr:t", ""));
+        all.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        for v in all.iter().filter(|v| v.len() >= 4) {
+            text = text.replace(v.as_str(), "[secret]");
+        }
+        assert!(!text.contains("YWxpY2U6aHVudGVyMi1pcy1sb25n") && !text.contains("s3cr%3At"), "{text}");
+    }
 }

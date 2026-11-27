@@ -250,7 +250,10 @@ fn lying_server_and_hostile_users() {
     assert!(!a3.vaults.contains_key(&mine) && a3.hidden.contains_key(&mine));
     a3.t.hide.set(None);
     *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
-    assert!(matches!(a3.sync(), Err(Error::Core(plaintext_core::Error::Rollback))));
+    // Caught and reported; the vault keeps its last verified state.
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a3.problems);
+    assert!(a3.vaults[&mine].items().any(|(_, i)| i.password == "added-later"));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -307,6 +310,17 @@ fn secret_key_survives_a_failed_login_after_signup() {
     assert!(s.admin, "the account was created, as the server's first");
 }
 
+#[test]
+fn plain_http_only_on_local_networks() {
+    for ok in ["https://vault.example.com", "http://localhost:8080", "http://127.0.0.1:1", "http://192.168.1.5", "http://10.0.0.2:8080",
+        "http://100.101.102.103", "http://nas.local", "http://vault.tail1234.ts.net", "http://plaintext:8080", "http://[::1]:8080", "http://[fd00::1]"] {
+        assert!(!insecure_url(ok), "{ok}");
+    }
+    for bad in ["http://vault.example.com", "http://8.8.8.8", "http://100.128.0.1", "ftp://x", "vault.example.com", "http://[2001:db8::1]"] {
+        assert!(insecure_url(bad), "{bad}");
+    }
+}
+
 /// What a client behind a reverse proxy sees: its own name for the server.
 struct Named(Http, &'static str);
 
@@ -318,4 +332,174 @@ impl Transport for Named {
     fn host(&self) -> String {
         self.1.into()
     }
+}
+
+// ---------- Attacks from the 2026-11 security audit, over real HTTP; each must stay fixed ----------
+
+use plaintext_core::api::{Kind, UserInfo, VaultPut};
+use plaintext_core::identity::Keyring;
+
+/// A server that lists a vault of its own making in the account (hiding the real ones)
+/// and answers for it; pushes to it are kept, not stored.
+struct Forge {
+    inner: Http,
+    id: Hex,
+    first: VaultResponse,
+    pushed: std::cell::RefCell<Vec<VaultPut>>,
+}
+
+impl Transport for Forge {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        if path.starts_with(&format!("/v1/vaults/{}", self.id)) {
+            return Ok(match method {
+                "GET" if path.contains("since=0") => (200, serde_json::to_vec(&self.first).unwrap()),
+                "GET" => (200, serde_json::to_vec(&VaultResponse { counter: self.first.counter, ..Default::default() }).unwrap()),
+                _ => {
+                    self.pushed.borrow_mut().push(serde_json::from_slice(&body.unwrap()).unwrap());
+                    (204, vec![])
+                }
+            });
+        }
+        let (status, bytes) = self.inner.send(method, path, token, body)?;
+        if method == "GET" && path == "/v1/account" && status == 200 {
+            let mut acct: AccountResponse = serde_json::from_slice(&bytes).unwrap();
+            acct.vaults = vec![self.id];
+            return Ok((status, serde_json::to_vec(&acct).unwrap()));
+        }
+        Ok((status, bytes))
+    }
+    fn host(&self) -> String {
+        self.inner.host()
+    }
+}
+
+#[test]
+fn audit_agent_session_trusts_a_vault_the_server_made() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let ci = alice.create_vault("CI").unwrap();
+    alice.put_item(&ci, plaintext_core::new_item_id(), item("Deploy token", "real-deploy-token")).unwrap();
+    let key = alice.create_agent("ci-bot").unwrap();
+    alice.share_vault(&ci, "ci-bot", Role::Writer, None).unwrap();
+
+    // The server builds its own "alice" and its own "CI" vault with the real agent as a writer.
+    let agent_id: UserInfo = alice.call("GET", "/v1/users/ci-bot", NONE).unwrap();
+    let mut fake = Keyring::new("alice");
+    fake.pin_identity(&agent_id.identity).unwrap();
+    let fm = fake.me();
+    let (mut fv, fnv) = Vault::create(&fm, "CI").unwrap();
+    let g = fv.grant(&fm, &fake, "ci-bot", Role::Writer, None, now()).unwrap();
+    fv.apply(&VaultResponse { counter: 1, rosters: vec![g.roster.clone()], ..Default::default() }, &mut fake, now()).unwrap();
+    fv.put(plaintext_core::new_item_id(), item("Deploy token", "attacker-deploy-token"));
+    let p = fv.push(&fm, now()).unwrap();
+    fv.pushed(&p);
+    let first = VaultResponse {
+        counter: 2,
+        manifests: vec![fnv.manifest.clone(), p.manifest.clone()],
+        rosters: vec![fnv.roster.clone(), g.roster.clone()],
+        key: Some(g.keys[0].key.clone()),
+        items: p.upserts.clone(),
+    };
+    let forge = Forge { inner: Http::new(&url), id: fv.id, first, pushed: Default::default() };
+
+    // Exactly the CLI's agent path (state::open with PLAINTEXT_AGENT_KEY): log in, sync, no local state.
+    // The agent knows its owner's real keys from the start, so the look-alike vault is refused.
+    let mut agent = Session::login(forge, &derive_agent(&key), "agent").unwrap();
+    agent.sync().unwrap();
+    assert!(agent.problems.iter().any(|p| p.contains("wasn't updated") && p.contains("alice")), "{:?}", agent.problems);
+    assert!(agent.vault("CI").is_err(), "nothing named CI is usable");
+    assert!(agent.t.pushed.borrow().is_empty(), "nothing was written to the server's vault");
+}
+
+#[test]
+fn audit_hidden_default_vault_sends_new_items_to_a_shared_vault() {
+    let (url, _) = server();
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+
+    // The server stops listing alice's Personal vault; she adds a login without naming a vault.
+    let mut a2 = Session::login(evil(&url), &derive("alice pw", &ask), "laptop").unwrap();
+    a2.t.hide.set(Some(personal));
+    a2.sync().unwrap();
+    // No silent fallback to Family (shared with bob): the user has to pick a vault.
+    assert!(matches!(a2.default_vault(), Err(Error::NotFound(_))), "default_vault() picked {:?} (Family: {fam:?})", a2.default_vault());
+    bob.sync().unwrap();
+    assert_eq!(alice.default_vault().unwrap(), personal);
+}
+
+/// A server that answers a directory lookup with an identity of its own.
+struct Lookup(Http, &'static str, plaintext_core::api::Signed);
+
+impl Transport for Lookup {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        if method == "GET" && path == format!("/v1/users/{}", self.1) {
+            let u = UserInfo { identity: self.2.clone(), admin: true, disabled: false, invite: None };
+            return Ok((200, serde_json::to_vec(&u).unwrap()));
+        }
+        self.0.send(method, path, token, body)
+    }
+    fn host(&self) -> String {
+        self.0.host()
+    }
+}
+
+#[test]
+fn audit_signup_drops_secret_key_after_creating_the_account() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let liar = Lookup(Http::new(&url), "alice", Keyring::new("alice").identity(Kind::Human, None));
+    // The account exists either way, so signup hands back the Secret Key; checking the
+    // inviter is a separate step that fails without pinning the server's "alice".
+    let (sk, bob) = Session::signup(liar, "bob", "bob pw", Some(&code), "phone").unwrap();
+    let mut bob = bob.unwrap();
+    assert!(matches!(bob.trust_inviter(&code), Err(Error::Core(plaintext_core::Error::KeyChanged(u))) if u == "alice"));
+    assert!(!bob.keyring.contacts.contains_key("alice"), "the server's alice was not pinned");
+    login(&url, "bob pw", &sk);
+}
+
+/// A server's redirect isn't followed (it could point a request, or a share
+/// link's fetch, anywhere), and a silent server times out instead of hanging.
+#[test]
+fn no_redirects() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten().take(1) {
+            let mut buf = [0u8; 1024];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/admin\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    let r = open_link(&Http::new(&url), &Hex([1; 16]), &"00".repeat(32));
+    assert!(matches!(r, Err(Error::Server(302, _))), "{r:?}");
+}
+
+/// Anyone can share a vault with an agent. It refuses ones its owner didn't
+/// sign for, and that refusal mustn't stop it from syncing its owner's vaults.
+#[test]
+fn a_stranger_s_vault_doesnt_jam_an_agent() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let ci = alice.create_vault("CI").unwrap();
+    alice.put_item(&ci, plaintext_core::new_item_id(), item("Deploy token", "real-deploy-token")).unwrap();
+    let key = alice.create_agent("ci-bot").unwrap();
+    alice.share_vault(&ci, "ci-bot", Role::Reader, None).unwrap();
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    let junk = bob.create_vault("CI").unwrap();
+    bob.put_item(&junk, plaintext_core::new_item_id(), item("Deploy token", "bobs-token")).unwrap();
+    bob.share_vault(&junk, "ci-bot", Role::Writer, None).unwrap();
+
+    let mut agent = Session::login(Http::new(&url), &derive_agent(&key), "agent").unwrap();
+    agent.sync().unwrap();
+    assert_eq!(agent.one("deploy token", None).unwrap().2.password, "real-deploy-token");
+    assert!(agent.problems.iter().any(|p| p.contains("wasn't updated")), "{:?}", agent.problems);
+    assert_eq!(agent.vaults.len(), 1, "the stranger's vault isn't listed as usable");
 }

@@ -48,7 +48,11 @@ plaintext import 1pux ~/Downloads/export.1pux    # also: bitwarden, csv
 
 You can have accounts on several servers, such as your family's and a work one. Each `signup` or `signin` adds an account and makes it the default. `plaintext account ls` lists them, `plaintext account use NAME` switches, and `--account alice@vault.example.com` (or `PLAINTEXT_ACCOUNT`) picks one for a single command.
 
-Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). `plaintext lock` forgets the session. On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
+Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
+
+- **Per terminal.** Unlocking lasts 12 hours, and only in the terminal you unlocked in, like `sudo`. A command with no terminal, such as a script, a background job, or anything an AI tool runs, can't use it and should use an agent key.
+- **Locking.** `plaintext lock` ends the session on the server too.
+- **Secrets stay out of arguments.** Pass `--password` with no value to be asked (or to read it from stdin), because other users of the computer can see arguments. `plaintext` refuses plain `http://` except on your own machine and private networks.
 
 ## Agents
 
@@ -66,7 +70,7 @@ DATABASE_URL="pt://Infra/Prod DB/password" plaintext run -- ./migrate
 plaintext inject -i config.tpl -o config.yml       # {{ pt://Infra/Prod DB/password }}
 ```
 
-`plaintext mcp` is a Model Context Protocol server for AI agents. It can search items and read their non-secret fields, run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It doesn't hand secret values to the model unless `PLAINTEXT_MCP_REVEAL=1`, which keeps them out of transcripts by accident; a model that runs commands can still reach anything in the vaults its agent account can read, so give agents only the vaults they need. Every agent read is in the vault's audit log (`plaintext vault audit Infra`).
+`plaintext mcp` is a Model Context Protocol server for AI agents, and it runs only with an agent key (`PLAINTEXT_SERVER` and `PLAINTEXT_AGENT_KEY`), never with your own session. It can search items and read their non-secret fields (passwords, hidden fields, keys, card numbers and notes come back as `pt://` references), run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It doesn't hand secret values to the model unless `PLAINTEXT_MCP_REVEAL=1`, which keeps them out of transcripts by accident; a model that runs commands can still reach anything in the vaults its agent account can read, so give agents only the vaults they need. Every agent read is in the vault's audit log (`plaintext vault audit Infra`).
 
 ## Develop
 

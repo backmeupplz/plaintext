@@ -66,8 +66,14 @@ pub struct Vault {
     pub counter: u64,
     last: B64,
     entries: BTreeMap<Hex, Entry>,
-    /// For locally edited items: the hash of the version the edit started from.
+    /// For locally edited items: the hash of the version the edit started from,
+    /// and of its content (so a re-seal under a new key isn't mistaken for an edit).
     base: BTreeMap<Hex, B64>,
+    #[serde(default)]
+    base_content: BTreeMap<Hex, B64>,
+    /// Some roster version was signed by the agent's owner (see `apply`).
+    #[serde(default)]
+    owner_signed: bool,
     dirty: BTreeSet<Hex>,
     deleted: BTreeSet<Hex>,
     meta_dirty: bool,
@@ -93,6 +99,11 @@ fn active(m: &Member, now: u64) -> bool {
     m.expires.is_none_or(|e| now < e)
 }
 
+fn content_hash(item: &Item) -> B64 {
+    h(&Zeroizing::new(serde_json::to_vec(item).expect("serializable")))
+}
+
+
 impl Vault {
     /// A vault this device knows only by id; the first `apply` fills it in.
     pub fn new(id: Hex) -> Vault {
@@ -108,6 +119,8 @@ impl Vault {
             last: B64::default(),
             entries: BTreeMap::new(),
             base: BTreeMap::new(),
+            base_content: BTreeMap::new(),
+            owner_signed: false,
             dirty: BTreeSet::new(),
             deleted: BTreeSet::new(),
             meta_dirty: false,
@@ -157,23 +170,27 @@ impl Vault {
         self.entries.get(id).map(|e| &e.item)
     }
 
-    pub fn put(&mut self, id: Hex, item: Item) {
+    /// Remember what an edit or delete started from (once per pending change).
+    fn mark_base(&mut self, id: Hex) {
         if let Some(e) = self.entries.get(&id)
             && !self.dirty.contains(&id)
+            && !self.deleted.contains(&id)
         {
             self.base.insert(id, h(&e.blob));
+            self.base_content.insert(id, content_hash(&e.item));
         }
+    }
+
+    pub fn put(&mut self, id: Hex, item: Item) {
+        self.mark_base(id);
         self.entries.insert(id, Entry { item, blob: Vec::new() });
         self.dirty.insert(id);
         self.deleted.remove(&id);
     }
 
     pub fn delete(&mut self, id: Hex) {
-        if let Some(e) = self.entries.remove(&id)
-            && !self.dirty.contains(&id)
-        {
-            self.base.insert(id, h(&e.blob));
-        }
+        self.mark_base(id);
+        self.entries.remove(&id);
         self.dirty.remove(&id);
         self.deleted.insert(id);
     }
@@ -200,12 +217,23 @@ impl Vault {
         }
     }
 
-    /// Verify a server response and merge it. Nothing changes unless all of it
-    /// checks out. May pin new members' keys in `keyring`; returns true if it did
-    /// (sync the keyring then).
+    /// Verify a server response and merge it. Nothing changes, the keyring
+    /// included, unless all of it checks out. May pin new members' keys and record
+    /// the newest roster in `keyring`; returns true if it did (sync the keyring then).
     pub fn apply(&mut self, resp: &VaultResponse, keyring: &mut Keyring, now: u64) -> Result<bool, Error> {
+        let mut kr = keyring.clone();
+        let changed = self.apply_with(resp, &mut kr, now)?;
+        if changed {
+            *keyring = kr;
+        }
+        Ok(changed)
+    }
+
+    fn apply_with(&mut self, resp: &VaultResponse, keyring: &mut Keyring, now: u64) -> Result<bool, Error> {
         let me = keyring.me();
         let mut kr_changed = false;
+        let checkpoint = keyring.rosters.get(&self.id).cloned();
+        let mut owner_signed = self.owner_signed;
 
         // 1. Roster chain.
         let mut roster = self.roster.clone();
@@ -217,18 +245,29 @@ impl Vault {
             if r.vault_id != self.id {
                 return Err(Error::Tampered);
             }
+            // Owners never expire, so who signed each version stays checkable
+            // on any device at any later time.
             let signer = match &roster {
                 None if r.version == 0 && r.prev.0.is_empty() => r.members.iter().find(|m| m.username == s.signer),
-                Some(prev) if r.version == prev.version + 1 && r.prev == roster_hash => {
-                    prev.members.iter().find(|m| m.username == s.signer && active(m, now))
-                }
+                Some(prev) if r.version == prev.version + 1 && r.prev == roster_hash => prev.members.iter().find(|m| m.username == s.signer),
                 _ => return Err(Error::Rollback),
             };
             let signer = signer.filter(|m| m.role == Role::Owner).ok_or(Error::BadSignature)?;
+            if r.members.iter().any(|m| m.role == Role::Owner && m.expires.is_some()) {
+                return Err(Error::OwnerExpiry);
+            }
+            // A v0 signer's key comes from the roster itself: it must match any pin.
+            if keyring.sign_pk(&s.signer).is_some_and(|pk| pk != signer.sign_pk.0) {
+                return Err(Error::KeyChanged(s.signer.clone()));
+            }
+            verify_doc::<Roster>(s, "roster", &signer.sign_pk.0)?;
+            if checkpoint.as_ref().is_some_and(|(v, ch)| *v == r.version && *ch != h(&s.body.0)) {
+                return Err(Error::Rollback);
+            }
             for m in &r.members {
                 kr_changed |= keyring.pin(&m.username, &m.sign_pk, &m.enc_pk)?;
             }
-            verify_doc::<Roster>(s, "roster", &signer.sign_pk.0)?;
+            owner_signed |= keyring.owner.as_deref() == Some(s.signer.as_str());
             if r.version == 0 {
                 creator = s.signer.clone();
             }
@@ -239,6 +278,20 @@ impl Vault {
         let roster = roster.ok_or(Error::NotMember)?;
         if !roster.members.iter().any(|m| m.username == me.username && active(m, now)) {
             return Err(Error::NotMember);
+        }
+        // Another device of this account has seen a newer roster (say, a removal):
+        // a server showing this device an older one is hiding it.
+        if checkpoint.as_ref().is_some_and(|(v, _)| roster.version < *v) {
+            return Err(Error::Rollback);
+        }
+        if checkpoint.as_ref().is_none_or(|(v, _)| roster.version > *v) {
+            keyring.rosters.insert(self.id, (roster.version, roster_hash.clone()));
+            kr_changed = true;
+        }
+        // An agent obeys its owner only: a vault counts if its owner signed some
+        // version of its roster, which no server can fake.
+        if keyring.owner.is_some() && !owner_signed {
+            return Err(Error::NotFromOwner);
         }
 
         // 2. Vault key for the current epoch, checked against the owner's commitment.
@@ -292,6 +345,7 @@ impl Vault {
             self.roster_hash = roster_hash;
             self.versions = versions;
             self.creator = creator;
+            self.owner_signed = owner_signed;
             return Ok(kr_changed);
         };
         // Demotion and removal replace the key, so anything under the current
@@ -312,19 +366,28 @@ impl Vault {
             received.insert(ib.id, Entry { item, blob: ib.blob.0.clone() });
         }
         let pending = |id: &Hex| self.dirty.contains(id) || self.deleted.contains(id);
+        let blob_changed = |id: &Hex, hash: &B64| self.base.get(id).is_some_and(|b| b != hash);
         for (id, hash) in &m.items {
-            if !pending(id) && !received.contains_key(id) && self.entries.get(id).is_none_or(|e| h(&e.blob) != *hash) {
+            // Every changed item must come with its blob, including ones edited
+            // here: otherwise the other edit would vanish instead of conflicting.
+            let have = if pending(id) { !blob_changed(id, hash) } else { self.entries.get(id).is_some_and(|e| h(&e.blob) == *hash) };
+            if !have && !received.contains_key(id) {
                 return Err(Error::ManifestMismatch);
             }
         }
 
         // 5. Merge. Local unpushed edits win; if the server's copy also changed
-        //    since the edit began, it's kept as a conflict copy.
+        //    since the edit began, it's kept as a conflict copy. A blob that was
+        //    only re-sealed (a key rotation) is not a change.
         let mut next = BTreeMap::new();
         let mut conflicts = Vec::new();
         let mut deleted = self.deleted.clone();
         for (id, hash) in &m.items {
-            let changed_remotely = self.base.get(id).is_some_and(|b| b != hash);
+            let changed_remotely = blob_changed(id, hash)
+                && match (received.get(id), self.base_content.get(id)) {
+                    (Some(e), Some(c)) => content_hash(&e.item) != *c,
+                    _ => true,
+                };
             if self.dirty.contains(id) {
                 if changed_remotely && let Some(e) = received.remove(id) {
                     conflicts.push(e.item);
@@ -361,6 +424,7 @@ impl Vault {
         self.roster_hash = roster_hash;
         self.versions = versions;
         self.creator = creator;
+        self.owner_signed = owner_signed;
         self.key = Some(key);
         self.counter = counter;
         self.last = last;
@@ -407,11 +471,13 @@ impl Vault {
             if self.entries.get(&u.id).is_some_and(|e| e.blob == u.blob.0) {
                 self.dirty.remove(&u.id);
                 self.base.remove(&u.id);
+                self.base_content.remove(&u.id);
             }
         }
         for d in &put.deletes {
             self.deleted.remove(d);
             self.base.remove(d);
+            self.base_content.remove(d);
         }
         self.meta_dirty = false;
     }
@@ -429,6 +495,9 @@ impl Vault {
     /// Add someone (or change their role or expiry). Their keys must already be
     /// pinned in `keyring`, which is what makes this safe against a key swap.
     pub fn grant(&self, me: &Me, keyring: &Keyring, username: &str, role: Role, expires: Option<u64>, now: u64) -> Result<RosterUpdate, Error> {
+        if role == Role::Owner && expires.is_some() {
+            return Err(Error::OwnerExpiry);
+        }
         let c = keyring.contacts.get(username).ok_or(Error::UnknownUser(username.into()))?;
         let member = Member { username: username.into(), sign_pk: c.sign_pk.clone(), enc_pk: c.enc_pk.clone(), role, expires };
         let mut r = self.next_roster(me, now)?;

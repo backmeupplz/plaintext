@@ -9,7 +9,7 @@ use plaintext_client::plaintext_core::Account;
 use plaintext_client::plaintext_core::api::Hex;
 use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent, server_host};
 use plaintext_client::plaintext_core::vault::Vault;
-use plaintext_client::{Error, Http, Session, now};
+use plaintext_client::{Error, Http, Session, Transport, now};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -48,6 +48,32 @@ struct Stored {
     account_id: String,
     account_key: String,
     until: u64,
+    /// The terminal it was unlocked in (see `terminal`).
+    #[serde(default)]
+    terminal: Option<String>,
+}
+
+/// The terminal this process runs in: the terminal device on stdin, stdout or
+/// stderr, plus the login session. The unlocked session works only there (like
+/// sudo's per-terminal tickets), so processes with no terminal, such as an MCP
+/// server's commands, background jobs or anything an AI agent runs through
+/// pipes, can't use it to reach this person's vaults; they need an agent key.
+#[cfg(unix)]
+fn terminal() -> Option<String> {
+    use std::os::fd::AsRawFd;
+    let fds = [std::io::stdin().as_raw_fd(), std::io::stdout().as_raw_fd(), std::io::stderr().as_raw_fd()];
+    let fd = fds.into_iter().find(|fd| unsafe { libc::isatty(*fd) } == 1)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(format!("{}:{}", st.st_rdev, unsafe { libc::getsid(0) }))
+}
+
+// ponytail: no per-terminal binding on Windows yet; the session is per user there.
+#[cfg(not(unix))]
+fn terminal() -> Option<String> {
+    Some("console".into())
 }
 
 pub fn home() -> PathBuf {
@@ -170,40 +196,74 @@ pub fn save_secret_key(cfg: &Config, sk: &SecretKey) -> Res<()> {
 pub fn secret_key(cfg: &Config) -> Res<SecretKey> {
     let s = match entry(cfg, "secret-key")?.get() {
         Ok(s) => s,
-        Err(_) => rpassword::prompt_password("Secret Key (A1-…): ")?,
+        Err(_) => prompt("Secret Key (A1-…): ")?.to_string(),
     };
     let sk = SecretKey::parse(&s)?;
     save_secret_key(cfg, &sk)?;
     Ok(sk)
 }
 
+/// Keep the unlocked session for this terminal, ending the one it replaces
+/// (unlocked in another terminal, say) so no older token stays live.
 pub fn remember(cfg: &Config, s: &S) -> Res<()> {
+    forget(cfg);
     let stored = Stored {
         token: s.token.clone(),
         account_id: hex::encode(s.account.id),
         account_key: hex::encode(&s.account.account_key[..]),
         until: now() + UNLOCKED_FOR,
+        terminal: terminal(),
     };
     entry(cfg, "session")?.set(&serde_json::to_string(&stored)?)?;
     Ok(())
 }
 
+/// Forget the unlocked session on this computer and end it on the server, so the
+/// token stops working even if a copy of it survives somewhere.
 pub fn forget(cfg: &Config) {
-    if let Ok(e) = entry(cfg, "session") {
-        e.delete();
+    let Ok(e) = entry(cfg, "session") else { return };
+    if let Ok(raw) = e.get().map(Zeroizing::new)
+        && let Ok(st) = serde_json::from_str::<Stored>(&raw)
+        && let Ok(h) = http(&cfg.server)
+    {
+        // Best effort: an unreachable server still gets the local copy removed.
+        let _ = h.send("POST", "/v1/logout", Some(&st.token), None);
     }
+    e.delete();
+}
+
+/// A connection to an account's server, refusing plain http:// across the internet.
+pub fn http(server: &str) -> Res<Http> {
+    if plaintext_client::insecure_url(server) {
+        return Err(format!("{server} isn't https://. Plain http:// is only allowed on this machine and private networks, because anyone on the way could take over the sign-in.").into());
+    }
+    Ok(Http::new(server))
 }
 
 fn resume(cfg: &Config) -> Option<S> {
     let raw = Zeroizing::new(entry(cfg, "session").ok()?.get().ok()?);
     let st: Stored = serde_json::from_str(&raw).ok()?;
     if st.until <= now() {
+        // Expired: don't leave the Account Key and a live token lying around.
+        forget(cfg);
+        return None;
+    }
+    // Unlocked in another terminal (or this process has none): ask again here.
+    if st.terminal.is_none() || st.terminal != terminal() {
         return None;
     }
     let mut id = [0u8; 16];
     hex::decode_to_slice(&st.account_id, &mut id).ok()?;
     let key: [u8; 32] = hex::decode(&st.account_key).ok()?.try_into().ok()?;
-    Session::resume(Http::new(&cfg.server), st.token, Account { id, account_key: Zeroizing::new(key) }).ok()
+    Session::resume(http(&cfg.server).ok()?, st.token, Account { id, account_key: Zeroizing::new(key) }).ok()
+}
+
+/// Ask at the terminal. Without one (a script, an AI tool's command) there's
+/// nobody to ask, so say what to do instead.
+fn prompt(msg: &str) -> Res<Zeroizing<String>> {
+    rpassword::prompt_password(msg).map(Zeroizing::new).map_err(|_| {
+        "this needs your password and there's no terminal to ask in. Unlock in a terminal; scripts and AI tools use an agent key (plaintext agent create)".into()
+    })
 }
 
 pub fn device() -> String {
@@ -213,9 +273,10 @@ pub fn device() -> String {
 
 /// Sign in with the password (and the Secret Key from the keychain, or asked for).
 pub fn sign_in(cfg: &Config) -> Res<S> {
+    http(&cfg.server)?;
     let sk = secret_key(cfg)?;
-    let pw = Zeroizing::new(rpassword::prompt_password(format!("Password for {}: ", cfg.username))?);
-    let s = Session::login(Http::new(&cfg.server), &derive(&pw, &sk), &device())?;
+    let pw = prompt(&format!("Password for {}: ", cfg.username))?;
+    let s = Session::login(http(&cfg.server)?, &derive(&pw, &sk), &device())?;
     remember(cfg, &s)?;
     Ok(s)
 }
@@ -226,7 +287,7 @@ pub fn open() -> Res<S> {
     if let Ok(key) = std::env::var("PLAINTEXT_AGENT_KEY") {
         let server = std::env::var("PLAINTEXT_SERVER").map_err(|_| "set PLAINTEXT_SERVER along with PLAINTEXT_AGENT_KEY")?;
         let key = AgentKey::parse(&key)?;
-        let mut s = Session::login(Http::new(&server), &derive_agent(&key), "agent")?;
+        let mut s = Session::login(http(&server)?, &derive_agent(&key), "agent")?;
         s.sync()?;
         return Ok(s);
     }
@@ -244,6 +305,9 @@ pub fn open() -> Res<S> {
             s.sync()?;
         }
         r => r?,
+    }
+    for p in &s.problems {
+        eprintln!("plaintext: warning: {}", crate::clean(p));
     }
     save(&s)?;
     Ok(s)

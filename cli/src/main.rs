@@ -14,6 +14,61 @@ use plaintext_client::{Http, Session, import, now, now_ms};
 use state::{Config, Res, S};
 use zeroize::Zeroizing;
 
+/// Print a line made safe for a terminal. Text from items, other people and
+/// servers could otherwise carry escape sequences that rewrite the screen, set
+/// the clipboard (OSC 52) or disguise links. Output to a pipe or file stays exact.
+macro_rules! say {
+    ($($t:tt)*) => {{
+        let s = format!($($t)*);
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) { println!("{}", $crate::clean(&s)) } else { println!("{s}") }
+    }};
+}
+macro_rules! note {
+    ($($t:tt)*) => {{
+        let s = format!($($t)*);
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) { eprintln!("{}", $crate::clean(&s)) } else { eprintln!("{s}") }
+    }};
+}
+
+/// Control characters and invisible direction overrides, shown as `\u{..}`.
+pub fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c.to_string(),
+            c if c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => c.escape_unicode().to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// Write a file only this user can read, replacing what's at `path` in one step
+/// (a symlink there is replaced, not followed).
+fn write_private(path: &std::path::Path, data: &[u8]) -> Res<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(".plaintext-{}.tmp", hex::encode(plaintext_client::plaintext_core::crypto::random::<8>())));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&tmp)?;
+    let r = f.write_all(data).and_then(|_| f.sync_all()).and_then(|_| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(r?)
+}
+
+/// A secret typed at a hidden prompt, or one line from stdin when piped. Never
+/// from arguments: other users of the computer can read those (`ps`).
+fn ask_secret(prompt: &str) -> Res<Zeroizing<String>> {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(Zeroizing::new(rpassword::prompt_password(prompt)?));
+    }
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin().read_line(&mut line)?;
+    Ok(Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
 #[derive(Parser)]
 #[command(name = "plaintext", version, about = "End-to-end encrypted password manager. Your server only ever sees ciphertext.")]
 struct Cli {
@@ -209,8 +264,9 @@ struct Fields {
     kind: Option<String>,
     #[arg(long)]
     username: Option<String>,
+    /// Ask for the password (or read it from stdin when piped)
     #[arg(long)]
-    password: Option<String>,
+    password: bool,
     /// Generate a strong password
     #[arg(long)]
     generate: bool,
@@ -226,7 +282,7 @@ struct Fields {
     /// label=value
     #[arg(long)]
     field: Vec<String>,
-    /// label=value, hidden by default
+    /// A hidden field: its label (you're asked for the value), or label=value
     #[arg(long)]
     concealed: Vec<String>,
 }
@@ -270,11 +326,15 @@ enum UserCmd {
     Ls,
     /// An invite code for someone new (admins)
     Invite,
-    /// Show a user's fingerprint; with --yes, mark it verified after comparing
+    /// Show a user's fingerprint; with --yes, mark it verified after comparing.
+    /// With --fingerprint (theirs, as they read it to you), verify against that:
+    /// it also replaces keys the server had substituted for theirs.
     Verify {
         user: String,
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
     /// Stop an account (admins, or the owner of an agent)
     Disable { user: String },
@@ -296,7 +356,7 @@ enum AgentCmd {
 
 fn main() {
     if let Err(e) = run(Cli::parse()) {
-        eprintln!("plaintext: {e}");
+        note!("plaintext: {e}");
         std::process::exit(1);
     }
 }
@@ -324,7 +384,7 @@ fn password_twice() -> Res<Zeroizing<String>> {
         return Err("the passwords don't match".into());
     }
     if tools::strength_bits(&a) < 50.0 {
-        eprintln!("That password is on the weak side. Your Secret Key still protects you if the server is breached, but not if someone steals this device.");
+        note!("That password is on the weak side. Your Secret Key still protects you if the server is breached, but not if someone steals this device.");
     }
     Ok(a)
 }
@@ -340,8 +400,8 @@ fn apply_fields(item: &mut Item, f: &Fields) -> Res<()> {
     if let Some(u) = &f.username {
         item.username = u.clone();
     }
-    if let Some(p) = &f.password {
-        item.password = p.clone();
+    if f.password {
+        item.password = ask_secret("Password: ")?.to_string();
     }
     if f.generate {
         item.password = tools::generate(&Recipe::default());
@@ -360,7 +420,15 @@ fn apply_fields(item: &mut Item, f: &Fields) -> Res<()> {
     }
     for (list, kind) in [(&f.field, "text"), (&f.concealed, "concealed")] {
         for kv in list {
-            let (label, value) = kv.split_once('=').ok_or("fields are label=value")?;
+            let asked;
+            let (label, value) = match kv.split_once('=') {
+                Some(lv) => lv,
+                None if kind == "concealed" => {
+                    asked = ask_secret(&format!("{kv}: "))?;
+                    (kv.as_str(), asked.as_str())
+                }
+                None => return Err("fields are label=value".into()),
+            };
             let fields = &mut item.sections.iter_mut().find(|s| s.title.is_empty()).map(|s| &mut s.fields);
             let field = Field { label: label.into(), kind: kind.into(), value: value.into(), ..Default::default() };
             match fields {
@@ -376,10 +444,10 @@ fn apply_fields(item: &mut Item, f: &Fields) -> Res<()> {
 }
 
 fn show(item: &Item, vault: &str) {
-    println!("{}  ({}, in {vault})", item.title, if item.kind.is_empty() { "item" } else { &item.kind });
+    say!("{}  ({}, in {vault})", item.title, if item.kind.is_empty() { "item" } else { &item.kind });
     let row = |k: &str, v: &str| {
         if !v.is_empty() {
-            println!("  {k:<12} {v}");
+            say!("  {k:<12} {v}");
         }
     };
     row("username", &item.username);
@@ -392,7 +460,7 @@ fn show(item: &Item, vault: &str) {
     }
     for s in &item.sections {
         if !s.title.is_empty() {
-            println!("  [{}]", s.title);
+            say!("  [{}]", s.title);
         }
         for f in &s.fields {
             row(&f.label, &f.value);
@@ -428,13 +496,14 @@ fn run(cli: Cli) -> Res<()> {
     }
     match cli.cmd {
         Cmd::Signup { server, username, invite } => {
-            let pw = password_twice()?;
             let cfg = Config { server: server.trim_end_matches('/').into(), username: username.clone() };
-            let (sk, s) = Session::signup(Http::new(&cfg.server), &username, &pw, invite.as_deref(), &state::device())?;
+            let http = state::http(&cfg.server)?;
+            let pw = password_twice()?;
+            let (sk, s) = Session::signup(http, &username, &pw, invite.as_deref(), &state::device())?;
             // The account exists now: show its Secret Key before anything else can fail.
-            println!("Your Secret Key: {}\n", sk.encode());
-            println!("Write it down with your server address ({}) and keep it somewhere safe.", cfg.server);
-            println!("You need it with your password to sign in on a new device, and nobody can recover it for you.\n");
+            say!("Your Secret Key: {}\n", sk.encode());
+            say!("Write it down with your server address ({}) and keep it somewhere safe.", cfg.server);
+            say!("You need it with your password to sign in on a new device, and nobody can recover it for you.\n");
             state::save_config(&cfg)?;
             state::save_secret_key(&cfg, &sk)?;
             let mut s = s.map_err(|e| {
@@ -444,10 +513,13 @@ fn run(cli: Cli) -> Res<()> {
                 )
             })?;
             state::remember(&cfg, &s)?;
-            println!("Welcome, {username}.{}", if s.admin { " You're this server's admin." } else { "" });
-            println!("Your Secret Key is saved on this computer.\nYour fingerprint: {}", s.me().fingerprint());
-            if let Some(code) = &invite {
-                s.trust_inviter(code)?;
+            say!("Welcome, {username}.{}", if s.admin { " You're this server's admin." } else { "" });
+            say!("Your Secret Key is saved on this computer.\nYour fingerprint: {}", s.me().fingerprint());
+            // Checked after the account exists, so a mismatch never costs the Secret Key.
+            if let Some(e) = invite.as_deref().filter(|c| c.contains('.')).and_then(|c| s.trust_inviter(c).err()) {
+                note!("\nWarning: couldn't confirm who invited you ({e}).");
+                note!("The server showed keys for them that don't match your invite code. Someone may be listening in.");
+                note!("Don't share anything with them until you've compared fingerprints in person: `plaintext user verify NAME --fingerprint ...`.");
             }
         }
         Cmd::Signin { server, username } => {
@@ -458,15 +530,15 @@ fn run(cli: Cli) -> Res<()> {
             };
             let s = state::sign_in(&cfg)?;
             state::save_config(&cfg)?;
-            println!("Signed in as {} until you run `plaintext lock` (or 12 hours pass).", s.username());
+            say!("Signed in as {} until you run `plaintext lock` (or 12 hours pass).", s.username());
         }
         Cmd::Lock => {
             state::forget(&state::load_config()?);
-            println!("Locked.");
+            say!("Locked.");
         }
         Cmd::Whoami => {
             let s = state::open()?;
-            println!("{}{}  fingerprint {}", s.username(), if s.admin { " (admin)" } else { "" }, s.me().fingerprint());
+            say!("{}{}  fingerprint {}", s.username(), if s.admin { " (admin)" } else { "" }, s.me().fingerprint());
         }
         Cmd::Ls { query, vault, json } => {
             let s = state::open()?;
@@ -481,10 +553,10 @@ fn run(cli: Cli) -> Res<()> {
                     .iter()
                     .map(|(vid, id, i)| serde_json::json!({"id": id, "vault": s.vaults[vid].meta.name, "title": i.title, "kind": i.kind, "username": i.username, "urls": i.urls}))
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                say!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 for (vid, id, i) in rows {
-                    println!("{}  {:<32} {:<24} {}", &id.to_string()[..8], i.title, i.username, s.vaults[&vid].meta.name);
+                    say!("{}  {:<32} {:<24} {}", &id.to_string()[..8], i.title, i.username, s.vaults[&vid].meta.name);
                 }
             }
         }
@@ -492,12 +564,12 @@ fn run(cli: Cli) -> Res<()> {
             let s = state::open()?;
             let (vid, _, it) = s.one(&item, vault_opt(&s, &vault)?.as_ref())?;
             match (field, json) {
-                (Some(f), _) => println!("{}", resolve(&s, &format!("pt://{}/{}/{f}", vid, it.title))?),
-                (None, true) => println!("{}", serde_json::to_string_pretty(&it)?),
+                (Some(f), _) => say!("{}", resolve(&s, &format!("pt://{}/{}/{f}", vid, it.title))?),
+                (None, true) => say!("{}", serde_json::to_string_pretty(&it)?),
                 (None, false) => show(&it, &s.vaults[&vid].meta.name),
             }
         }
-        Cmd::Read { reference } => println!("{}", resolve(&state::open()?, &reference)?),
+        Cmd::Read { reference } => say!("{}", resolve(&state::open()?, &reference)?),
         Cmd::Add { title, fields, vault } => {
             let mut s = state::open()?;
             let vid = match vault_opt(&s, &vault)? {
@@ -509,7 +581,7 @@ fn run(cli: Cli) -> Res<()> {
             let id = new_item_id();
             s.put_item(&vid, id, item)?;
             state::save(&s)?;
-            println!("Added {} to {}.", &id.to_string()[..8], s.vaults[&vid].meta.name);
+            say!("Added {} to {}.", &id.to_string()[..8], s.vaults[&vid].meta.name);
         }
         Cmd::Edit { item, title, fields, vault } => {
             let mut s = state::open()?;
@@ -524,14 +596,14 @@ fn run(cli: Cli) -> Res<()> {
             it.edit(next, now_ms());
             s.put_item(&vid, id, it)?;
             state::save(&s)?;
-            println!("Saved.");
+            say!("Saved.");
         }
         Cmd::Rm { item, vault } => {
             let mut s = state::open()?;
             let (vid, id, it) = s.one(&item, vault_opt(&s, &vault)?.as_ref())?;
             s.delete_item(&vid, id)?;
             state::save(&s)?;
-            println!("Deleted {}.", it.title);
+            say!("Deleted {}.", it.title);
         }
         Cmd::Generate { length, no_symbols, words, pin } => {
             let r = match (words, pin) {
@@ -539,13 +611,13 @@ fn run(cli: Cli) -> Res<()> {
                 (_, Some(p)) => Recipe::Pin { length: p },
                 _ => Recipe::Random { length, digits: true, symbols: !no_symbols },
             };
-            println!("{}", tools::generate(&r));
+            say!("{}", tools::generate(&r));
         }
         Cmd::Totp { item } => {
             let s = state::open()?;
             let (_, _, it) = s.one(&item, None)?;
             let (code, left) = tools::totp(&it.totp, now()).ok_or("no one-time code on that item")?;
-            println!("{code}  ({left}s left)");
+            say!("{code}  ({left}s left)");
         }
         Cmd::Watchtower { breaches } => {
             let s = state::open()?;
@@ -562,7 +634,7 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 }
                 if !f.is_empty() {
-                    println!("{:<32} {:<12} {}", it.title, s.vaults[vid].meta.name, f.join(", ").replace("notwofactor", "no 2FA code saved"));
+                    say!("{:<32} {:<12} {}", it.title, s.vaults[vid].meta.name, f.join(", ").replace("notwofactor", "no 2FA code saved"));
                 }
             }
         }
@@ -571,30 +643,40 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::User(u) => user_cmd(u)?,
         Cmd::Agent(AgentCmd::Create { name, vault, role: r, expires }) => {
             let mut s = state::open()?;
+            // Check everything that can fail before the account exists, and show the
+            // key right after: an agent whose key was never shown is just litter.
+            let grant = match &vault {
+                Some(v) => {
+                    let vid = s.vault(v)?;
+                    if s.vaults[&vid].role(s.username(), now()) != Some(Role::Owner) {
+                        return Err(format!("only an owner of {v} can give an agent access to it").into());
+                    }
+                    Some((vid, v.clone(), role(&r)?, expires.as_deref().map(duration).transpose()?.map(|d| now() + d)))
+                }
+                None => None,
+            };
             let key = s.create_agent(&name)?;
-            if let Some(v) = vault {
-                let vid = s.vault(&v)?;
-                let exp = expires.as_deref().map(duration).transpose()?.map(|d| now() + d);
-                s.share_vault(&vid, &name, role(&r)?, exp)?;
-                println!("{name} can now {} {v}{}.", if role(&r)? == Role::Reader { "read" } else { "use" }, if exp.is_some() { " until it expires" } else { "" });
+            say!("\nAgent key (shown once; store it in the agent's secret store):\n{}\n", key.encode());
+            if let Some((vid, v, role, exp)) = grant {
+                s.share_vault(&vid, &name, role, exp)?;
+                say!("{name} can now {} {v}{}.", if role == Role::Reader { "read" } else { "use" }, if exp.is_some() { " until it expires" } else { "" });
             }
-            println!("\nAgent key (shown once; store it in the agent's secret store):\n{}\n", key.encode());
-            println!("Use it with:\n  PLAINTEXT_SERVER={} PLAINTEXT_AGENT_KEY=ptk_… plaintext run -- your-command", state::load_config()?.server);
+            say!("Use it with:\n  PLAINTEXT_SERVER={} PLAINTEXT_AGENT_KEY=ptk_… plaintext run -- your-command", state::load_config()?.server);
         }
         Cmd::Send { item, to, expires } => {
             let mut s = state::open()?;
             let (_, _, it) = s.one(&item, None)?;
             let exp = expires.as_deref().map(duration).transpose()?.map(|d| now() + d);
             s.send(&to, &Content::Item(Box::new(it.clone())), exp)?;
-            println!("Sent {} to {to}. {to}'s fingerprint: {}", it.title, s.fingerprint(&to).unwrap_or_default());
+            say!("Sent {} to {to}. {to}'s fingerprint: {}", it.title, s.fingerprint(&to).unwrap_or_default());
         }
         Cmd::Link { item, expires, views } => {
             let s = state::open()?;
             let (_, _, it) = s.one(&item, None)?;
             let cfg = state::load_config()?;
-            println!("{}", s.create_link(&std::env::var("PLAINTEXT_LINK_PAGE").unwrap_or_else(|_| plaintext_client::LINK_PAGE.into()), &cfg.server, &it, now() + duration(&expires)?, views)?);
+            say!("{}", s.create_link(&std::env::var("PLAINTEXT_LINK_PAGE").unwrap_or_else(|_| plaintext_client::LINK_PAGE.into()), &cfg.server, &it, now() + duration(&expires)?, views)?);
             if !it.files.is_empty() || !it.passkeys.is_empty() {
-                eprintln!("Attachments and passkeys aren't included in share links.");
+                note!("Attachments and passkeys aren't included in share links.");
             }
         }
         Cmd::Inbox { save, vault, delete } => {
@@ -611,19 +693,19 @@ fn run(cli: Cli) -> Res<()> {
                             };
                             s.put_item(&vid, new_item_id(), (**it).clone())?;
                             s.delete_message(&m.id)?;
-                            println!("Saved {} from {from}.", it.title);
+                            say!("Saved {} from {from}.", it.title);
                         } else {
-                            println!("{}  item     from {from:<16} {}", &id[..8], it.title);
+                            say!("{}  item     from {from:<16} {}", &id[..8], it.title);
                         }
                     }
-                    Ok((m, Content::Request(text))) => println!("{}  request  from {from:<16} {text}", &m.id.to_string()[..8]),
-                    Err(e) => println!("?         unreadable from {from}: {e}"),
+                    Ok((m, Content::Request(text))) => say!("{}  request  from {from:<16} {text}", &m.id.to_string()[..8]),
+                    Err(e) => say!("?         unreadable from {from}: {e}"),
                 }
                 if let (Some(d), Ok((m, _))) = (&delete, r)
                     && m.id.to_string().starts_with(d.as_str())
                 {
                     s.delete_message(&m.id)?;
-                    println!("Deleted.");
+                    say!("Deleted.");
                 }
             }
             state::save(&s)?;
@@ -631,7 +713,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Request { text, to } => {
             let mut s = state::open()?;
             s.send(&to, &Content::Request(text), Some(now() + 7 * 86400))?;
-            println!("Asked {to}.");
+            say!("Asked {to}.");
         }
         Cmd::Run { env_file, cmd } => {
             let s = state::open()?;
@@ -674,15 +756,8 @@ fn run(cli: Cli) -> Res<()> {
             }
             out.push_str(rest);
             match output {
-                Some(f) => {
-                    #[cfg(unix)]
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut o = std::fs::OpenOptions::new();
-                    o.write(true).create(true).truncate(true);
-                    #[cfg(unix)]
-                    o.mode(0o600);
-                    o.open(f)?.write_all(out.as_bytes())?;
-                }
+                Some(f) => write_private(std::path::Path::new(&f), out.as_bytes())?,
+                None if std::io::IsTerminal::is_terminal(&std::io::stdout()) => print!("{}", clean(&out)),
                 None => std::io::stdout().write_all(out.as_bytes())?,
             }
         }
@@ -695,14 +770,16 @@ fn run(cli: Cli) -> Res<()> {
             it.files.push(f);
             s.put_item(&vid, id, it)?;
             state::save(&s)?;
-            println!("Attached {name}.");
+            say!("Attached {name}.");
         }
         Cmd::Download { item, name, output } => {
             let s = state::open()?;
             let (vid, _, it) = s.one(&item, None)?;
             let f = it.files.iter().find(|f| f.name == name).ok_or("no attachment with that name")?;
-            std::fs::write(output.unwrap_or(name.clone()), s.download_file(&vid, f)?)?;
-            println!("Saved {name}.");
+            // The name is whatever the item's author chose: never a path.
+            let out = output.unwrap_or_else(|| plaintext_client::plaintext_core::item::safe_file_name(&f.name));
+            write_private(std::path::Path::new(&out), &s.download_file(&vid, f)?)?;
+            say!("Saved {out}.");
         }
         Cmd::Import { format, file, vault } => {
             let mut s = state::open()?;
@@ -733,13 +810,13 @@ fn run(cli: Cli) -> Res<()> {
                 s.sync_vault(&vid)?;
             }
             state::save(&s)?;
-            println!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
+            say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
         }
         Cmd::Export { vault } => {
             let s = state::open()?;
             let v = vault_opt(&s, &vault)?;
             let items: Vec<&Item> = s.vaults.iter().filter(|(id, _)| v.is_none_or(|w| w == **id)).flat_map(|(_, vl)| vl.items().map(|(_, i)| i)).collect();
-            println!("{}", serde_json::to_string_pretty(&import::to_bitwarden(&items))?);
+            say!("{}", serde_json::to_string_pretty(&import::to_bitwarden(&items))?);
         }
         Cmd::Passwd => {
             let s = state::open()?;
@@ -749,16 +826,16 @@ fn run(cli: Cli) -> Res<()> {
             let new = password_twice()?;
             s.change_password(&plaintext_client::plaintext_core::crypto::derive(&old, &sk), &sk, &new)?;
             state::forget(&cfg);
-            println!("Password changed. Other devices need to sign in again.");
+            say!("Password changed. Other devices need to sign in again.");
         }
         Cmd::Sessions { end } => {
             let s = state::open()?;
             if let Some(id) = end {
                 s.end_session(&id)?;
-                println!("Signed that device out.");
+                say!("Signed that device out.");
             }
             for d in s.sessions()? {
-                println!("{}  {:<32} {}", d.id, d.device, if d.current { "(this one)" } else { "" });
+                say!("{}  {:<32} {}", d.id, d.device, if d.current { "(this one)" } else { "" });
             }
         }
         Cmd::Open { link } => {
@@ -778,18 +855,18 @@ fn account_cmd(a: AccountCmd) -> Res<()> {
     match a {
         AccountCmd::Ls => {
             for (i, c) in accts.accounts.iter().enumerate() {
-                println!("{} {:<40} {}", if i == accts.current { "*" } else { " " }, c.name(), c.server);
+                say!("{} {:<40} {}", if i == accts.current { "*" } else { " " }, c.name(), c.server);
             }
         }
         AccountCmd::Use { account } => {
             let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
             state::save_config(&c)?;
-            println!("Using {} by default.", c.name());
+            say!("Using {} by default.", c.name());
         }
         AccountCmd::Remove { account } => {
             let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
             state::remove_account(&c)?;
-            println!("Signed out of {} and forgot its Secret Key on this computer. Your data on the server is untouched.", c.name());
+            say!("Signed out of {} and forgot its Secret Key on this computer. Your data on the server is untouched.", c.name());
         }
     }
     Ok(())
@@ -803,26 +880,26 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             for (id, vl) in &s.vaults {
                 let role = vl.role(&me, now()).map(|r| format!("{r:?}").to_lowercase()).unwrap_or_default();
                 let members = vl.roster.as_ref().map_or(0, |r| r.members.len());
-                println!("{}  {:<24} {:<7} {} items, {} members", &id.to_string()[..8], vl.meta.name, role, vl.items().count(), members);
+                say!("{}  {:<24} {:<7} {} items, {} members", &id.to_string()[..8], vl.meta.name, role, vl.items().count(), members);
             }
         }
         VaultCmd::Create { name } => {
             s.create_vault(&name)?;
-            println!("Created {name}.");
+            say!("Created {name}.");
         }
         VaultCmd::Rename { vault, name } => {
             let id = s.vault(&vault)?;
             let mut meta = s.vaults[&id].meta.clone();
             meta.name = name;
             s.rename_vault(&id, meta)?;
-            println!("Renamed.");
+            say!("Renamed.");
         }
         VaultCmd::Members { vault } => {
             let id = s.vault(&vault)?;
             for m in s.vaults[&id].roster.as_ref().map(|r| r.members.clone()).unwrap_or_default() {
                 let verified = m.username == s.username() || s.keyring.contacts.get(&m.username).is_some_and(|c| c.verified);
                 let exp = m.expires.map(|e| format!(" until {}", e)).unwrap_or_default();
-                println!(
+                say!(
                     "{:<20} {:<7}{exp}  {}  {}",
                     m.username,
                     format!("{:?}", m.role).to_lowercase(),
@@ -836,23 +913,23 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             let exp = expires.as_deref().map(duration).transpose()?.map(|d| now() + d);
             s.share_vault(&id, &user, role(&r)?, exp)?;
             let verified = s.keyring.contacts.get(&user).is_some_and(|c| c.verified);
-            println!("Shared {vault} with {user} as {r}.");
+            say!("Shared {vault} with {user} as {r}.");
             if !verified {
-                println!("{user} isn't verified yet. Compare this fingerprint with them: {}", s.fingerprint(&user).unwrap_or_default());
-                println!("then run `plaintext user verify {user} --yes`.");
+                say!("{user} isn't verified yet. Compare this fingerprint with them: {}", s.fingerprint(&user).unwrap_or_default());
+                say!("then run `plaintext user verify {user} --yes`.");
             }
         }
         VaultCmd::Revoke { vault, user } => {
             let id = s.vault(&vault)?;
             s.revoke(&id, &user)?;
-            println!("Removed {user} and replaced the vault key.");
+            say!("Removed {user} and replaced the vault key.");
         }
         VaultCmd::Audit { vault } => {
             let id = s.vault(&vault)?;
             for e in s.audit(&id)? {
                 let t = e.ts as i64;
                 let date = plaintext_client::import::days_to_date(t.div_euclid(86400));
-                println!("{date} {:02}:{:02} UTC  {:<20} {}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60, e.username, e.action);
+                say!("{date} {:02}:{:02} UTC  {:<20} {}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60, e.username, e.action);
             }
         }
     }
@@ -865,39 +942,61 @@ fn user_cmd(u: UserCmd) -> Res<()> {
         UserCmd::Ls => {
             for u in s.users()? {
                 let id: plaintext_client::plaintext_core::api::Identity = serde_json::from_slice(&u.identity.body.0)?;
+                let verified = s.keyring.contacts.get(&id.username).is_some_and(|c| c.verified);
+                // An agent names its owner itself; only our own agents (verified
+                // when we made them) are known to really be ours.
                 let tag = match (id.kind, &id.owner) {
-                    (Kind::Agent, Some(o)) => format!("agent of {o}"),
+                    (Kind::Agent, Some(o)) if *o == s.username() && verified => "your agent".into(),
+                    (Kind::Agent, _) => "agent".into(),
                     _ if u.admin => "admin".into(),
                     _ => String::new(),
                 };
-                let verified = s.keyring.contacts.get(&id.username).is_some_and(|c| c.verified);
-                println!("{:<20} {:<16} {}{}", id.username, tag, if verified { "verified" } else { "" }, if u.disabled { " disabled" } else { "" });
+                say!("{:<20} {:<16} {}{}", id.username, tag, if verified { "verified" } else { "" }, if u.disabled { " disabled" } else { "" });
             }
         }
         UserCmd::Invite => {
             let code = s.invite()?;
             let cfg = state::load_config()?;
-            println!("Send this to the person you're inviting (valid 7 days, one use):\n");
-            println!("  plaintext signup --server {} --username THEIR_NAME --invite {code}\n", cfg.server);
-            println!("When they join, your devices verify their keys automatically.");
+            say!("Send this to the person you're inviting (valid 7 days, one use):\n");
+            say!("  plaintext signup --server {} --username THEIR_NAME --invite {code}\n", cfg.server);
+            say!("When they join, your devices verify their keys automatically.");
         }
-        UserCmd::Verify { user, yes } => {
+        UserCmd::Verify { user, fingerprint: Some(fp), .. } => {
+            match s.verify_fingerprint(&user, &fp)? {
+                true => say!("{user} verified. The keys you had for them were different (likely put there by the server); they're replaced."),
+                false => say!("{user} verified."),
+            }
+        }
+        UserCmd::Verify { user, yes, fingerprint: None } => {
             if !s.keyring.contacts.contains_key(&user) {
                 s.pin_user(&user)?;
             }
-            println!("{user}: {}", s.fingerprint(&user).unwrap_or_default());
+            say!("{user}: {}", s.fingerprint(&user).unwrap_or_default());
             if yes {
                 s.mark_verified(&user)?;
-                println!("Marked verified.");
+                say!("Marked verified.");
             } else {
-                println!("Compare this with {user}'s `plaintext whoami`; if it matches, run again with --yes.");
+                say!("Compare this with {user}'s `plaintext whoami`; if it matches, run again with --yes.");
             }
         }
         UserCmd::Disable { user } => {
             s.disable_user(&user)?;
-            println!("Disabled {user}: they can't sign in any more.");
-            println!("They still know the keys of vaults they were in; run `plaintext vault revoke VAULT {user}` to replace those keys.");
+            say!("Disabled {user}: they can't sign in any more.");
+            say!("They still know the keys of vaults they were in; run `plaintext vault revoke VAULT {user}` to replace those keys.");
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn terminal_escapes_become_visible() {
+        let hostile = "Payroll\u{1b}]52;c;Y3VybA==\u{7}\u{1b}[2K\u{202e}gpj.exe\tok\n";
+        let shown = super::clean(hostile);
+        assert!(!shown.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.starts_with("Payroll\\u{1b}]52;c;"));
+        assert_eq!(super::clean("plain text, ünïcødé"), "plain text, ünïcødé");
+    }
 }

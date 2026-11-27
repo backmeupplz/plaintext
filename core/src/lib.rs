@@ -41,6 +41,10 @@ pub enum Error {
     PendingChanges,
     Expired,
     BadJson,
+    /// An agent was shown a vault its owner never signed for.
+    NotFromOwner,
+    /// Owners can't expire: a roster they signed must stay verifiable forever.
+    OwnerExpiry,
 }
 
 impl fmt::Display for Error {
@@ -61,6 +65,8 @@ impl fmt::Display for Error {
             Error::PendingChanges => f.write_str("push your pending changes first"),
             Error::Expired => f.write_str("this has expired"),
             Error::BadJson => f.write_str("malformed data"),
+            Error::NotFromOwner => f.write_str("this vault wasn't shared by this agent's owner, so the agent doesn't trust it"),
+            Error::OwnerExpiry => f.write_str("owners can't have an expiry; give them edit access with an expiry instead"),
         }
     }
 }
@@ -69,10 +75,15 @@ impl std::error::Error for Error {}
 /// Plaintext is padded to this many bytes so blob sizes don't reveal lengths.
 const PAD: usize = 256;
 
+/// Pad JSON to a multiple of `PAD` bytes; trailing whitespace is valid JSON.
+pub(crate) fn pad(json: &mut Vec<u8>) {
+    let padded = json.len().div_ceil(PAD).max(1) * PAD;
+    json.resize(padded, b' ');
+}
+
 pub(crate) fn seal_json<T: Serialize>(key: &Key, ad: &[u8], v: &T) -> Vec<u8> {
     let mut json = Zeroizing::new(serde_json::to_vec(v).expect("serializable"));
-    let padded = json.len().div_ceil(PAD).max(1) * PAD;
-    json.resize(padded, b' '); // trailing whitespace is valid JSON
+    pad(&mut json);
     seal(key, ad, &json)
 }
 
@@ -95,13 +106,20 @@ pub struct Signup {
     pub vault: Option<Vault>,
 }
 
-fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<String>, invite: Option<&str>) -> Result<Signup, Error> {
+fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<&Me>, invite: Option<&str>) -> Result<Signup, Error> {
     if !identity::valid_username(username) {
         return Err(Error::BadUsername);
     }
     let account = Account { id: d.account_id, account_key: random_key() };
     let mut keyring = Keyring::new(username);
-    let identity = keyring.identity(kind, owner);
+    // An agent starts out trusting its owner, and only its owner: the server
+    // can't stand up a look-alike owner (or anyone else) for it to obey.
+    if let Some(o) = owner {
+        keyring.pin(&o.username, &o.sign_pk(), &o.enc_pk())?;
+        keyring.mark_verified(&o.username);
+        keyring.owner = Some(o.username.clone());
+    }
+    let identity = keyring.identity(kind, owner.map(|o| o.username.clone()));
     let (vault, new_vault) = match kind {
         Kind::Human => {
             let (v, nv) = Vault::create(&keyring.me(), "Personal")?;
@@ -137,7 +155,7 @@ pub fn signup(username: &str, password: &str, invite: Option<&str>) -> Result<(S
 /// the request with the owner's session to `POST /v1/agents`; hand the agent its key.
 pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup), Error> {
     let key = AgentKey::generate();
-    let s = new_account(&derive_agent(&key), name, Kind::Agent, Some(owner.username.clone()), None)?;
+    let s = new_account(&derive_agent(&key), name, Kind::Agent, Some(&owner.me()), None)?;
     owner.pin_identity(&s.request.identity)?;
     owner.mark_verified(name);
     Ok((key, s))
@@ -179,16 +197,24 @@ pub enum Content {
     Request(String),
 }
 
-/// Seal `content` to a pinned contact and sign it.
+/// The sealed part of a message names both ends, so nobody holding the envelope
+/// can re-sign it as someone else or redirect it.
+fn message_ad(id: &Hex, from: &str, to: &str) -> Vec<u8> {
+    [ad("message", &[&id.0]), from.as_bytes().to_vec(), vec![0], to.as_bytes().to_vec()].concat()
+}
+
+/// Seal `content` to a pinned contact and sign it. An item goes out as its
+/// current fields only (`Item::shareable`).
 pub fn send(me: &Me, keyring: &Keyring, to: &str, content: &Content, expires: Option<u64>) -> Result<Signed, Error> {
     let c = keyring.contacts.get(to).ok_or(Error::UnknownUser(to.into()))?;
     let id = Hex(random());
-    let json = Zeroizing::new(serde_json::to_vec(content).expect("serializable"));
-    let kind = match content {
-        Content::Item(_) => MessageKind::Item,
-        Content::Request(_) => MessageKind::Request,
+    let (kind, content) = match content {
+        Content::Item(it) => (MessageKind::Item, Content::Item(Box::new(it.shareable()))),
+        Content::Request(t) => (MessageKind::Request, Content::Request(t.clone())),
     };
-    let sealed = seal_to(&c.enc_pk.0, &[ad("message", &[&id.0]), to.as_bytes().to_vec()].concat(), &json)?;
+    let mut json = Zeroizing::new(serde_json::to_vec(&content).expect("serializable"));
+    pad(&mut json);
+    let sealed = seal_to(&c.enc_pk.0, &message_ad(&id, &me.username, to), &json)?;
     Ok(me.sign_doc("message", &Message { id, to: to.into(), kind, expires, sealed: B64(sealed) }))
 }
 
@@ -203,7 +229,7 @@ pub fn receive(keyring: &Keyring, s: &Signed, now: u64) -> Result<(Message, Cont
         return Err(Error::Expired);
     }
     let me = keyring.me();
-    let raw = open_from(&me.enc, &[ad("message", &[&m.id.0]), m.to.as_bytes().to_vec()].concat(), &m.sealed.0)?;
+    let raw = open_from(&me.enc, &message_ad(&m.id, &s.signer, &m.to), &m.sealed.0)?;
     let content = serde_json::from_slice(&raw).map_err(|_| Error::BadJson)?;
     Ok((m, content))
 }
@@ -211,29 +237,11 @@ pub fn receive(keyring: &Keyring, s: &Signed, now: u64) -> Result<(Message, Cont
 // ---------- Links anyone can open ----------
 
 /// Seal an item for a link. The returned fragment goes after `#` in the URL and
-/// never reaches any server.
-///
-/// Only the current, visible fields go in: no password history, old versions,
-/// passkey private keys, attachment keys, flags or unknown top-level fields
-/// (`extra`, which a newer client may have used for anything).
+/// never reaches any server. Only the item's current fields go in (`Item::shareable`).
 pub fn create_link(item: &Item, expires: u64, max_views: Option<u32>) -> (NewLink, String) {
-    let shown = Item {
-        kind: item.kind.clone(),
-        title: item.title.clone(),
-        username: item.username.clone(),
-        password: item.password.clone(),
-        urls: item.urls.clone(),
-        totp: item.totp.clone(),
-        notes: item.notes.clone(),
-        sections: item.sections.clone(),
-        tags: item.tags.clone(),
-        created: item.created,
-        updated: item.updated,
-        ..Default::default()
-    };
     let id = Hex(random());
     let key = random_key();
-    let blob = seal_json(&key, &ad("link", &[&id.0]), &shown);
+    let blob = seal_json(&key, &ad("link", &[&id.0]), &item.shareable());
     (NewLink { id, blob: B64(blob), expires, max_views }, hex::encode(&key[..]))
 }
 

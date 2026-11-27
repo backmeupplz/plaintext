@@ -31,7 +31,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::Core(e) => e.fmt(f),
-            Error::Server(code, msg) => write!(f, "server said {code}: {msg}"),
+            Error::Server(code, msg) => write!(f, "server said {code}: {}", msg.chars().take(300).collect::<String>()),
             Error::Network(e) => write!(f, "couldn't reach the server: {e}"),
             Error::NotFound(what) => write!(f, "{what} not found"),
         }
@@ -71,7 +71,17 @@ pub struct Http {
 
 impl Http {
     pub fn new(base: &str) -> Http {
-        let agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        use std::time::Duration;
+        // No redirects: a server (or a share link's server) can't bounce a request
+        // to another host. Timeouts: a server that stops answering can't hang us.
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_global(Some(Duration::from_secs(600)))
+            .build()
+            .into();
         Http { base: base.trim_end_matches('/').into(), agent }
     }
 }
@@ -101,6 +111,26 @@ impl Transport for Http {
 /// serves the page's script could read the key in the link. Self-hosters can host
 /// `docs/s/` on their own domain and use that instead.
 pub const LINK_PAGE: &str = "https://getplaintext.org/s/";
+
+/// Whether talking to `url` would expose sign-ins and session tokens to the
+/// network: anything but `https://`, except plain `http://` to this machine, a
+/// private or Tailscale network, `.local` names, or a single-label name (a LAN or
+/// Docker host). Someone on the path could replay a sign-in sent in the clear.
+pub fn insecure_url(url: &str) -> bool {
+    let Some(rest) = url.trim().strip_prefix("http://") else { return !url.trim().starts_with("https://") };
+    let host = plaintext_core::crypto::server_host(rest);
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(':') => h,
+        _ => host.as_str(),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+        Err(_) => !host.contains('.') || [".local", ".localhost", ".ts.net", ".internal", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s)),
+    };
+    !local
+}
 
 /// What the server allows before anyone signs in (open signup, setup code).
 pub fn server_info<T: Transport>(t: &T) -> Result<ServerInfo> {
@@ -136,6 +166,10 @@ pub struct Session<T: Transport> {
     /// Vaults the server stopped listing. Their verified state is kept, so if
     /// they come back the server can't hand us an older copy as if new.
     pub hidden: BTreeMap<Hex, Vault>,
+    /// What the last `sync` couldn't do, for the user to see: vaults that didn't
+    /// verify (kept as last verified, or left out if never verified) and invite
+    /// conflicts. One bad vault doesn't stop the rest from syncing.
+    pub problems: Vec<String>,
 }
 
 impl<T: Transport> Session<T> {
@@ -155,15 +189,36 @@ impl<T: Transport> Session<T> {
         Ok((sk, session))
     }
 
-    /// The invite names who sent it and their fingerprint: pin and verify them.
-    /// Setup codes name nobody and are ignored.
+    /// The invite code names who sent it and their fingerprint: pin and verify
+    /// them if the server's directory agrees. If it doesn't, nothing is pinned and
+    /// this fails with `KeyChanged`: someone may be in the middle. Setup codes
+    /// name nobody and are ignored.
     pub fn trust_inviter(&mut self, invite: &str) -> Result<()> {
         let Some((inviter, fp)) = plaintext_core::identity::invite_sender(invite) else { return Ok(()) };
-        self.pin_user(&inviter)?;
-        if self.fingerprint(&inviter).map(|f| f.replace(' ', "")) != Some(fp) {
-            return Err(plaintext_core::Error::KeyChanged(inviter).into());
+        self.verify_fingerprint(&inviter, &fp).map(|_| ())
+    }
+
+    /// Confirm `username`'s keys against a fingerprint obtained out of band (read
+    /// aloud, scanned from their screen, carried in an invite). On a match they're
+    /// pinned and verified, replacing an earlier pin if the server had substituted
+    /// one; otherwise nothing changes and this fails with `KeyChanged`. Returns
+    /// true if an earlier, different pin was replaced.
+    pub fn verify_fingerprint(&mut self, username: &str, fingerprint: &str) -> Result<bool> {
+        let want = fingerprint.replace([' ', '-'], "").to_uppercase();
+        if self.fingerprint(username).is_some_and(|f| f.replace(' ', "") == want) {
+            self.mark_verified(username)?;
+            return Ok(false);
         }
-        self.mark_verified(&inviter)
+        let u = self.lookup(username)?;
+        let id = plaintext_core::identity::check_identity(&u.identity)?;
+        if plaintext_core::crypto::fingerprint(&id.username, &id.sign_pk.0, &id.enc_pk.0).replace(' ', "") != want {
+            return Err(plaintext_core::Error::KeyChanged(username.into()).into());
+        }
+        let replaced = self.keyring.contacts.contains_key(username);
+        self.keyring.repin_verified(&u.identity)?;
+        self.keyring_dirty = true;
+        self.save_keyring()?;
+        Ok(replaced)
     }
 
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
@@ -182,6 +237,7 @@ impl<T: Transport> Session<T> {
             admin: acct.admin,
             vaults: BTreeMap::new(),
             hidden: BTreeMap::new(),
+            problems: Vec::new(),
         })
     }
 
@@ -190,7 +246,7 @@ impl<T: Transport> Session<T> {
     pub fn resume(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&token), NONE)?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), problems: Vec::new() })
     }
 
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -214,16 +270,34 @@ impl<T: Transport> Session<T> {
             let v = self.vaults.remove(&id).expect("listed above");
             self.hidden.insert(id, v);
         }
+        self.problems.clear();
         for id in &acct.vaults {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
-            self.sync_vault(id)?;
-            self.revoke_expired(id)?;
+            match self.sync_vault(id).and_then(|_| self.revoke_expired(id)) {
+                Ok(()) => {}
+                // Anyone can share a vault with you (or an agent); one that doesn't
+                // check out mustn't stop the others. Network and session errors still do.
+                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
+                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
+                    if known.is_none() {
+                        self.vaults.remove(id);
+                    }
+                    self.problems.push(format!("vault {} wasn't updated: {e}", known.unwrap_or_else(|| id.to_string())));
+                }
+                Err(e) => return Err(e),
+            }
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
             let users = self.users()?;
-            self.keyring_dirty |= !self.keyring.verify_invitees(&users).is_empty();
+            let (done, conflicts) = self.keyring.verify_invitees(&users);
+            self.keyring_dirty |= !done.is_empty();
+            for n in conflicts {
+                self.problems.push(format!(
+                    "someone signed up with your invite as {n}, but you already had different keys for {n}; compare fingerprints in person (plaintext user verify {n} --fingerprint …)"
+                ));
+            }
         }
         self.save_keyring()
     }
@@ -333,6 +407,16 @@ impl<T: Transport> Session<T> {
     /// Look a user up in the server directory and pin their keys (trust on first
     /// use; compare fingerprints to verify). Fails if they differ from a pin.
     pub fn pin_user(&mut self, username: &str) -> Result<Identity> {
+        let u = self.lookup(username)?;
+        let before = self.keyring.contacts.contains_key(username);
+        let id = self.keyring.pin_identity(&u.identity)?;
+        self.keyring_dirty |= !before;
+        self.save_keyring()?;
+        Ok(id)
+    }
+
+    /// A user's directory entry, by exact username.
+    fn lookup(&self, username: &str) -> Result<UserInfo> {
         if !plaintext_core::identity::valid_username(username) {
             return Err(Error::NotFound(format!("user {username}")));
         }
@@ -343,11 +427,7 @@ impl<T: Transport> Session<T> {
         if u.identity.signer != username {
             return Err(plaintext_core::Error::KeyChanged(username.into()).into());
         }
-        let before = self.keyring.contacts.contains_key(username);
-        let id = self.keyring.pin_identity(&u.identity)?;
-        self.keyring_dirty |= !before;
-        self.save_keyring()?;
-        Ok(id)
+        Ok(u)
     }
 
     pub fn fingerprint(&self, username: &str) -> Option<String> {
@@ -425,7 +505,10 @@ impl<T: Transport> Session<T> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
         self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
-        self.pull(id)
+        self.pull(id)?;
+        // Record the new roster in the keyring now, so this account's other
+        // devices (and new ones) can't be shown the vault from before it.
+        self.save_keyring()
     }
 
     /// Remove someone and replace the vault key.
@@ -434,7 +517,8 @@ impl<T: Transport> Session<T> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         let update = v.revoke(&self.me(), username, now())?;
         self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
-        self.pull(id)
+        self.pull(id)?;
+        self.save_keyring()
     }
 
     pub fn audit(&self, id: &Hex) -> Result<Vec<AuditEntry>> {
@@ -457,19 +541,19 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// The vault new items go to by default: the one this account made at signup,
-    /// else one it created itself. Never a vault someone else shared, so nobody
-    /// can collect your new logins by sharing you a vault called "Personal".
+    /// The vault new items go to by default: the one this account made at signup.
+    /// Never a vault anyone else can read: if the server stops listing that one,
+    /// this fails rather than pick another (it might be shared), so nobody can
+    /// collect your new logins by hiding your vault or sharing you a "Personal".
+    /// Accounts with no default recorded fall back to a vault only they are in.
     pub fn default_vault(&self) -> Result<Hex> {
         let me = self.username().to_string();
         let own = |v: &&Vault| v.creator == me && v.role(&me, now()).is_some_and(|r| r >= Role::Writer);
-        self.keyring
-            .default_vault
-            .and_then(|id| self.vaults.get(&id))
-            .filter(own)
-            .or_else(|| self.vaults.values().find(own))
-            .map(|v| v.id)
-            .ok_or(Error::Core(plaintext_core::Error::ReadOnly))
+        let found = match self.keyring.default_vault {
+            Some(id) => self.vaults.get(&id).filter(own),
+            None => self.vaults.values().filter(own).find(|v| v.roster.as_ref().is_some_and(|r| r.members.len() == 1)),
+        };
+        found.map(|v| v.id).ok_or(Error::NotFound("your default vault (the server isn't listing it); name a vault".into()))
     }
 
     /// One of our own vaults by name (for imports), never one shared with us.
@@ -526,7 +610,7 @@ impl<T: Transport> Session<T> {
         raw(&self.t, "PUT", &format!("/v1/vaults/{vault}/files/{id}"), Some(&self.token), Some(blob.clone()))?;
         Ok(FileRef {
             id,
-            name: name.into(),
+            name: plaintext_core::item::safe_file_name(name),
             size: data.len() as u64,
             key: B64(key.to_vec()),
             hash: B64(plaintext_core::crypto::sha256(&blob).to_vec()),
