@@ -1345,9 +1345,19 @@ async fn update_roster(
         if !r.members.iter().any(|m| m.username == c.username) {
             return Err((BAD, "to stop using a vault, leave it"));
         }
-        // Without an owner nobody could change its key or members again.
-        if !r.members.iter().any(|m| m.role == Role::Owner) {
-            return Err((BAD, "a vault needs an owner"));
+        // Without an owner nobody could change its key or members again. Owners never
+        // expire (clients refuse such a roster), and a disabled one can't sign in.
+        if r.members.iter().any(|m| m.role == Role::Owner && m.expires.is_some()) {
+            return Err((BAD, "owners don't expire"));
+        }
+        let mut owners = 0;
+        for m in r.members.iter().filter(|m| m.role == Role::Owner) {
+            owners += tx
+                .query_row("SELECT COUNT(*) FROM accounts WHERE username = ? AND disabled = 0", [&m.username], |row| row.get::<_, i64>(0))
+                .map_err(db_err)?;
+        }
+        if owners == 0 {
+            return Err((BAD, "a vault needs an owner who can sign in"));
         }
         // Someone who left (or was deleted) stays out unless an owner adds them anew: a
         // roster built before they left, still listing them, mustn't bring them back.

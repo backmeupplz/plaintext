@@ -307,7 +307,7 @@ impl<T: Transport> Session<T> {
                 Err(e) if e.held_back() => full = Some(e),
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
-                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
+                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
                     if known.is_none() {
                         self.vaults.remove(id);
@@ -334,7 +334,11 @@ impl<T: Transport> Session<T> {
 
     fn pull(&mut self, id: &Hex) -> Result<()> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        let resp: VaultResponse = self.call("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE)?;
+        let resp: VaultResponse = match self.call("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE) {
+            // Waiting won't make it smaller: report this vault, sync the others.
+            Err(Error::Server(413, m)) => return Err(Error::Refused(format!("too big to pull ({m})"))),
+            r => r?,
+        };
         let v = self.vaults.get_mut(id).expect("checked above");
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
         self.gone.insert(*id, resp.gone);

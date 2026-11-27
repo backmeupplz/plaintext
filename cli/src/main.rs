@@ -823,31 +823,46 @@ fn run(cli: Cli) -> Res<()> {
             };
             let n = imported.iter().map(|v| v.items.len()).sum::<usize>();
             // The vaults first: if one can't be made, nothing is imported yet.
+            // Where each part goes: a vault we have, or (Err) one to make.
             let mut targets = Vec::new();
             for v in imported {
-                let vid = match (&vault, v.name.is_empty()) {
-                    (Some(name), _) => s.vault(name)?,
-                    (None, true) => s.default_vault()?,
-                    (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
-                    (None, false) => match s.own_vault(&v.name) {
-                        Some(id) => id,
-                        None => s.create_vault(&v.name)?,
-                    },
+                let to = match (&vault, v.name.is_empty()) {
+                    (Some(name), _) => Ok(s.vault(name)?),
+                    (None, true) => Ok(s.default_vault()?),
+                    (None, false) if v.name.eq_ignore_ascii_case("personal") => Ok(s.default_vault()?),
+                    (None, false) => s.own_vault(&v.name).ok_or(v.name),
                 };
-                targets.push((vid, v.items));
+                targets.push((to, v.items));
             }
             // A device pulls a vault's items in one response, so a vault holds at most
-            // one push's worth (sealed: padded to 256 bytes, plus 41).
-            let sealed = |it: &Item| serde_json::to_vec(it).map_or(0, |j| j.len().div_ceil(256) * 256 + 41);
+            // one push's worth: sealed, an item is padded to 256 bytes plus 41, and
+            // each attachment adds a reference of about its name plus 200.
+            let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
             let mut size = std::collections::BTreeMap::<_, usize>::new();
-            for (vid, items) in &targets {
-                let have = || s.vaults.get(vid).map_or(0, |v| v.items().map(|(_, i)| sealed(i)).sum());
-                *size.entry(*vid).or_insert_with(have) += items.iter().map(|(it, _)| sealed(it)).sum::<usize>();
+            for (to, items) in &targets {
+                let have = || to.as_ref().ok().and_then(|id| s.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
+                let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
+                *size.entry(to.clone()).or_insert_with(have) += adds;
             }
-            if let Some((vid, _)) = size.iter().find(|(_, n)| **n > plaintext_client::plaintext_core::api::MAX_PUSH) {
-                let name = s.vaults.get(vid).map_or(String::new(), |v| v.meta.name.clone());
-                return Err(format!("that's more than {name} can hold (64 MiB of items); import into several vaults (--vault)").into());
+            if let Some((to, _)) = size.iter().find(|(_, n)| **n > plaintext_client::plaintext_core::api::MAX_PUSH) {
+                let name = match to {
+                    Ok(id) => s.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
+                    Err(name) => name.clone(),
+                };
+                return Err(format!("that's more than one vault can hold (64 MiB of items, for {name}): split the file and import the parts into different vaults with --vault NAME").into());
             }
+            let mut made = Vec::new();
+            for (to, items) in targets {
+                let vid = match to {
+                    Ok(id) => id,
+                    Err(name) => match s.own_vault(&name) {
+                        Some(id) => id,
+                        None => s.create_vault(&name)?,
+                    },
+                };
+                made.push((vid, items));
+            }
+            let targets = made;
             // Every item goes into this device's copy before anything is pushed, so a
             // failed push loses nothing. Once an upload fails, the remaining
             // attachments are left out and listed.
