@@ -41,6 +41,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The server didn't take a vault's change this time: another device changed
+    /// it first (409), it was too big to send (413) or the account is full (507).
+    /// The change waits on the device for the next sync.
+    pub fn held_back(&self) -> bool {
+        matches!(self, Error::Server(409 | 413 | 507, _))
+    }
+}
 impl From<plaintext_core::Error> for Error {
     fn from(e: plaintext_core::Error) -> Self {
         Error::Core(e)
@@ -290,7 +299,7 @@ impl<T: Transport> Session<T> {
             self.vaults.entry(*id).or_insert(v);
             match self.sync_vault(id).and_then(|_| self.remove_members(id, None)) {
                 Ok(()) => {}
-                Err(e @ Error::Server(409 | 413 | 507, _)) => full = Some(e),
+                Err(e) if e.held_back() => full = Some(e),
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
@@ -543,8 +552,8 @@ impl<T: Transport> Session<T> {
     /// account is the only owner of a vault others use.
     pub fn delete_account(&mut self, d: &Derived) -> Result<()> {
         match self.sync() {
-            Ok(()) | Err(Error::Server(413 | 507, _)) => {}
-            Err(e) => return Err(e),
+            Err(e) if !e.held_back() => return Err(e),
+            _ => {}
         }
         let me = self.username().to_string();
         let mut blocking = Vec::new();

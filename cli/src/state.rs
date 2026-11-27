@@ -285,7 +285,7 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
 /// device got there first) instead of failing every command over it.
 fn sync(s: &mut S) -> Result<(), Error> {
     match s.sync() {
-        Err(e @ Error::Server(409 | 413, _)) => {
+        Err(e) if e.held_back() => {
             eprintln!("warning: {e}");
             Ok(())
         }

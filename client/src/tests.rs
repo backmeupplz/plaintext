@@ -490,7 +490,19 @@ fn storage_quota() {
     bob.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Bob's own", "y"));
     assert_eq!(status(bob.sync()), 507);
     assert!(!bob.vaults[&mine].has_changes());
-    // Removing someone (a new key) works over the quota; adding someone doesn't.
+    // Staged items count too: over the quota only an owner may stage, and only as
+    // much as the vault's items (a new key re-seals them).
+    let stage = |s: &Session<Http>, id: Hex, n: usize| {
+        let upserts = vec![ItemBlob { id: plaintext_core::new_item_id(), blob: B64(vec![1; n]) }];
+        status(s.call::<()>("POST", &format!("/v1/vaults/{personal}/stage"), Some(&StageRequest { stage: id, upserts })))
+    };
+    let st = plaintext_core::new_item_id();
+    assert_eq!(stage(&bob, st, 100), 507);
+    assert_eq!(stage(&alice, st, 100), 200);
+    assert_eq!(stage(&alice, st, 2000), 507);
+    // Over the quota, a promotion and removing someone (a new key) still work;
+    // adding someone doesn't.
+    alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
     alice.revoke(&personal, "bob").unwrap();
     assert_eq!(status(alice.share_vault(&personal, "bob", Role::Reader, None)), 507);
 
@@ -720,9 +732,18 @@ fn leaving_a_vault() {
     assert!(!bob.vaults.contains_key(&fam));
     let bot = Session::login(Http::new(&url), &derive_agent(&bot_key), "t").unwrap();
     assert_eq!(status(bot.call::<VaultResponse>("GET", &format!("/v1/vaults/{fam}"), NONE)), 404);
+    // A roster alice's device built before it saw them leave can't bring them back.
+    alice.pin_user("carol").unwrap();
+    let stale = alice.vaults[&fam].grant(&alice.me(), &alice.keyring, "carol", Role::Reader, None, now()).unwrap();
+    assert_eq!(status(alice.call::<()>("POST", &format!("/v1/vaults/{fam}/roster"), Some(&stale))), 409);
     alice.sync().unwrap();
     let r = alice.vaults[&fam].roster.clone().unwrap();
     assert_eq!((r.epoch, r.members.len()), (1, 1));
+    // A creator who leaves hands the vault to an owner who stays.
+    let club = carol.create_vault("Club").unwrap();
+    carol.share_vault(&club, "alice", Role::Owner, None).unwrap();
+    carol.leave_vault(&club).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'alice'"), 3);
 
     // The only owner can't leave a vault others use.
     let gift = bob.create_vault("Gift").unwrap();
@@ -736,7 +757,7 @@ fn leaving_a_vault() {
     carol.sync().unwrap();
     carol.leave_vault(&gift).unwrap();
     assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 1);
-    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults"), 3, "alice's two and carol's own");
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults"), 4, "alice's three and carol's own");
     let _ = std::fs::remove_file(&path);
 }
 

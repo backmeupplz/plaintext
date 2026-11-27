@@ -901,15 +901,18 @@ async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extensi
 
 // ---------- Vaults ----------
 
-/// Bytes `account` stores: items, files, rosters and the latest manifest of the
-/// vaults it created, and the share links and messages it and its agents sent.
-// ponytail: earlier manifests aren't counted (see "Known limits" in DESIGN.md).
+/// Bytes `account` stores: items, files, staged items and the latest roster and
+/// manifest of the vaults it created, and the share links and messages it and its
+/// agents sent.
+// ponytail: earlier rosters and manifests aren't counted (see "Known limits" in DESIGN.md).
 fn usage(db: &Connection, account: Option<&str>) -> R<u64> {
     db.query_row(
         &format!(
             "SELECT (SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM files WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
-                  + (SELECT COALESCE(SUM(octet_length(signed)), 0) FROM rosters WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
+                  + (SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
+                  + (SELECT COALESCE(SUM(octet_length(r.signed)), 0) FROM rosters r JOIN vaults v ON v.id = r.vault_id AND v.roster_version = r.version
+                     WHERE v.creator = ?1)
                   + (SELECT COALESCE(SUM(octet_length(m.signed)), 0) FROM manifests m JOIN vaults v ON v.id = m.vault_id AND v.counter = m.counter
                      WHERE v.creator = ?1)
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM links WHERE {})
@@ -1236,13 +1239,15 @@ async fn stage(
         )
         .map_err(db_err)?;
     }
-    // Staged items need room in the quota, except up to the size of the vault's
-    // items, which is what re-sealing them all for a new key takes.
+    // Staged items count against the vault's creator. Over the quota, an owner may
+    // still stage up to the size of the vault's items, which is what re-sealing
+    // them all for a new key takes.
     if let Some(quota) = cfg.quota {
-        let sum = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> R<u64> { tx.query_row(sql, p, |r| r.get(0)).map_err(db_err) };
-        let mine = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", &[&&vault[..], &c.username])?;
-        let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
-        if mine > items && usage(&tx, creator(&tx, &vault)?.as_deref())? + mine > quota {
+        let sum = |table: &str| -> R<u64> {
+            tx.query_row(&format!("SELECT COALESCE(SUM(length(blob)), 0) FROM {table} WHERE vault_id = ?"), [&vault[..]], |r| r.get(0)).map_err(db_err)
+        };
+        let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && sum("staged")? <= sum("items")?;
+        if !rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota {
             return Err(FULL);
         }
     }
@@ -1276,21 +1281,36 @@ async fn update_roster(
     if !(r.epoch == epoch || rotating) || rotating != u.rotation.is_some() {
         return Err((BAD, "a key change needs a rotation and vice versa"));
     }
-    // Adding or changing members needs room for the new roster version; removing
-    // someone (a new key) always works, as long as the items don't grow.
-    match &u.rotation {
-        None => within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), || {
-            store_roster(&tx, &vault, &u.roster, &r)?;
-            store_keys(&tx, &vault, &u.keys)
-        })?,
-        Some(put) => {
-            store_roster(&tx, &vault, &u.roster, &r)?;
-            store_keys(&tx, &vault, &u.keys)?;
-            push_within_quota(&tx, &cfg, &vault, || {
-                tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
-                store_put(&tx, &vault, put, &c.username)
-            })?;
+    let prev: String =
+        tx.query_row("SELECT signed FROM rosters WHERE vault_id = ? AND version = ?", params![&vault[..], version], |row| row.get(0)).map_err(db_err)?;
+    let prev: Roster = parse(&serde_json::from_str::<Signed>(&prev).map_err(db_err)?)?;
+    let had = |name: &str| prev.members.iter().any(|m| m.username == name);
+    // Someone who left (or was deleted) stays out unless an owner adds them anew: a
+    // roster built before they left, still listing them, mustn't bring them back.
+    for m in r.members.iter().filter(|m| had(&m.username)) {
+        let kept: bool = tx
+            .query_row("SELECT COUNT(*) FROM members WHERE vault_id = ? AND username = ?", params![&vault[..], m.username], |row| row.get(0))
+            .map_err(db_err)?;
+        if !kept {
+            return Err((StatusCode::CONFLICT, "someone left the vault, pull first"));
         }
+    }
+    // Adding someone needs room for the longer roster. Other changes (a promotion,
+    // removing someone with a new key) always go through, as long as the items don't grow.
+    let store = || -> R<()> {
+        store_roster(&tx, &vault, &u.roster, &r)?;
+        store_keys(&tx, &vault, &u.keys)
+    };
+    if r.members.iter().any(|m| !had(&m.username)) {
+        within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), store)?;
+    } else {
+        store()?;
+    }
+    if let Some(put) = &u.rotation {
+        push_within_quota(&tx, &cfg, &vault, || {
+            tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
+            store_put(&tx, &vault, put, &c.username)
+        })?;
     }
     audit_log(&tx, &vault, &c.username, &format!("roster v{}", r.version))?;
     tx.commit().map_err(db_err)?;

@@ -822,35 +822,66 @@ fn run(cli: Cli) -> Res<()> {
                 _ => import::csv(&String::from_utf8_lossy(&data))?,
             };
             let n = imported.iter().map(|v| v.items.len()).sum::<usize>();
-            let sent = (|| -> Res<()> {
-                for v in imported {
-                    let vid = match (&vault, v.name.is_empty()) {
-                        (Some(name), _) => s.vault(name)?,
-                        (None, true) => s.default_vault()?,
-                        (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
-                        (None, false) => match s.own_vault(&v.name) {
-                            Some(id) => id,
-                            None => s.create_vault(&v.name)?,
-                        },
-                    };
-                    for (it, files) in v.items {
-                        let mut it = it;
-                        for (name, bytes) in files {
-                            it.files.push(s.upload_file(&vid, &name, &bytes)?);
-                        }
-                        s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
-                    }
-                    s.sync_vault(&vid)?;
-                }
-                Ok(())
-            })();
-            // What was imported but not sent stays on this device for the next sync,
-            // with the attachments it already uploaded.
-            state::save(&s)?;
-            if let Err(e) = sent {
-                return Err(format!("{e}\nThe items imported so far are saved on this device and go to the server with the next sync; don't import {file} again.").into());
+            // The vaults first: if one can't be made, nothing is imported yet.
+            let mut targets = Vec::new();
+            for v in imported {
+                let vid = match (&vault, v.name.is_empty()) {
+                    (Some(name), _) => s.vault(name)?,
+                    (None, true) => s.default_vault()?,
+                    (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
+                    (None, false) => match s.own_vault(&v.name) {
+                        Some(id) => id,
+                        None => s.create_vault(&v.name)?,
+                    },
+                };
+                targets.push((vid, v.items));
             }
-            say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
+            // Every item goes into this device's copy before anything is pushed, so a
+            // failed push loses nothing. Once an upload fails, the remaining
+            // attachments are left out and listed.
+            let (mut upload_err, mut skipped, mut vids) = (None, Vec::new(), Vec::new());
+            for (vid, items) in targets {
+                for (mut it, files) in items {
+                    for (name, bytes) in files {
+                        if upload_err.is_none() {
+                            match s.upload_file(&vid, &name, &bytes) {
+                                Ok(f) => {
+                                    it.files.push(f);
+                                    continue;
+                                }
+                                Err(e) => upload_err = Some(e),
+                            }
+                        }
+                        skipped.push(format!("{}: {name}", it.title));
+                    }
+                    s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
+                }
+                if !vids.contains(&vid) {
+                    vids.push(vid);
+                }
+            }
+            let mut sync_err = None;
+            for vid in &vids {
+                if let Err(e) = s.sync_vault(vid) {
+                    sync_err.get_or_insert(e);
+                }
+            }
+            state::save(&s)?;
+            if let Some(e) = upload_err {
+                eprintln!("warning: {e}");
+                say!("These attachments weren't uploaded; add them with `plaintext attach ITEM FILE`:");
+                for f in &skipped {
+                    say!("  {f}");
+                }
+            }
+            if let Some(e) = sync_err {
+                return Err(format!("{e}\nThe {n} items are saved on this device and go to the server with the next sync; don't import {file} again.").into());
+            }
+            if skipped.is_empty() {
+                say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
+            } else {
+                say!("Imported {n} items. Delete {file} once the attachments above are in: it holds your passwords unencrypted.");
+            }
         }
         Cmd::Export { vault } => {
             let s = state::open()?;
@@ -985,6 +1016,15 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
         }
         VaultCmd::Leave { vault } => {
             let id = s.vault(&vault)?;
+            let name = s.vaults[&id].meta.name.clone();
+            println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
+            print!("Type the vault's name ({name}) to confirm: ");
+            std::io::stdout().flush()?;
+            let mut typed = String::new();
+            std::io::stdin().read_line(&mut typed)?;
+            if typed.trim() != name {
+                return Err("that's not the vault's name; you're still in it".into());
+            }
             s.leave_vault(&id)?;
             say!("Left {vault}.");
         }
