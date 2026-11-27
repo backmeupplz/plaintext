@@ -779,3 +779,89 @@ fn attachments_are_padded() {
     let old = seal(&key, &ad("file", &[&vault, &file]), b"old file");
     assert_eq!(&open_file(&key, &vault, &file, 8, &old).unwrap()[..], b"old file");
 }
+
+/// A pull with just this manifest and its blobs (what the server sends after `p`).
+fn delta(log: &Log, p: &VaultPut) -> VaultResponse {
+    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![] }
+}
+
+fn titles(v: &Vault) -> Vec<String> {
+    let mut t: Vec<String> = v.items().map(|(_, i)| format!("{}={}", i.title, i.password)).collect();
+    t.sort();
+    t
+}
+
+/// #987: an item edited here while the server also changed it keeps syncing
+/// afterwards, though later pulls don't resend that item's blob.
+#[test]
+fn pending_edit_keeps_syncing_after_a_conflict() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let id = new_item_id();
+    v1.put(id, login("bank", "one"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    let mut v2 = Vault::new(v1.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v1.put(id, login("bank", "from device 1"));
+    let p1 = v1.push(&me, 0).unwrap();
+    v1.pushed(&p1);
+    log.put(&p1);
+    v2.put(id, login("bank", "from device 2"));
+    v2.apply(&delta(&log, &p1), &mut a, 0).unwrap();
+    // Device 1 adds something else; device 2 pulls again, its edit still pending.
+    v1.put(new_item_id(), login("other", "x"));
+    let p2 = v1.push(&me, 0).unwrap();
+    v1.pushed(&p2);
+    log.put(&p2);
+    v2.apply(&delta(&log, &p2), &mut a, 0).unwrap();
+    let p3 = v2.push(&me, 0).unwrap();
+    v2.pushed(&p3);
+    log.put(&p3);
+    let mut fresh = Vault::new(v1.id);
+    fresh.apply(&log.full("alice"), &mut a, 0).unwrap();
+    assert_eq!(titles(&fresh), ["bank (conflict)=from device 1", "bank=from device 2", "other=x"]);
+}
+
+/// #987, the re-seal case: a key rotation re-seals an item edited or deleted here.
+#[test]
+fn pending_edit_and_delete_keep_syncing_after_a_rotation() {
+    let (mut a, _) = pair();
+    let am = a.me();
+    let (mut v, nv) = Vault::create(&am, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let (x, y) = (new_item_id(), new_item_id());
+    v.put(x, login("edit me", "old"));
+    v.put(y, login("delete me", "y"));
+    let p = v.push(&am, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+    let g = v.grant(&am, &a, "bob", Role::Reader, None, 0).unwrap();
+    log.roster(&g);
+    adopt(&mut v, &log, &g, &mut a);
+    let mut d2 = Vault::new(v.id);
+    d2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    let r = v.revoke(&am, &["bob"], 0).unwrap();
+    log.roster(&r);
+    let rot = r.rotation.as_ref().unwrap();
+    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![] };
+    v.apply(&rotation, &mut a, 0).unwrap();
+    d2.put(x, login("edit me", "new"));
+    d2.delete(y);
+    d2.apply(&rotation, &mut a, 0).unwrap();
+    // The laptop adds an item; device 2 pulls again with both changes pending.
+    v.put(new_item_id(), login("later", "z"));
+    let p2 = v.push(&am, 0).unwrap();
+    v.pushed(&p2);
+    log.put(&p2);
+    d2.apply(&delta(&log, &p2), &mut a, 0).unwrap();
+    let p3 = d2.push(&am, 0).unwrap();
+    d2.pushed(&p3);
+    log.put(&p3);
+    let mut fresh = Vault::new(v.id);
+    fresh.apply(&log.full("alice"), &mut a, 0).unwrap();
+    assert_eq!(titles(&fresh), ["edit me=new", "later=z"]);
+}

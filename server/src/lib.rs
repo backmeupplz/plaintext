@@ -62,7 +62,7 @@ const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
 const TOO_BIG: (StatusCode, &str) = (StatusCode::PAYLOAD_TOO_LARGE, "more items than a device can pull in one go: push fewer at a time");
 /// 507, not 413: clients tell a full account from a request that's too big.
 const FULL: (StatusCode, &str) =
-    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items, files or share links to make room");
+    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items or share links to make room (their attachments are freed about a week later, by a device that syncs the vault)");
 
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
@@ -221,6 +221,7 @@ fn app(db: Connection, cfg: Config) -> Router {
         .route("/v1/vaults/{id}/stage", post(stage.layer(big(VAULT_BODY))))
         .route("/v1/vaults/{id}/leave", post(leave))
         .route("/v1/vaults/{id}/audit", get(audit))
+        .route("/v1/vaults/{id}/files", get(list_files))
         .route("/v1/vaults/{id}/files/{fid}", get(get_file).put(put_file.layer(big(MAX_FILE))).delete(delete_file))
         .route("/v1/messages", get(inbox).post(send_message.layer(big(BLOB_BODY))))
         .route("/v1/messages/{id}", axum::routing::delete(delete_message))
@@ -1438,6 +1439,20 @@ async fn put_file(
     })?;
     tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_files(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<Json<FileList>> {
+    let vault = hex_id(&id)?;
+    let db = lock(&db);
+    let c = caller(&db, &h)?;
+    need_role(&db, &vault, &c.username, Role::Writer)?;
+    let mut st = db.prepare("SELECT id, length(blob) FROM files WHERE vault_id = ? ORDER BY id").map_err(db_err)?;
+    let files = st
+        .query_map([&vault[..]], |r| Ok(FileInfo { id: Hex(r.get(0)?), size: r.get(1)? }))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    Ok(Json(FileList { now: now(), files }))
 }
 
 async fn get_file(State(db): State<Db>, h: HeaderMap, Path((id, fid)): Path<(String, String)>) -> R<Vec<u8>> {
