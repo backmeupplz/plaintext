@@ -211,10 +211,28 @@ pub fn receive(keyring: &Keyring, s: &Signed, now: u64) -> Result<(Message, Cont
 
 /// Seal an item for a link. The returned fragment goes after `#` in the URL and
 /// never reaches any server.
+///
+/// Only the current, visible fields go in: no password history, old versions,
+/// passkey private keys, attachment keys, flags or unknown top-level fields
+/// (`extra`, which a newer client may have used for anything).
 pub fn create_link(item: &Item, expires: u64, max_views: Option<u32>) -> (NewLink, String) {
+    let shown = Item {
+        kind: item.kind.clone(),
+        title: item.title.clone(),
+        username: item.username.clone(),
+        password: item.password.clone(),
+        urls: item.urls.clone(),
+        totp: item.totp.clone(),
+        notes: item.notes.clone(),
+        sections: item.sections.clone(),
+        tags: item.tags.clone(),
+        created: item.created,
+        updated: item.updated,
+        ..Default::default()
+    };
     let id = Hex(random());
     let key = random_key();
-    let blob = seal_json(&key, &ad("link", &[&id.0]), item);
+    let blob = seal_json(&key, &ad("link", &[&id.0]), &shown);
     (NewLink { id, blob: B64(blob), expires, max_views }, hex::encode(&key[..]))
 }
 

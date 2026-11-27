@@ -100,7 +100,7 @@ Each vault has a counter and a **manifest chain**. A manifest is a signed envelo
 
 - **Sharing one item with a user:** the item is sealed to their pinned key, signed, and placed in their inbox with an optional expiry. They save it into a vault or delete it.
 - **Access requests:** an agent sends its owner a sealed, signed request ("need the prod DB password for the migration"). The owner grants vault access or sends the item.
-- **Share links** for people without an account: the item is sealed with a random key that exists only in the link's `#fragment`; the server stores the blob with an expiry (≤ 30 days) and optional view limit, and serves it without authentication. The link opens a static viewer at `getplaintext.org/s/`, so the self-hosted server never serves the code that decrypts. Whoever controls getplaintext.org's hosting could, in principle, serve a malicious viewer; that page is static, open source and small.
+- **Share links** for people without an account: the item's current fields (no password history, earlier versions, passkeys or attachments) are sealed with a random key that exists only in the link's `#fragment`; the server stores the blob with an expiry (≤ 30 days) and optional view limit, and serves it without authentication. The link opens a static viewer at `getplaintext.org/s/`, so the self-hosted server never serves the code that decrypts. Whoever controls getplaintext.org's hosting could, in principle, serve a malicious viewer; that page is static, open source and small.
 
 ## Agents
 

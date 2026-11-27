@@ -1,4 +1,5 @@
 use super::*;
+use crate::item::{Field, FileRef, Passkey, Section};
 use crate::vault::Vault;
 
 const BLOB_VECTOR: &str = "01030303030303030303030303030303030303030303030303f46a2a721b55a38803873c9683da27fbe1fc928015e0d59931";
@@ -319,6 +320,45 @@ fn messages_and_links() {
     let (link, frag) = create_link(&item, 100, Some(1));
     assert_eq!(open_link(&link.id, &link.blob.0, &frag).unwrap(), item);
     assert!(open_link(&new_item_id(), &link.blob.0, &frag).is_err());
+}
+
+#[test]
+fn links_carry_only_the_current_item() {
+    let version = |pw: &str| Item {
+        username: "me".into(),
+        urls: vec!["https://x.test".into()],
+        totp: "JBSWY3DPEHPK3PXP".into(),
+        notes: "router in the hall".into(),
+        sections: vec![Section { title: "s".into(), fields: vec![Field { label: "pin".into(), kind: "concealed".into(), value: "1234".into(), ..Default::default() }] }],
+        tags: vec!["home".into()],
+        ..login("wifi", pw)
+    };
+    let mut item = version("first-pw-1");
+    item.edit(version("second-pw-2"), 10);
+    item.edit(version("current-pw-3"), 20);
+    item.favorite = true;
+    item.archived = true;
+    item.passkeys.push(Passkey {
+        rp_id: "x.test".into(),
+        credential_id: B64(vec![1]),
+        user_handle: B64(vec![2]),
+        user_name: "me".into(),
+        private_key: B64(b"passkey-private".to_vec()),
+        counter: 0,
+        created: 0,
+    });
+    item.files.push(FileRef { id: new_item_id(), name: "f".into(), size: 1, key: B64(b"file-key-bytes".to_vec()), hash: B64(vec![3]) });
+    item.extra.insert("future".into(), "future-secret".into());
+    assert!(!item.history.is_empty() && !item.password_history.is_empty());
+
+    let (link, frag) = create_link(&item, 100, None);
+    let got = open_link(&link.id, &link.blob.0, &frag).unwrap();
+    let want = Item { history: vec![], password_history: vec![], passkeys: vec![], files: vec![], favorite: false, archived: false, extra: Default::default(), ..item.clone() };
+    assert_eq!(got, want);
+    let json = serde_json::to_string(&got).unwrap();
+    for leak in ["first-pw-1", "second-pw-2", "future-secret"] {
+        assert!(!json.contains(leak), "{leak} leaked into a link");
+    }
 }
 
 #[test]

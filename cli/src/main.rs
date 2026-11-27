@@ -563,6 +563,9 @@ fn run(cli: Cli) -> Res<()> {
             let (_, _, it) = s.one(&item, None)?;
             let cfg = state::load_config()?;
             println!("{}", s.create_link(&cfg.server, &it, now() + duration(&expires)?, views)?);
+            if !it.files.is_empty() || !it.passkeys.is_empty() {
+                eprintln!("Attachments and passkeys aren't included in share links.");
+            }
         }
         Cmd::Inbox { save, vault, delete } => {
             let mut s = state::open()?;
