@@ -13,7 +13,22 @@ cd "$(dirname "$0")/.."
 sim=$1 theme=$2 out=$3
 tmp=$(mktemp -d)
 cargo build -q -p plaintext-server -p plaintext-cli
-pt() { PLAINTEXT_HOME="$tmp/bob" PLAINTEXT_KEYCHAIN=file target/debug/plaintext "$@"; }
+# The CLI keeps its unlocked session per terminal, so each call gets a pty that
+# answers bob's password prompt.
+cat >"$tmp/pt.exp" <<'EXP'
+set timeout 60
+log_user 1
+spawn -noecho {*}$argv
+expect {
+  "Password for" { send "$env(PT_PW)\r"; exp_continue }
+  "Password: " { send "$env(PT_ITEM_PW)\r"; exp_continue }
+  "One-time password secret" { send "JBSWY3DPEHPK3PXP\r"; exp_continue }
+  eof
+}
+lassign [wait] pid spawnid os code
+exit $code
+EXP
+pt() { PT_PW="bob's long password" PLAINTEXT_HOME="$tmp/bob" PLAINTEXT_KEYCHAIN=file expect "$tmp/pt.exp" target/debug/plaintext "$@"; }
 
 PLAINTEXT_ADDR=127.0.0.1:7959 PLAINTEXT_DB="$tmp/db" PLAINTEXT_SETUP_CODE=setup target/debug/plaintext-server >"$tmp/server.log" 2>&1 &
 server=$!
@@ -26,14 +41,14 @@ sk=$(PLAINTEXT_HOME="$tmp/bob" PLAINTEXT_KEYCHAIN=file expect -c "
   spawn target/debug/plaintext signup --server $url --username bob --invite setup
   expect \"New password:\"; send \"bob's long password\r\"
   expect \"Again:\"; send \"bob's long password\r\"
-  expect eof" | grep -o 'A1-[A-Z0-9-]*' | head -1)
+  expect eof" | grep -o 'A1-[A-Z0-9-]*' | sed -n 1p)
 pt vault create Family >/dev/null
 pt add "Home Wi-Fi" --kind wifi --vault Family --concealed "Wireless password=sunny-meadow-42" --field "Network name=Meadow" >/dev/null
 pt add Netflix --vault Family --username family@example.com --generate --url https://netflix.com >/dev/null
-pt add "Family email" --vault Family --username family@example.com --generate --totp JBSWY3DPEHPK3PXP --url https://mail.example.com >/dev/null
-pt add "Router" --vault Family --username admin --password admin --url http://192.168.1.1 >/dev/null
-pt add "Door code" --kind password --password 4711 >/dev/null
-invite=$(pt user invite | sed -n 's/.*--invite \([^ ]*\).*/\1/p')
+pt add "Family email" --vault Family --username family@example.com --generate --totp --url https://mail.example.com >/dev/null
+PT_ITEM_PW=admin pt add "Router" --vault Family --username admin --password --url http://192.168.1.1 >/dev/null
+PT_ITEM_PW=4711 pt add "Door code" --kind password --password >/dev/null
+invite=$(pt user invite | tr -d '\r' | sed -n 's/.*--invite \([^ ]*\).*/\1/p')
 
 # Once alice exists, bob shares Family with her and sends her an item.
 (

@@ -271,6 +271,7 @@ struct ItemList: View {
             }
         }
         .swipeActions(edge: .trailing) {
+            if model.canEdit(s.ref) {
             Button { model.setFlags(s.ref, favorite: !s.favorite, archived: s.archived) } label: {
                 Label(s.favorite ? "Unfavorite" : "Favorite", systemImage: s.favorite ? "star.slash" : "star")
             }
@@ -279,6 +280,7 @@ struct ItemList: View {
                 Label(s.archived ? "Unarchive" : "Archive", systemImage: "archivebox")
             }
             .tint(Palette.muted)
+            }
         }
     }
 }
@@ -299,12 +301,14 @@ struct QuickActions: View {
         if item.hasUsername { Button { model.copyField(item.ref, "username") } label: { Label("Copy username", systemImage: "person") } }
         if item.hasPassword { Button { model.copyField(item.ref, "password") } label: { Label("Copy password", systemImage: "key") } }
         if item.hasTotp { Button { model.copyField(item.ref, "totp") } label: { Label("Copy one-time code", systemImage: "clock") } }
-        Divider()
-        Button { model.setFlags(item.ref, favorite: !item.favorite, archived: item.archived) } label: {
-            Label(item.favorite ? "Remove from Favorites" : "Add to Favorites", systemImage: "star")
+        if model.canEdit(item.ref) {
+            Divider()
+            Button { model.setFlags(item.ref, favorite: !item.favorite, archived: item.archived) } label: {
+                Label(item.favorite ? "Remove from Favorites" : "Add to Favorites", systemImage: "star")
+            }
+            Button { model.edit(item.ref) } label: { Label("Edit", systemImage: "pencil") }
+            Button(role: .destructive) { model.delete(item.ref, title: item.title) } label: { Label("Delete", systemImage: "trash") }
         }
-        Button { model.edit(item.ref) } label: { Label("Edit", systemImage: "pencil") }
-        Button(role: .destructive) { model.delete(item.ref, title: item.title) } label: { Label("Delete", systemImage: "trash") }
     }
 }
 

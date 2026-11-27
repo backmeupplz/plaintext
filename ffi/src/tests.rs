@@ -136,6 +136,11 @@ fn app_end_to_end() {
     alice.share_vault(a.clone(), work.clone(), "Bob".into(), Role::Writer, None).unwrap();
     bob.sync(b.clone()).unwrap();
     assert_eq!(bob.items(None, Some(work.clone()), "".into(), false)[0].title, "GitHub");
+    // A vault bob can only view: his edits are refused instead of queueing forever.
+    let view = alice.create_vault(a.clone(), "View".into()).unwrap();
+    alice.share_vault(a.clone(), view.clone(), "bob".into(), Role::Reader, None).unwrap();
+    bob.sync(b.clone()).unwrap();
+    assert!(matches!(bob.put_item(b.clone(), view.clone(), None, item_template("login".into())), Err(PlaintextError::ReadOnly)));
     let members = alice.members(a.clone(), work.clone()).unwrap();
     assert!(members[0].is_me && members.iter().any(|m| m.username == "bob" && m.verified && m.role == Role::Writer));
 

@@ -33,6 +33,14 @@ enum EmergencyKit {
         if let url { try? FileManager.default.removeItem(at: url) }
     }
 
+    /// At launch: kits left behind when the app was quit with one on screen.
+    static func discardLeftovers() {
+        let tmp = FileManager.default.temporaryDirectory
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? [] where name.hasPrefix("Plaintext Emergency Kit") {
+            discard(tmp.appendingPathComponent(name))
+        }
+    }
+
     @MainActor
     static func print(_ url: URL) {
         #if os(iOS)

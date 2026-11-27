@@ -10,6 +10,7 @@ struct PlaintextMain: App {
     @StateObject private var model = AppModel()
 
     init() {
+        EmergencyKit.discardLeftovers()
         #if DEBUG && os(macOS)
         ShotDriver.start()
         #endif
@@ -208,7 +209,7 @@ struct AppCommands: Commands {
             Divider()
             Button("Edit") { model.summary(model.selection).map { model.edit($0.ref) } }
                 .keyboardShortcut("e")
-                .disabled(model.selection == nil)
+                .disabled(model.summary(model.selection).map { !model.canEdit($0.ref) } ?? true)
             Divider()
             Button("Lock") { model.lock() }
                 .keyboardShortcut("l", modifiers: [.command, .control])

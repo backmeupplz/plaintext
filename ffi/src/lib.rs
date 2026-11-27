@@ -151,6 +151,9 @@ pub struct SignupResult {
     /// Show once, on the Emergency Kit.
     pub secret_key: String,
     pub unlock: UnlockData,
+    /// The server showed keys for whoever sent the invite that don't match the
+    /// invite: show it next to the Emergency Kit.
+    pub warning: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -917,6 +920,13 @@ fn not_found(what: &str) -> PlaintextError {
     PlaintextError::NotFound { message: what.into() }
 }
 
+fn writable(s: &S, vid: &Hex) -> Res<()> {
+    match s.vaults.get(vid).ok_or_else(|| not_found("that vault"))?.role(s.username(), now()) {
+        Some(r) if r >= CoreRole::Writer => Ok(()),
+        _ => Err(PlaintextError::ReadOnly),
+    }
+}
+
 fn get_item(s: &S, vid: &Hex, iid: &Hex) -> Res<Item> {
     s.vaults.get(vid).and_then(|v| v.get(iid)).cloned().ok_or_else(|| not_found("that item"))
 }
@@ -953,14 +963,18 @@ impl PlaintextApp {
             },
         };
         // Checked after the account exists, so a mismatch never costs the Secret Key.
-        if let Some(Err(e)) = invite.as_deref().filter(|c| c.contains('.')).map(|c| s.trust_inviter(c)) {
-            s.problems.push(format!("couldn't confirm who invited you ({e}). Compare fingerprints in person before you share anything with them"));
-        }
+        let warning = match invite.as_deref().filter(|c| c.contains('.')).map(|c| s.trust_inviter(c)) {
+            Some(Err(e)) => Some(format!(
+                "Plaintext couldn't confirm who invited you ({}). Someone may be listening in: compare fingerprints in person before you share anything with them.",
+                PlaintextError::from(e)
+            )),
+            _ => None,
+        };
         let _ = s.sync();
         let unlock = unlock_of(&s);
         let id = hex::encode(s.account.id);
         let account = self.start(s, server).or_else(|_| Ok::<_, PlaintextError>(self.acct(&id)?.info.read().expect("lock").clone()))?;
-        Ok(SignupResult { account, secret_key: sk.encode(), unlock })
+        Ok(SignupResult { account, secret_key: sk.encode(), unlock, warning })
     }
 
     /// Sign in with the password and Secret Key (a new device, another account,
@@ -974,7 +988,9 @@ impl PlaintextApp {
             r => r?,
         };
         s.load_local(&self.dir_for(&s.account))?;
-        s.sync()?;
+        // Signed in either way: what this sync couldn't do (a full account, a
+        // server error) shows on the next one instead of locking the device out.
+        let _ = s.sync();
         let unlock = unlock_of(&s);
         let account = self.start(s, server)?;
         Ok(LoginResult { account, unlock })
@@ -989,7 +1005,7 @@ impl PlaintextApp {
             Ok(mut s) => {
                 s.load_local(&self.dir_for(&s.account))?;
                 match s.sync() {
-                    Ok(()) | Err(ClientError::Network(_)) => s,
+                    Ok(()) | Err(ClientError::Network(_) | ClientError::Server(500.., _)) => s,
                     // Signed out: stays locked until the password signs in again.
                     Err(ClientError::Server(401, _)) => return Err(PlaintextError::SignedOut),
                     // Anything else (a rollback, a changed key) opens with a warning.
@@ -999,7 +1015,8 @@ impl PlaintextApp {
                     }
                 }
             }
-            Err(ClientError::Network(_)) => {
+            // Down (also behind a proxy answering 502/503): open from this device's copies.
+            Err(ClientError::Network(_) | ClientError::Server(500.., _)) => {
                 let account = account_of(&unlock)?;
                 let dir = self.dir_for(&account);
                 Session::offline(Http::new(&server), unlock.token, account, &dir)?
@@ -1040,7 +1057,13 @@ impl PlaintextApp {
     /// Sign this device out of one account: end the session on the server (when
     /// reachable) and delete this device's copies.
     pub fn sign_out(&self, account: String) {
-        let Ok(a) = self.acct(&account) else { return };
+        let Ok(a) = self.acct(&account) else {
+            // Locked: no session to end here, but the copies still go.
+            if account.len() == 32 && hex::decode(&account).is_ok() {
+                let _ = std::fs::remove_dir_all(self.dir.join("vaults").join(&account[..16]));
+            }
+            return;
+        };
         self.drop_account(&account);
         let s = a.session.lock().unwrap_or_else(|e| e.into_inner());
         let _ = s.logout();
@@ -1141,7 +1164,7 @@ impl PlaintextApp {
             Some(i) => (hex_id(i)?, true),
             None => (core::new_item_id(), false),
         };
-        self.local_first(&account, |s| {
+        self.local_first(&account, &vid, |s| {
             let next = if existing {
                 let old = get_item(s, &vid, &iid)?;
                 let mut it = old.clone();
@@ -1161,7 +1184,7 @@ impl PlaintextApp {
     /// Favorite or archive without making a new version.
     pub fn set_flags(&self, account: String, vault: String, id: String, favorite: bool, archived: bool) -> Res<()> {
         let (vid, iid) = (hex_id(&vault)?, hex_id(&id)?);
-        self.local_first(&account, |s| {
+        self.local_first(&account, &vid, |s| {
             let mut it = get_item(s, &vid, &iid)?;
             (it.favorite, it.archived) = (favorite, archived);
             Ok(s.put_item(&vid, iid, it)?)
@@ -1172,7 +1195,7 @@ impl PlaintextApp {
     /// current one goes into history in turn.
     pub fn restore_version(&self, account: String, vault: String, id: String, index: u32) -> Res<()> {
         let (vid, iid) = (hex_id(&vault)?, hex_id(&id)?);
-        self.local_first(&account, |s| {
+        self.local_first(&account, &vid, |s| {
             let cur = get_item(s, &vid, &iid)?;
             let old = cur.history.get(index as usize).cloned().ok_or_else(|| not_found("that version"))?;
             let mut old: Item = serde_json::from_value(old).map_err(|_| PlaintextError::Invalid { message: "that version is unreadable".into() })?;
@@ -1186,7 +1209,7 @@ impl PlaintextApp {
 
     pub fn delete_item(&self, account: String, vault: String, id: String) -> Res<()> {
         let (vid, iid) = (hex_id(&vault)?, hex_id(&id)?);
-        self.local_first(&account, |s| Ok(s.delete_item(&vid, iid)?))
+        self.local_first(&account, &vid, |s| Ok(s.delete_item(&vid, iid)?))
     }
 
     /// Move to another vault, also one of another account (attachments are
@@ -1194,6 +1217,7 @@ impl PlaintextApp {
     pub fn move_item(&self, account: String, vault: String, id: String, to_account: String, to_vault: String) -> Res<String> {
         let (vid, iid, to) = (hex_id(&vault)?, hex_id(&id)?, hex_id(&to_vault)?);
         let (mut it, files) = self.with(&account, |s| {
+            writable(s, &vid)?;
             let it = get_item(s, &vid, &iid)?;
             let mut files = Vec::new();
             for f in &it.files {
@@ -1204,7 +1228,7 @@ impl PlaintextApp {
         it.files.clear();
         let nid = core::new_item_id();
         self.with(&to_account, |s| {
-            s.vaults.get(&to).ok_or_else(|| not_found("that vault"))?;
+            writable(s, &to)?;
             for (name, data) in &files {
                 it.files.push(s.upload_file(&to, name, data)?);
             }
@@ -1217,6 +1241,7 @@ impl PlaintextApp {
     pub fn attach_file(&self, account: String, vault: String, id: String, name: String, data: Vec<u8>) -> Res<()> {
         let (vid, iid) = (hex_id(&vault)?, hex_id(&id)?);
         self.with(&account, |s| {
+            writable(s, &vid)?;
             let mut it = get_item(s, &vid, &iid)?;
             it.files.push(s.upload_file(&vid, &name, &data)?);
             Ok(s.put_item(&vid, iid, it)?)
@@ -1234,13 +1259,13 @@ impl PlaintextApp {
 
     /// Local Watchtower checks over every account's vaults (archived items skipped).
     pub fn watchtower(&self) -> Vec<WatchItem> {
-        let rows = self.rows.read().expect("lock");
-        let found = tools::watchtower(rows.iter().map(|r| (r.id, &r.item)));
+        let all = self.rows.read().expect("lock");
+        // A vault shared between two of your accounts counts once.
         let mut seen = std::collections::BTreeSet::new();
+        let rows: Vec<&Row> = all.iter().filter(|r| seen.insert((r.vault, r.id))).collect();
+        let found = tools::watchtower(rows.iter().map(|r| (r.id, &r.item)));
         let mut out: Vec<WatchItem> = rows
             .iter()
-            // A vault shared between two of your accounts shows up once.
-            .filter(|r| seen.insert((r.vault, r.id)))
             .filter_map(|r| {
                 let f = found.get(&r.id)?;
                 let reused_with = rows
@@ -1617,7 +1642,7 @@ impl PlaintextApp {
         // A session that was locked or signed out meanwhile must not write over
         // newer snapshots (or bring back a folder `sign_out` removed).
         if !self.accounts.read().expect("lock").iter().any(|x| Arc::ptr_eq(x, a)) {
-            return Ok(());
+            return Err(PlaintextError::Locked);
         }
         let saved = s.save_local(&self.dir_for(&s.account));
         let me = s.username().to_string();
@@ -1678,9 +1703,14 @@ impl PlaintextApp {
 
     /// Like `with`, but a network failure isn't one: the change is saved on this
     /// device and goes out with the next sync.
-    fn local_first(&self, account: &str, f: impl FnOnce(&mut S) -> Res<()>) -> Res<()> {
-        match self.with(account, f) {
+    /// Edits to a vault you can only view are refused: they'd never reach the server.
+    fn local_first(&self, account: &str, vault: &Hex, f: impl FnOnce(&mut S) -> Res<()>) -> Res<()> {
+        match self.with(account, |s| {
+            writable(s, vault)?;
+            f(s)
+        }) {
             Err(PlaintextError::Network { .. }) => Ok(()),
+            Err(PlaintextError::Server { code: 500.., .. }) => Ok(()),
             r => r,
         }
     }

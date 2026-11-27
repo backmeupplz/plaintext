@@ -353,6 +353,7 @@ struct KitStep: View {
                 }
                 LabeledRow(label: "Server", value: r.account.server)
                 LabeledRow(label: "Username", value: r.account.username)
+                if let w = r.warning { Note(text: w, icon: "exclamationmark.triangle", color: Palette.warn) }
             }
         } actions: {
             if let pdf {

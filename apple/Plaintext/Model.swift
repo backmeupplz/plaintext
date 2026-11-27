@@ -269,7 +269,8 @@ final class AppModel: ObservableObject {
 
     func lock() {
         // Without a stored session the next unlock signs in again, so end these.
-        core.lock(endSessions: !sessionsStored)
+        // Not mid-onboarding, though: that session is about to be stored.
+        core.lock(endSessions: !sessionsStored && !onboarding)
         accounts = []
         items = []
         vaults = []
@@ -335,6 +336,7 @@ final class AppModel: ObservableObject {
                 if let box { inbox[id] = box }
                 if let err, !(err is CancellationError) {
                     if case PlaintextError.Network = err { continue }
+                    if case PlaintextError.Locked = err { continue }
                     if case PlaintextError.SignedOut = err, let k = known(id) {
                         // Keep this device's copies: they hold the rollback guard and pins.
                         Keychain.forget(k, sessionOnly: true)
@@ -345,7 +347,14 @@ final class AppModel: ObservableObject {
             }
         }
         reload()
-        if let firstError { show(firstError) } else if let p = accounts.lazy.flatMap(\.problems).first { banner = capitalized(p) }
+        // The server signed this device out of its only open account.
+        if accounts.isEmpty, !locked { lock() }
+        if let firstError {
+            show(firstError)
+        } else if let p = accounts.lazy.flatMap(\.problems).first {
+            // The client's text can end with a CLI hint; the app has its own Verify screen.
+            banner = capitalized(p.components(separatedBy: " (plaintext ").first ?? p)
+        }
     }
 
     private func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
@@ -364,6 +373,7 @@ final class AppModel: ObservableObject {
     var inboxCount: Int { inbox.values.reduce(0) { $0 + $1.filter { !$0.id.isEmpty }.count } }
 
     func vault(_ ref: ItemRef) -> VaultInfo? { vaults.first { $0.accountId == ref.account && $0.id == ref.vault } }
+    func canEdit(_ ref: ItemRef) -> Bool { vault(ref)?.role.map { $0 != .reader } ?? false }
     func vault(account: String, id: String) -> VaultInfo? { vaults.first { $0.accountId == account && $0.id == id } }
 
     /// Where a new item goes: the selected vault if it's writable, else the
