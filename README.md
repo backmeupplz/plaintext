@@ -7,21 +7,23 @@ Site: https://getplaintext.org. Status: the protocol, server, command line and M
 ## Run the server
 
 ```sh
-docker build -t plaintext .
-docker run -d --name plaintext -v plaintext:/data -p 8080:8080 \
-  -e PLAINTEXT_URL=https://vault.example.com -e PLAINTEXT_SETUP_CODE=pick-a-random-string plaintext
+docker run -d --name plaintext -v plaintext:/data -p 127.0.0.1:8080:8080 \
+  -e PLAINTEXT_URL=https://vault.example.com \
+  -e PLAINTEXT_SETUP_CODE=a-long-random-string ghcr.io/backmeupplz/plaintext-server
 ```
 
-Put it behind HTTPS at any address you like: your own domain, a LAN address or a Tailscale name, and set `PLAINTEXT_URL` to that address. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). Settings:
+The image (amd64 and arm64) holds only the static server binary, and `docker build -t plaintext .` builds an image from source instead. Each [release](https://github.com/backmeupplz/plaintext/releases/latest) also has `plaintext-server` binaries for Linux (static) and macOS, which read the same settings as the image.
+
+Put it behind HTTPS at any address you like (your own domain, a LAN address or a Tailscale name) and set `PLAINTEXT_URL` to that address. The port above only listens on the machine itself, so drop the `127.0.0.1:` if your proxy runs somewhere else. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). Settings, all optional except `PLAINTEXT_URL` on anything but your own machine:
 
 | Variable | |
 |---|---|
-| `PLAINTEXT_SETUP_CODE` | On a server reachable from the internet, set it to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account. |
+| `PLAINTEXT_SETUP_CODE` | On a server reachable from the internet, set it to a random string without dots so nobody can sign up before you, and pass it as `--invite` when you create the first account. |
 | `PLAINTEXT_URL` | The address clients use, such as `https://vault.example.com` (comma-separate several). Logins are signed for the server's address, and the server refuses logins signed for any other. Without it, only `localhost` can sign in. An `https://` address also makes every response send `Strict-Transport-Security`. |
 | `PLAINTEXT_SIGNUP=open` | Anyone can sign up without an invite, for running a hosted service. People are then found by exact username, nobody but admins can list everyone, and each address gets at most 10 signups and 30 failed logins an hour. Needs `PLAINTEXT_SETUP_CODE` too. |
 | `PLAINTEXT_TRUST_PROXY=1` | The server sits behind one reverse proxy that sets `X-Forwarded-For`, so rate limits count the address the proxy saw rather than the proxy's own. Leave it unset if clients can reach the server directly, or they could pick their own address. |
 | `PLAINTEXT_QUOTA_MB` | How much each account may store: items and attachments in the vaults it created, and the share links and messages it and its agents sent. Writes past it are refused, while reading and deleting keep working. Unset means unlimited. |
-| `PLAINTEXT_ADDR`, `PLAINTEXT_DB` | Listen address (`0.0.0.0:8080`) and database path (`plaintext.db`). |
+| `PLAINTEXT_ADDR`, `PLAINTEXT_DB` | Listen address (`0.0.0.0:8080`) and database path (`plaintext.db`, or `/data/plaintext.db` in the image). |
 
 Share links open on a static page at getplaintext.org that decrypts in the browser; your server never sees the key. To use your own domain for that too, host a copy of `docs/s/` anywhere except the vault server itself and set `PLAINTEXT_LINK_PAGE=https://your.page/s/`. Keep the trailing `/`, since the page loads its files from next to itself.
 
@@ -41,7 +43,7 @@ docker start plaintext
 ## The command line
 
 ```sh
-cargo install --path cli        # installs `plaintext`
+curl -fsSL https://getplaintext.org/install | sh   # macOS and Linux, or: brew install backmeupplz/tap/plaintext
 plaintext signup --server https://vault.example.com --username alice
 plaintext add GitHub --username alice --generate --url https://github.com
 plaintext get github
@@ -51,9 +53,9 @@ plaintext import 1pux ~/Downloads/export.1pux    # also: bitwarden, csv
 
 You can have accounts on several servers, such as your family's and a work one. Each `signup` or `signin` adds an account and makes it the default. `plaintext account ls` lists them, `plaintext account use NAME` switches, and `--account alice@vault.example.com` (or `PLAINTEXT_ACCOUNT`) picks one for a single command. `plaintext account delete` deletes the account from its server for good, after asking for your password and username; vaults you share stay with the others.
 
-Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
+Windows builds are on the releases page, and `cargo install --locked --path cli` builds it from source. Your Secret Key and unlocked session live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). On machines without a keychain, `PLAINTEXT_KEYCHAIN=file` keeps them in 0600 files instead.
 
-- **Per terminal.** Unlocking lasts 12 hours, and only in the terminal you unlocked in, like `sudo`. A command with no terminal, such as a script, a background job, or anything an AI tool runs, can't use it and should use an agent key.
+- **Per terminal.** Unlocking lasts 12 hours, and on macOS and Linux only in the terminal you unlocked in, like `sudo`. A command with no terminal, such as a script, a background job, or anything an AI tool runs, can't use it and should use an agent key. On Windows the session is shared by all of your user's programs for now.
 - **Locking.** `plaintext lock` ends the session on the server too.
 - **Secrets stay out of arguments.** `--password`, `--totp` and `--concealed LABEL` (without `=value`) ask for the secret, or, when stdin is piped, read one line each in that order. An empty answer to `--totp` removes the one-time code. Other users of the computer can see arguments. `plaintext` refuses plain `http://` except on your own machine and private networks.
 
@@ -73,7 +75,13 @@ DATABASE_URL="pt://Infra/Prod DB/password" plaintext run -- ./migrate
 plaintext inject -i config.tpl -o config.yml       # {{ pt://Infra/Prod DB/password }}
 ```
 
-`plaintext mcp` is a Model Context Protocol server for AI agents, and it runs only with an agent key (`PLAINTEXT_SERVER` and `PLAINTEXT_AGENT_KEY`), never with your own session. It can search items and read their non-secret fields (passwords, hidden fields, keys, card numbers and notes come back as `pt://` references), run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It doesn't hand secret values to the model unless `PLAINTEXT_MCP_REVEAL=1`, which keeps them out of transcripts by accident; a model that runs commands can still reach anything in the vaults its agent account can read, so give agents only the vaults they need. Every agent read is in the vault's audit log (`plaintext vault audit Infra`).
+`plaintext mcp` is a Model Context Protocol server for AI agents, and it runs only with an agent key (`PLAINTEXT_SERVER` and `PLAINTEXT_AGENT_KEY`), never with your own session. It can search items and read their non-secret fields (passwords, hidden fields, keys, card numbers and notes come back as `pt://` references), run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It doesn't hand secret values to the model unless `PLAINTEXT_MCP_REVEAL=1`, which keeps them out of transcripts by accident; a model that runs commands can still reach anything in the vaults its agent account can read, so give agents only the vaults they need. Every agent read is in the vault's audit log (`plaintext vault audit Infra`). To add it to Claude Code:
+
+```sh
+claude mcp add plaintext -e PLAINTEXT_SERVER=https://vault.example.com -e PLAINTEXT_AGENT_KEY=ptk_… -- plaintext mcp
+```
+
+Claude Desktop (`claude_desktop_config.json`) and Cursor (`~/.cursor/mcp.json`) take the same server under `mcpServers`: `{"plaintext": {"command": "plaintext", "args": ["mcp"], "env": {"PLAINTEXT_SERVER": "https://vault.example.com", "PLAINTEXT_AGENT_KEY": "ptk_…"}}}`. Use the full path to `plaintext` if the app doesn't see your shell's PATH.
 
 ## Develop
 
@@ -84,3 +92,5 @@ wasm/build.sh                   # rebuild the browser core into docs/s/ (CI chec
 ```
 
 The share-link viewer at `getplaintext.org/s/` is `docs/s/`: a static page that decrypts with the core compiled to WebAssembly. `wasm/build.sh` builds on linux/amd64 like CI (in Docker elsewhere), so the committed `.wasm` matches byte for byte.
+
+Releases: bump `version` in Cargo.toml, then `git tag -a vX.Y.Z -m "Plaintext X.Y.Z" && git push origin vX.Y.Z`. `.forgejo/workflows/release.yml` builds every platform, publishes the GitHub and Forgejo releases with SHA256SUMS, updates the Homebrew tap and pushes the image to GHCR.

@@ -183,6 +183,13 @@ impl Item {
         *self = next;
     }
 
+    /// The files this item refers to, in its current fields and its earlier versions.
+    pub fn file_ids(&self) -> impl Iterator<Item = crate::api::Hex> + '_ {
+        let earlier = self.history.iter().flat_map(|h| h.get("files").and_then(Value::as_array).into_iter().flatten());
+        let earlier = earlier.filter_map(|f| f.get("id")?.as_str()?.parse().ok());
+        self.files.iter().map(|f| f.id).chain(earlier)
+    }
+
     /// Every concealed value, for Watchtower-style checks and search exclusion.
     pub fn secrets(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.password.as_str())

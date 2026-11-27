@@ -77,6 +77,16 @@ pub struct Vault {
     dirty: BTreeSet<Hex>,
     deleted: BTreeSet<Hex>,
     meta_dirty: bool,
+    /// For pending changes: the files of the version they started from, which the
+    /// server keeps serving until the change is pushed.
+    #[serde(default)]
+    base_files: BTreeMap<Hex, Vec<Hex>>,
+    /// Files on the server no item here refers to, and when this device first saw
+    /// each one so; and when it last looked (see `collect_files`).
+    #[serde(default)]
+    orphans: BTreeMap<Hex, u64>,
+    #[serde(default)]
+    files_checked: u64,
 }
 
 fn h(b: &[u8]) -> B64 {
@@ -124,6 +134,9 @@ impl Vault {
             dirty: BTreeSet::new(),
             deleted: BTreeSet::new(),
             meta_dirty: false,
+            base_files: BTreeMap::new(),
+            orphans: BTreeMap::new(),
+            files_checked: 0,
         }
     }
 
@@ -178,6 +191,7 @@ impl Vault {
         {
             self.base.insert(id, h(&e.blob));
             self.base_content.insert(id, content_hash(&e.item));
+            self.base_files.insert(id, e.item.file_ids().collect());
         }
     }
 
@@ -193,6 +207,32 @@ impl Vault {
         self.entries.remove(&id);
         self.dirty.remove(&id);
         self.deleted.insert(id);
+    }
+
+    /// Of the files the server lists for this vault, the ones to delete: no item
+    /// refers to them (current fields, earlier versions, or the server's copy of
+    /// an item with a change pending here), and this device has seen them so for
+    /// at least `grace` seconds. The grace covers an upload whose item isn't pushed
+    /// yet, and another device bringing back a deleted item with an edit it hadn't
+    /// pushed. Call it right after a pull, with the server's time.
+    pub fn collect_files(&mut self, listed: &[Hex], now: u64, grace: u64) -> Vec<Hex> {
+        // A snapshot from before `base_files` can't say what a pending change replaces.
+        if self.dirty.iter().chain(&self.deleted).any(|id| self.base.contains_key(id) && !self.base_files.contains_key(id)) {
+            return Vec::new();
+        }
+        let pending = self.base_files.iter().filter(|(id, _)| self.dirty.contains(id) || self.deleted.contains(id));
+        let used: BTreeSet<Hex> = self.items().flat_map(|(_, i)| i.file_ids()).chain(pending.flat_map(|(_, f)| f.iter().copied())).collect();
+        // The clock only runs while this device keeps looking: after a gap of more
+        // than two graces (a laptop left closed) every file starts over, since a
+        // file may have been referenced again in between. `now` is the server's.
+        let mut seen = std::mem::take(&mut self.orphans);
+        if now.saturating_sub(self.files_checked) > 2 * grace {
+            seen.clear();
+        }
+        self.files_checked = now;
+        let since = |f: &Hex| seen.get(f).map_or(now, |s| (*s).min(now));
+        self.orphans = listed.iter().filter(|f| !used.contains(f)).map(|f| (*f, since(f))).collect();
+        self.orphans.iter().filter(|(_, since)| now >= since.saturating_add(grace)).map(|(f, _)| *f).collect()
     }
 
     pub fn set_meta(&mut self, meta: VaultMeta) {
@@ -390,7 +430,7 @@ impl Vault {
                 };
             if self.dirty.contains(id) {
                 if changed_remotely && let Some(e) = received.remove(id) {
-                    conflicts.push(e.item);
+                    conflicts.push((*id, e.item));
                 }
                 continue;
             }
@@ -413,7 +453,9 @@ impl Vault {
         }
         self.entries = next;
         self.deleted = deleted;
-        for mut item in conflicts {
+        for (id, mut item) in conflicts {
+            // The server serves this version under `id` until our edit is pushed.
+            self.base_files.entry(id).or_default().extend(item.file_ids());
             item.title = format!("{} (conflict)", item.title);
             self.put(Hex(random()), item);
         }
@@ -472,12 +514,14 @@ impl Vault {
                 self.dirty.remove(&u.id);
                 self.base.remove(&u.id);
                 self.base_content.remove(&u.id);
+                self.base_files.remove(&u.id);
             }
         }
         for d in &put.deletes {
             self.deleted.remove(d);
             self.base.remove(d);
             self.base_content.remove(d);
+            self.base_files.remove(d);
         }
         self.meta_dirty = false;
     }

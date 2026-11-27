@@ -176,13 +176,14 @@ fn family_agent_and_sharing() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A server that lies: it can serve an old keyring, hide a vault, or replay an
-/// old (genuine) vault response.
+/// A server that lies: it can serve an old keyring, hide a vault, replay an
+/// old (genuine) vault response, or report another time in file listings.
 struct Evil {
     inner: Http,
     old_keyring: std::cell::RefCell<Option<B64>>,
     hide: std::cell::Cell<Option<Hex>>,
     replay: std::cell::RefCell<Option<(String, Vec<u8>)>>,
+    files_now: std::cell::Cell<Option<u64>>,
 }
 
 impl Transport for Evil {
@@ -204,6 +205,15 @@ impl Transport for Evil {
             }
             return Ok((status, serde_json::to_vec(&acct).unwrap()));
         }
+        if let Some(now) = self.files_now.get()
+            && method == "GET"
+            && path.ends_with("/files")
+            && status == 200
+        {
+            let mut list: FileList = serde_json::from_slice(&bytes).unwrap();
+            list.now = now;
+            return Ok((status, serde_json::to_vec(&list).unwrap()));
+        }
         Ok((status, bytes))
     }
 
@@ -213,7 +223,7 @@ impl Transport for Evil {
 }
 
 fn evil(url: &str) -> Evil {
-    Evil { inner: Http::new(url), old_keyring: Default::default(), hide: Default::default(), replay: Default::default() }
+    Evil { inner: Http::new(url), old_keyring: Default::default(), hide: Default::default(), replay: Default::default(), files_now: Default::default() }
 }
 
 #[test]
@@ -498,15 +508,185 @@ fn storage_quota() {
     assert_eq!(status(bob.sync()), 413);
     assert!(!bob.vaults[&mine].has_changes());
 
-    // Deleting an item deletes its attachment too, which makes room.
+    // Deleting an item leaves its attachment until the grace has passed, then
+    // collecting it makes room.
     alice.delete_item(&personal, id).unwrap();
+    // A change refused for lack of room doesn't stop that vault's collection.
+    alice.vaults.get_mut(&personal).unwrap().put(plaintext_core::new_item_id(), item("Waiting", "w"));
+    assert_eq!(status(alice.sync()), 413);
+    assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000);
+    alice.collect_files(&personal, FILE_GRACE).unwrap();
     assert_eq!(status(alice.download_file(&personal, &big)), 404);
+    alice.sync().unwrap();
+    assert!(!alice.vaults[&personal].has_changes(), "the room went to the refused change");
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert!(acct.usage < 1000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
+}
+
+/// Files no item refers to are listed and, after a grace, deleted by a writer's
+/// sync; an item another device brings back keeps its attachment.
+#[test]
+fn file_garbage_collection() {
+    let (url, path) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", Some(&alice.invite().unwrap()), "x");
+    alice.sync().unwrap();
+    let v = alice.create_vault("Shared").unwrap();
+    alice.share_vault(&v, "bob", Role::Writer, None).unwrap();
+    alice.share_vault(&v, "carol", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    carol.sync().unwrap();
+    // An upload whose item never got pushed, one kept only in an earlier version,
+    // and one a current item lists.
+    let orphan = alice.upload_file(&v, "crash.bin", b"never pushed").unwrap();
+    let old = alice.upload_file(&v, "v1.pdf", b"first version").unwrap();
+    let kept = alice.upload_file(&v, "deed.pdf", b"the deed").unwrap();
+    let id = plaintext_core::new_item_id();
+    alice.put_item(&v, id, Item { files: vec![old.clone()], ..item("House", "h") }).unwrap();
+    let mut it = alice.vaults[&v].get(&id).unwrap().clone();
+    it.edit(Item { files: vec![kept.clone()], ..item("House", "h") }, now_ms());
+    alice.put_item(&v, id, it).unwrap();
+
+    let listed = alice.files(&v).unwrap();
+    let mut got: Vec<Hex> = listed.files.iter().map(|f| f.id).collect();
+    got.sort();
+    let mut want = [&orphan, &old, &kept].map(|f| f.id);
+    want.sort();
+    assert_eq!(got, want);
+    assert!(listed.files.iter().all(|f| f.size > 16), "sealed sizes");
+    assert!(listed.now.abs_diff(now()) < 60, "the server's clock");
+    assert_eq!(status(carol.files(&v)), 403, "only writers list");
+    let mine = alice.default_vault().unwrap();
+    assert_eq!(status(bob.files(&mine)), 404, "non-members may not (nor learn the vault exists)");
+    let count = |s: &Session<Http>| s.files(&v).unwrap().files.len();
+
+    // A sync notes the orphan; short of a week, nothing goes.
+    alice.sync().unwrap();
+    let snap = alice.vaults[&v].snapshot(&alice.account);
+    let restart = |s: &mut Session<Http>| drop(s.vaults.insert(v, Vault::restore(&s.account, v, &snap).unwrap()));
+    alice.collect_files(&v, FILE_GRACE - 60).unwrap();
+    assert_eq!(count(&alice), 3);
+    // A device that hasn't looked for more than two weeks starts the clock over.
+    restart(&mut alice);
+    alice.collect_files(&v, 2 * FILE_GRACE + 1).unwrap();
+    assert_eq!(count(&alice), 3);
+    // Readers never collect.
+    carol.sync().unwrap();
+    carol.collect_files(&v, 4 * FILE_GRACE).unwrap();
+    assert_eq!(count(&alice), 3);
+    // The note survives a restart (the snapshot): a week on, the orphan goes, and only it.
+    restart(&mut alice);
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(status(alice.download_file(&v, &orphan)), 404);
+    assert_eq!(alice.download_file(&v, &old).unwrap(), b"first version");
+    assert_eq!(alice.download_file(&v, &kept).unwrap(), b"the deed");
+
+    // Bob edits the item without pushing. Alice deletes it, but until that's
+    // pushed the server still serves the item, so its files stay.
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    let mut edit = bob.vaults[&v].get(&id).unwrap().clone();
+    edit.notes = "edited offline".into();
+    bob.vaults.get_mut(&v).unwrap().put(id, edit);
+    alice.vaults.get_mut(&v).unwrap().delete(id);
+    alice.collect_files(&v, 0).unwrap();
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(count(&alice), 2);
+    // Pushed, the deletion leaves them unreferenced, but bob's edit wins the merge
+    // and brings the item back within the grace, attachment and all.
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    assert!(alice.vaults[&v].get(&id).is_some());
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(bob.download_file(&v, &kept).unwrap(), b"the deed");
+    assert_eq!(count(&alice), 2);
+
+    // A conflict: bob pushes a version with a new attachment while alice has an
+    // edit pending. Until alice pushes, the server serves bob's version under the
+    // item's id, so its file stays even if she drops her conflict copy.
+    let new = bob.upload_file(&v, "deed2.pdf", b"new deed").unwrap();
+    let mut mine = alice.vaults[&v].get(&id).unwrap().clone();
+    mine.notes = "alice's".into();
+    alice.vaults.get_mut(&v).unwrap().put(id, mine);
+    bob.put_item(&v, id, Item { files: vec![new.clone()], ..item("House", "h2") }).unwrap();
+    alice.pull(&v).unwrap();
+    let copy = *alice.vaults[&v].items().find(|(_, i)| i.title.ends_with("(conflict)")).unwrap().0;
+    alice.vaults.get_mut(&v).unwrap().delete(copy);
+    alice.collect_files(&v, 0).unwrap();
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(alice.download_file(&v, &new).unwrap(), b"new deed");
+    // Once her edit replaces it, nothing refers to that file any more.
+    alice.sync().unwrap();
+    alice.collect_files(&v, 0).unwrap();
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(status(alice.download_file(&v, &new)), 404);
+
+    // A snapshot from before collection existed restores, and with a change
+    // pending on a pushed item it collects nothing: it can't tell what the
+    // server's copy refers to. Here a pending edit drops both of the House's
+    // files and a pending delete takes the Car's.
+    let car_file = alice.upload_file(&v, "car.pdf", b"title").unwrap();
+    let car = plaintext_core::new_item_id();
+    alice.put_item(&v, car, Item { files: vec![car_file.clone()], ..item("Car", "c") }).unwrap();
+    let vault = alice.vaults.get_mut(&v).unwrap();
+    vault.put(id, item("House", "h3"));
+    vault.delete(car);
+    let mut j = serde_json::to_value(&*vault).unwrap();
+    for k in ["base_files", "orphans", "files_checked"] {
+        j.as_object_mut().unwrap().remove(k).unwrap();
+    }
+    *vault = serde_json::from_value(j).unwrap();
+    alice.collect_files(&v, 0).unwrap();
+    alice.collect_files(&v, FILE_GRACE).unwrap();
+    assert_eq!(alice.download_file(&v, &car_file).unwrap(), b"title");
+    assert_eq!(alice.download_file(&v, &old).unwrap(), b"first version");
+    assert_eq!(alice.download_file(&v, &kept).unwrap(), b"the deed");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Collection goes by the server's clock, however far this device's is ahead.
+#[test]
+fn file_collection_uses_the_server_clock() {
+    let (url, path) = server();
+    let (_, mut alice) = join(evil(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    alice.sync().unwrap();
+    let v = alice.default_vault().unwrap();
+    let orphan = alice.upload_file(&v, "crash.bin", b"never pushed").unwrap();
+    // The server says it's 1970; the device's clock is decades ahead.
+    let at = |s: &mut Session<Evil>, t| {
+        s.t.files_now.set(Some(t));
+        s.collect_files(&v, 0).unwrap();
+    };
+    at(&mut alice, 1000);
+    at(&mut alice, 1000 + FILE_GRACE - 1);
+    assert_eq!(alice.download_file(&v, &orphan).unwrap(), b"never pushed");
+    at(&mut alice, 1000 + FILE_GRACE);
+    assert_eq!(status(alice.download_file(&v, &orphan)), 404);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The grace and the gap that starts it over, to the second.
+#[test]
+fn file_collection_bounds() {
+    let (g, f) = (100, plaintext_core::new_item_id());
+    let noted = || {
+        let mut v = Vault::new(plaintext_core::new_item_id());
+        assert!(v.collect_files(&[f], 1000, g).is_empty());
+        v
+    };
+    let mut v = noted();
+    assert!(v.collect_files(&[f], 1000 + g - 1, g).is_empty());
+    assert_eq!(v.collect_files(&[f], 1000 + g, g), [f]);
+    // Looking again two graces later keeps the note; a second more starts over.
+    assert_eq!(noted().collect_files(&[f], 1000 + 2 * g, g), [f]);
+    assert!(noted().collect_files(&[f], 1000 + 2 * g + 1, g).is_empty());
 }
 
 /// Open servers limit signups and failed logins per client address; behind a
