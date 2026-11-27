@@ -82,8 +82,10 @@ fun concealed(kind: String) = kind == "concealed" || kind == "ssh_key"
  * ponytail: mirrors core's `safe_file_name`; switch to the Rust export once the FFI has it (after PR #14).
  */
 fun safeName(name: String): String {
-    val base = name.substringAfterLast('/').substringAfterLast('\\').filter { it >= ' ' && it != '\u007f' }.trim()
-    return if (base.isEmpty() || base == "." || base == "..") "attachment" else base.take(120)
+    var base = name.substringAfterLast('/').substringAfterLast('\\').filterNot { Character.isISOControl(it) }.trim()
+    // File names are limited to 255 bytes, not characters.
+    while (base.toByteArray().size > 200) base = base.dropLast(if (base.length > 1 && base[base.length - 2].isHighSurrogate()) 2 else 1)
+    return if (base.isEmpty() || base == "." || base == "..") "attachment" else base
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -382,10 +384,12 @@ fun readUri(context: Context, uri: Uri): Pair<String, ByteArray> {
 private suspend fun shareFile(context: Context, ref: ItemRef, f: FileData, action: String) {
     val model = context.model
     val bytes = model.call { it.downloadFile(ref.account, ref.vault, ref.item, f.id) }
+    if (model.locked) return // locked while downloading: nothing goes on disk
     val file = withContext(Dispatchers.IO) {
         val dir = File(context.cacheDir, "open/${UUID.randomUUID()}").apply { mkdirs() }
         File(dir, safeName(f.name)).apply { writeBytes(bytes) }
     }
+    if (model.locked) return model.wipeCache()
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
     val type = context.contentResolver.getType(uri) ?: "application/octet-stream"
     val intent = Intent(action).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

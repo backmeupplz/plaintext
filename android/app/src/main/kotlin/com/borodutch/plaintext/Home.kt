@@ -73,6 +73,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -236,7 +237,9 @@ fun ItemRow(s: ItemSummary, onClick: (() -> Unit)? = null) {
     var menu by remember { mutableStateOf(false) }
     val multi = model.accounts.size > 1 || model.vaults.size > 1
     val secondary = if (model.filter is Filter.Vault || !multi) s.subtitle else listOf(s.subtitle, s.vaultName).filter { it.isNotEmpty() }.joinToString(" · ")
+    val current by rememberUpdatedState(s)
     val state = rememberSwipeToDismissBoxState(confirmValueChange = {
+        val s = current
         when (it) {
             SwipeToDismissBoxValue.StartToEnd -> if (s.hasPassword) model.copyField(s.ref, "password")
             SwipeToDismissBoxValue.EndToStart -> model.setFlags(s.ref, !s.favorite, s.archived)

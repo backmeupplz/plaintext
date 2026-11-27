@@ -98,8 +98,8 @@ fun Onboarding(adding: Boolean = false, onClose: (() -> Unit)? = null) {
     val flow = remember { Flow() }
     val step = flow.path.lastOrNull()
     val model = LocalContext.current.model
-    // Closed before finishing (say, Add account cancelled on the kit step, or the app locked there).
-    DisposableEffect(Unit) { onDispose { model.settingUp = false } }
+    // Gone before finishing (say, the app locked on the kit step): the added account keeps its session.
+    DisposableEffect(Unit) { onDispose { model.abandonSetup() } }
     // The kit and biometrics steps can't be backed out of: the account already exists.
     BackHandler(enabled = step != null || onClose != null) {
         when {
@@ -242,6 +242,8 @@ private fun CreateStep(flow: Flow) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The account may already exist once the server answers: stay until it does.
+    BackHandler(enabled = busy) {}
     var reveal by remember { mutableStateOf(false) }
     val needsInvite = flow.info?.open == false
     val setup = flow.info?.setup == true
@@ -254,7 +256,7 @@ private fun CreateStep(flow: Flow) {
         val (server, username, password, invite) = listOf(flow.server, flow.username.lowercase().trim(), flow.password, flow.invite.trim())
         scope.launch {
             try {
-                flow.signup = model.call { it.signup(server, username, password, invite.ifEmpty { null }) }.also { model.remember(it.account, it.secretKey) }
+                flow.signup = model.addAccount({ it.signup(server, username, password, invite.ifEmpty { null }) }) { Triple(it.account, it.secretKey, it.unlock) }
                 flow.password = ""
                 flow.go(Step.Kit)
             } catch (e: Exception) {
@@ -266,7 +268,7 @@ private fun CreateStep(flow: Flow) {
     }
 
     StepPage(
-        "Create your account", "on ${flow.server.substringAfter("://")}", onBack = { flow.back() },
+        "Create your account", "on ${flow.server.substringAfter("://")}", onBack = if (busy) null else ({ flow.back() }),
         actions = { PrimaryButton("Create account", ::create, enabled = ready, busy = busy) },
     ) {
         Field(
@@ -306,9 +308,11 @@ private fun KitStep(flow: Flow) {
     var saved by remember { mutableStateOf(false) }
     val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
         if (uri != null) {
-            runCatching { EmergencyKit.save(context, uri, r.secretKey, r.account.server, r.account.username) }
-                .onSuccess { saved = true; context.model.flash("Emergency Kit saved") }
-                .onFailure { context.model.banner = "Couldn't save the Emergency Kit there. Try another place." }
+            context.model.scope.launch {
+                runCatching { EmergencyKit.save(context, uri, r.secretKey, r.account.server, r.account.username) }
+                    .onSuccess { saved = true; context.model.flash("Emergency Kit saved") }
+                    .onFailure { context.model.banner = "Couldn't save the Emergency Kit there. Try another place." }
+            }
         }
     }
     StepPage(
@@ -405,6 +409,8 @@ private fun PasswordStep(flow: Flow) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The account may already exist once the server answers: stay until it does.
+    BackHandler(enabled = busy) {}
     val insecure = runCatching { serverAddress(flow.server).insecure }.getOrDefault(false)
     fun signIn() {
         if (flow.password.isEmpty()) return
@@ -413,7 +419,7 @@ private fun PasswordStep(flow: Flow) {
         val (server, sk, pw) = Triple(flow.server, flow.secretKey, flow.password)
         scope.launch {
             try {
-                flow.login = model.call { it.login(server, sk, pw) }.also { model.remember(it.account, sk) }
+                flow.login = model.addAccount({ it.login(server, sk, pw) }) { Triple(it.account, sk, it.unlock) }
                 flow.password = ""
                 flow.go(Step.Biometrics)
             } catch (e: Exception) {
@@ -424,7 +430,7 @@ private fun PasswordStep(flow: Flow) {
         }
     }
     StepPage(
-        "Enter your password", accountLabel(flow.server, flow.username), onBack = { flow.back() },
+        "Enter your password", accountLabel(flow.server, flow.username), onBack = if (busy) null else ({ flow.back() }),
         actions = { PrimaryButton("Sign in", ::signIn, enabled = flow.password.isNotEmpty(), busy = busy) },
     ) {
         Field("Password", flow.password, { flow.password = it }, kind = Input.Password, onDone = ::signIn)

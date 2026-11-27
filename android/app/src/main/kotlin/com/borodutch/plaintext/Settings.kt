@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.plaintext_ffi.ImportFormat
 import uniffi.plaintext_ffi.SessionData
@@ -182,8 +183,10 @@ fun AccountScreen(account: String) {
     var busy by remember { mutableStateOf(false) }
     val sk = remember(account) { model.vault.secretKey(account) }
     val saveKit = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-        if (uri != null && sk != null) runCatching { EmergencyKit.save(context, uri, sk, known.server, known.username) }
-            .onSuccess { model.flash("Emergency Kit saved") }.onFailure { model.banner = "Couldn't save the Emergency Kit there. Try another place." }
+        if (uri != null && sk != null) model.scope.launch {
+            runCatching { EmergencyKit.save(context, uri, sk, known.server, known.username) }
+                .onSuccess { model.flash("Emergency Kit saved") }.onFailure { model.banner = "Couldn't save the Emergency Kit there. Try another place." }
+        }
     }
     suspend fun load() {
         if (model.account(account) == null) return

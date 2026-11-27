@@ -18,6 +18,8 @@ import android.print.PrintManager
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import uniffi.plaintext_ffi.deviceCode
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -83,7 +85,7 @@ object EmergencyKit {
         doc.close()
     }
 
-    fun save(context: Context, uri: Uri, secretKey: String, server: String, username: String) {
+    suspend fun save(context: Context, uri: Uri, secretKey: String, server: String, username: String) = withContext(Dispatchers.IO) {
         context.contentResolver.openOutputStream(uri, "wt")?.use { write(it, secretKey, server, username) }
     }
 

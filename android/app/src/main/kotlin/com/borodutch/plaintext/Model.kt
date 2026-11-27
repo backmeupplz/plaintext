@@ -3,10 +3,12 @@ package com.borodutch.plaintext
 import android.content.Context
 import android.os.Build
 import android.provider.Settings
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -33,6 +36,7 @@ import uniffi.plaintext_ffi.generatePassword
 import uniffi.plaintext_ffi.itemTemplate
 import uniffi.plaintext_ffi.totpCode
 import java.io.File
+import java.security.UnrecoverableKeyException
 
 /** An error worded for people, raised by the app itself. */
 class UserError(message: String) : Exception(message)
@@ -88,6 +92,9 @@ class Model(val context: Context) {
     val vault = Vault(context)
     val core = PlaintextApp(File(context.noBackupFilesDir, "plaintext").apply { mkdirs() }.path, deviceName(context))
 
+    // Left over if the process died while unlocked.
+    init { File(context.cacheDir, "open").deleteRecursively() }
+
     var known by mutableStateOf(vault.known)
         private set
     var accounts by mutableStateOf(listOf<AccountInfo>())
@@ -117,8 +124,12 @@ class Model(val context: Context) {
 
     /** First run, between signup (or sign-in) and the end of onboarding: [known] is no longer empty. */
     var onboarding by mutableStateOf(false)
-    /** An account was just added and its session isn't stored yet: a lock now mustn't end it. */
-    var settingUp = false
+    /** An account added while unlocked whose onboarding hasn't finished: what [abandonSetup] stores if it never does. */
+    private var pending: Pair<String, UnlockData>? = null
+    /** Bumped by every lock that does something; an unlock or signup that sees it change gives up. */
+    private var epoch = 0
+    /** Unlocks in flight: a lock must still go through while one runs. */
+    private var opening = 0
     private var lastTouch = System.currentTimeMillis()
     private var idleJob: Job? = null
 
@@ -159,23 +170,49 @@ class Model(val context: Context) {
     }
 
     /** Right after signup or sign-in, before the Emergency Kit is on screen: keep the account and its Secret Key (the app may be killed there). */
-    fun remember(info: AccountInfo, secretKey: String) {
+    fun remember(info: AccountInfo, secretKey: String, unlock: UnlockData) {
         val k = KnownAccount(info.id, info.server, info.username)
         if (known.isEmpty()) onboarding = true
-        settingUp = true
+        pending = info.id to unlock
         // Same name on the same server: an old account of a reset server is gone.
         known.filter { it.id != k.id && it.name == k.name }.forEach { vault.forget(it.id) }
         storeKnown(known.filter { it.id != k.id && it.name != k.name } + k)
         vault.saveSecretKey(info.id, secretKey)
     }
 
+    /**
+     * Signup or sign-in that finishes even if the screen that started it goes away, so the Secret Key of an account
+     * that now exists is never lost. A lock meanwhile leaves the account stored but closed.
+     */
+    suspend fun <T> addAccount(work: (PlaintextApp) -> T, parts: (T) -> Triple<AccountInfo, String, UnlockData>): T {
+        val e = epoch
+        return scope.async {
+            val r = call(work)
+            val (info, sk, u) = parts(r)
+            remember(info, sk, u)
+            if (epoch != e) {
+                abandonSetup()
+                core.lock(!sessionsStored)
+            }
+            r
+        }.await()
+    }
+
     /** Onboarding is done: store what unlocks the account and open it. */
     fun added(info: AccountInfo, unlock: UnlockData, secretKey: String) {
-        remember(info, secretKey)
+        remember(info, secretKey, unlock)
+        pending = null
         onboarding = false
-        settingUp = false
         saveSession(info.id, unlock)
         unlocked()
+    }
+
+    /** An added account's onboarding ended early (a lock, say, on the kit step): keep its session as onboarding would have. */
+    fun abandonSetup() {
+        val (id, u) = pending ?: return
+        pending = null
+        saveSession(id, u)
+        known(id)?.let { banner = "${it.name} was added. Save its Emergency Kit from Settings → ${it.username}." }
     }
 
     /** Nothing on this device can resume a session without the password. */
@@ -189,39 +226,52 @@ class Model(val context: Context) {
     /** Re-store every open account's session after the biometrics setting changes. */
     fun biometricsChanged(on: Boolean) {
         vault.biometrics = on
-        if (!on) vault.forgetAllSessions()
-        else accounts.forEach { a -> runCatching { core.unlockData(a.id) }.onSuccess { saveSession(a.id, it) } }
+        if (!on) return vault.forgetAllSessions()
+        val ids = accounts.map { it.id }
+        scope.launch {
+            for (id in ids) runCatching { call { it.unlockData(id) } }.onSuccess { saveSession(id, it) }
+        }
     }
 
     /** After a successful biometric prompt: open every account with a stored session. */
     fun unlockWithStoredSessions() {
         if (!locked || unlocking) return
         unlocking = true
+        val e = epoch
         scope.launch {
             val sessions = try {
-                vault.sessions()
-            } catch (e: Exception) {
-                // A new fingerprint or face was enrolled (or the key is gone): the password is needed once.
-                vault.forgetAllSessions()
-                banner = "Your fingerprints or face changed, so enter your password once to turn biometric unlock back on."
+                withContext(Dispatchers.IO) { vault.sessions() }
+            } catch (x: Exception) {
+                if (x is KeyPermanentlyInvalidatedException || x is UnrecoverableKeyException) {
+                    // A new fingerprint or face was enrolled (or the key is gone): the password is needed once.
+                    vault.forgetAllSessions()
+                    banner = "Your fingerprints or face changed, so enter your password once to turn biometric unlock back on."
+                } else {
+                    banner = "Couldn't open your vaults with your fingerprint. Try again, or use your password."
+                }
                 unlocking = false
                 return@launch
             }
             val errors = mutableListOf<String>()
+            opening++
             for (k in known) {
+                if (epoch != e) break
                 val u = sessions[k.id] ?: continue
                 if (account(k.id) != null) continue
                 try {
                     call { it.resume(k.server, u) }
-                } catch (e: PlaintextException.SignedOut) {
+                } catch (x: PlaintextException.SignedOut) {
                     vault.forgetSession(k.id)
                     errors += "${k.name} was signed out. Enter its password to sign in again."
-                } catch (e: Exception) {
-                    errors += errorText(e)
+                } catch (x: Exception) {
+                    errors += errorText(x)
                 }
             }
+            opening--
             sessions.values.forEach { it.accountKey.fill(0) }
             unlocking = false
+            // Locked again while opening (the screen went off): stay locked.
+            if (epoch != e) return@launch core.lock(!sessionsStored)
             reload()
             if (accounts.isNotEmpty()) unlocked()
             banner = errors.firstOrNull()
@@ -231,8 +281,12 @@ class Model(val context: Context) {
     /** Unlock one account with its password; the Secret Key is kept on this device. */
     suspend fun unlock(k: KnownAccount, password: String) {
         val sk = vault.secretKey(k.id) ?: throw UserError("This device lost its copy of the Secret Key. Sign in again with your Emergency Kit.")
-        val r = call { it.login(k.server, sk, password) }
+        val e = epoch
+        opening++
+        val r = try { call { it.login(k.server, sk, password) } } finally { opening-- }
         saveSession(k.id, r.unlock)
+        // Locked again while signing in: stay locked.
+        if (epoch != e) return core.lock(!sessionsStored)
         unlocked()
     }
 
@@ -266,10 +320,12 @@ class Model(val context: Context) {
     }
 
     fun lock() {
-        if (locked && accounts.isEmpty()) return
+        if (locked && accounts.isEmpty() && opening == 0) return
+        epoch++
         idleJob?.cancel()
-        // Without a stored session the next unlock signs in again, so end these; not for an account being added, though.
-        core.lock(!sessionsStored && !settingUp)
+        abandonSetup()
+        // Without a stored session the next unlock signs in again, so end these.
+        core.lock(!sessionsStored)
         accounts = emptyList(); items = emptyList(); vaults = emptyList(); watch = emptyList()
         inbox = emptyMap(); breached = emptyMap()
         stack.clear()
@@ -406,7 +462,14 @@ class Model(val context: Context) {
         scope.launch {
             delay(5_000)
             if (undone) return@launch
-            try { call { it.deleteItem(ref.account, ref.vault, ref.item) } } catch (e: Exception) { show(e) }
+            // Locked meanwhile: delete once it's open again.
+            snapshotFlow { locked }.first { !it }
+            try {
+                call { it.deleteItem(ref.account, ref.vault, ref.item) }
+            } catch (_: PlaintextException.Locked) {
+            } catch (e: Exception) {
+                show(e)
+            }
             deleting -= ref.key
             reload()
         }

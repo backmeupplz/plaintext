@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PersistableBundle
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
 import android.util.Base64
@@ -173,6 +174,10 @@ class Vault(private val context: Context) {
 
     /** The biometric key's public half, as a plain key so encrypting happens in software. */
     private fun bioPublic(): java.security.PublicKey {
+        // Invalidated by a new enrolment: sessions sealed to it could never open, so start over with a new key.
+        // biometricsAvailable() keeps every caller on Android 11 or later.
+        if (Build.VERSION.SDK_INT < 30) throw IllegalStateException("biometric unlock needs Android 11")
+        if (ks.containsAlias(BIO) && !bioKeyUsable()) forgetAllSessions()
         val cert = ks.getCertificate(BIO) ?: run {
             strongBoxOrNot { strong ->
                 KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore").apply {
@@ -183,14 +188,22 @@ class Vault(private val context: Context) {
                         .setUserAuthenticationRequired(true)
                         .setInvalidatedByBiometricEnrollment(true)
                         .setIsStrongBoxBacked(strong)
-                    if (Build.VERSION.SDK_INT >= 30) b.setUserAuthenticationParameters(AUTH_SECONDS, KeyProperties.AUTH_BIOMETRIC_STRONG)
-                    else @Suppress("DEPRECATION") b.setUserAuthenticationValidityDurationSeconds(AUTH_SECONDS)
+                    b.setUserAuthenticationParameters(AUTH_SECONDS, KeyProperties.AUTH_BIOMETRIC_STRONG)
                     initialize(b.build())
                 }.generateKeyPair()
             }
             ks.getCertificate(BIO)
         }
         return KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(cert.publicKey.encoded))
+    }
+
+    private fun bioKeyUsable() = try {
+        Cipher.getInstance(RSA).init(Cipher.DECRYPT_MODE, ks.getKey(BIO, null) as java.security.PrivateKey, OAEP)
+        true
+    } catch (_: KeyPermanentlyInvalidatedException) {
+        false
+    } catch (_: Exception) {
+        true // not authenticated right now, which is fine for sealing
     }
 
     /** StrongBox when the phone has one. */
@@ -230,8 +243,11 @@ class Vault(private val context: Context) {
         private fun b64(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
         private fun unb64(s: String) = Base64.decode(s, Base64.NO_WRAP)
 
-        /** A strong fingerprint or face sensor with something enrolled. */
-        fun biometricsAvailable(context: Context) =
+        /**
+         * A strong fingerprint or face sensor with something enrolled, on Android 11 or later. Before that, a key usable for
+         * a few seconds after authenticating also opens with the screen lock PIN and survives a new enrolment.
+         */
+        fun biometricsAvailable(context: Context) = Build.VERSION.SDK_INT >= 30 &&
             BiometricManager.from(context).canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
     }
 }

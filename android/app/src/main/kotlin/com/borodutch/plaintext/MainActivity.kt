@@ -26,6 +26,12 @@ class MainActivity : FragmentActivity() {
         model.foregrounded()
     }
 
+    // Back from a picker, share sheet or permission dialog (the translucent ones never stop the activity).
+    override fun onResume() {
+        super.onResume()
+        model.external = false
+    }
+
     override fun onStop() {
         super.onStop()
         if (!isChangingConfigurations) model.backgrounded()

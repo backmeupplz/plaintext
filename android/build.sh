@@ -10,8 +10,6 @@ set -eu
 cd "$(dirname "$0")/.."
 abis="${ABIS:-arm64-v8a x86_64}"
 profile="${PROFILE:-release}"
-dir=$([ "$profile" = dev ] && echo debug || echo "$profile")
-target_dir="${CARGO_TARGET_DIR:-target}"
 gen=android/app/build/generated
 PATH="$HOME/.cargo/bin:$PATH"
 # Homebrew's Rust has no Android targets: put rustup's toolchain first.
