@@ -57,8 +57,10 @@ pub struct Vault {
     key: Option<B64>,
     pub roster: Option<Roster>,
     roster_hash: B64,
-    /// Everyone who could write in any roster version this device has verified.
-    writers: BTreeSet<String>,
+    /// For every roster version verified: its epoch and who could write in it.
+    versions: BTreeMap<u64, (u64, BTreeSet<String>)>,
+    /// Who signed roster v0, i.e. created the vault.
+    pub creator: String,
     pub meta: VaultMeta,
     /// Highest manifest counter verified. It's the rollback guard, so persist it.
     pub counter: u64,
@@ -99,7 +101,8 @@ impl Vault {
             key: None,
             roster: None,
             roster_hash: B64::default(),
-            writers: BTreeSet::new(),
+            versions: BTreeMap::new(),
+            creator: String::new(),
             meta: VaultMeta::default(),
             counter: 0,
             last: B64::default(),
@@ -126,7 +129,8 @@ impl Vault {
         let signed = me.sign_doc("roster", &roster);
         let keys = vec![wrap(&vk, &v.id, 0, &roster.members[0])?];
         v.roster_hash = h(&signed.body.0);
-        v.writers.insert(me.username.clone());
+        v.versions.insert(0, (0, BTreeSet::from([me.username.clone()])));
+        v.creator = me.username.clone();
         v.roster = Some(roster);
         v.key = Some(B64(vk.to_vec()));
         v.meta.name = name.into();
@@ -191,7 +195,8 @@ impl Vault {
     pub fn pull_query(&self) -> String {
         match &self.roster {
             Some(r) => format!("since={}&roster={}", self.counter, r.version),
-            None => "since=0".into(),
+            // A device with no state starts from the latest manifest.
+            None => "since=0&latest=true".into(),
         }
     }
 
@@ -205,7 +210,8 @@ impl Vault {
         // 1. Roster chain.
         let mut roster = self.roster.clone();
         let mut roster_hash = self.roster_hash.clone();
-        let mut writers = self.writers.clone();
+        let mut versions = self.versions.clone();
+        let mut creator = self.creator.clone();
         for s in &resp.rosters {
             let r: Roster = serde_json::from_slice(&s.body.0).map_err(|_| Error::BadJson)?;
             if r.vault_id != self.id {
@@ -223,7 +229,10 @@ impl Vault {
                 kr_changed |= keyring.pin(&m.username, &m.sign_pk, &m.enc_pk)?;
             }
             verify_doc::<Roster>(s, "roster", &signer.sign_pk.0)?;
-            writers.extend(r.members.iter().filter(|m| m.role >= Role::Writer).map(|m| m.username.clone()));
+            if r.version == 0 {
+                creator = s.signer.clone();
+            }
+            versions.insert(r.version, (r.epoch, r.members.iter().filter(|m| m.role >= Role::Writer).map(|m| m.username.clone()).collect()));
             roster_hash = h(&s.body.0);
             roster = Some(r);
         }
@@ -247,16 +256,21 @@ impl Vault {
         };
         let vk: Key = Zeroizing::new(key.0.as_slice().try_into().map_err(|_| Error::Tampered)?);
 
-        // 3. Manifest chain: consecutive, hash-linked, each signed by a writer.
+        // 3. Manifest chain: consecutive, hash-linked, each signed by someone who
+        //    could write under the roster version it names, in that version's epoch.
+        //    A device with no state yet may start from any manifest (its first sync
+        //    is trust on first use either way); after that, every link is checked.
         let (mut counter, mut last) = (self.counter, self.last.clone());
         let mut latest: Option<(ManifestEnvelope, String)> = None;
         for s in &resp.manifests {
             let env: ManifestEnvelope = serde_json::from_slice(&s.body.0).map_err(|_| Error::BadJson)?;
-            if env.vault_id != self.id || env.counter != counter + 1 || env.prev != last {
+            let fresh = latest.is_none() && self.counter == 0;
+            if env.vault_id != self.id || (!fresh && (env.counter != counter + 1 || env.prev != last)) {
                 return Err(Error::Rollback);
             }
-            if !writers.contains(&s.signer) {
-                return Err(Error::BadSignature);
+            match versions.get(&env.roster) {
+                Some((epoch, w)) if *epoch == env.epoch && w.contains(&s.signer) => {}
+                _ => return Err(Error::BadSignature),
             }
             let pk = keyring.sign_pk(&s.signer).ok_or(Error::BadSignature)?;
             verify_doc::<ManifestEnvelope>(s, "manifest", &pk)?;
@@ -276,11 +290,15 @@ impl Vault {
             }
             self.roster = Some(roster);
             self.roster_hash = roster_hash;
-            self.writers = writers;
+            self.versions = versions;
+            self.creator = creator;
             return Ok(kr_changed);
         };
-        if env.epoch != roster.epoch || !roster.members.iter().any(|m| m.username == signer && m.role >= Role::Writer && active(m, now)) {
-            return Err(Error::BadSignature);
+        // Demotion and removal replace the key, so anything under the current
+        // epoch was written by someone who could write at the time.
+        let _ = signer;
+        if env.epoch != roster.epoch {
+            return Err(Error::ManifestMismatch);
         }
         let m: ManifestBody = open_json(&vk, &ad("manifest", &[&self.id.0]), &env.sealed.0)?;
 
@@ -341,16 +359,17 @@ impl Vault {
         }
         self.roster = Some(roster);
         self.roster_hash = roster_hash;
-        self.writers = writers;
+        self.versions = versions;
+        self.creator = creator;
         self.key = Some(key);
         self.counter = counter;
         self.last = last;
         Ok(kr_changed)
     }
 
-    fn seal_manifest(&self, me: &Me, vk: &Key, epoch: u64, items: BTreeMap<Hex, B64>) -> Signed {
+    fn seal_manifest(&self, me: &Me, vk: &Key, epoch: u64, roster: u64, items: BTreeMap<Hex, B64>) -> Signed {
         let sealed = seal_json(vk, &ad("manifest", &[&self.id.0]), &ManifestBody { meta: self.meta.clone(), items });
-        let env = ManifestEnvelope { vault_id: self.id, counter: self.counter + 1, epoch, prev: self.last.clone(), sealed: B64(sealed) };
+        let env = ManifestEnvelope { vault_id: self.id, counter: self.counter + 1, epoch, roster, prev: self.last.clone(), sealed: B64(sealed) };
         me.sign_doc("manifest", &env)
     }
 
@@ -369,10 +388,10 @@ impl Vault {
             upserts.push(ItemBlob { id: *id, blob: B64(e.blob.clone()) });
         }
         let items = self.entries.iter().map(|(id, e)| (*id, h(&e.blob))).collect();
-        let epoch = self.roster.as_ref().map_or(0, |r| r.epoch);
+        let (epoch, version) = self.roster.as_ref().map_or((0, 0), |r| (r.epoch, r.version));
         Ok(VaultPut {
             expected_counter: self.counter,
-            manifest: self.seal_manifest(me, &vk, epoch, items),
+            manifest: self.seal_manifest(me, &vk, epoch, version, items),
             upserts,
             deletes: self.deleted.iter().copied().collect(),
         })
@@ -413,10 +432,14 @@ impl Vault {
         let c = keyring.contacts.get(username).ok_or(Error::UnknownUser(username.into()))?;
         let member = Member { username: username.into(), sign_pk: c.sign_pk.clone(), enc_pk: c.enc_pk.clone(), role, expires };
         let mut r = self.next_roster(me, now)?;
-        let new = !r.members.iter().any(|m| m.username == username);
+        let old = r.members.iter().find(|m| m.username == username).map(|m| m.role);
         r.members.retain(|m| m.username != username);
         r.members.push(member.clone());
-        let keys = if new { vec![wrap(&self.key()?, &self.id, r.epoch, &member)?] } else { vec![] };
+        // A demoted member still holds the key, so demotion replaces it, like removal.
+        if old.is_some_and(|o| role < o) {
+            return self.rotate(me, r);
+        }
+        let keys = if old.is_none() { vec![wrap(&self.key()?, &self.id, r.epoch, &member)?] } else { vec![] };
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: None })
     }
 
@@ -428,6 +451,14 @@ impl Vault {
         }
         let mut r = self.next_roster(me, now)?;
         r.members.retain(|m| m.username != username);
+        self.rotate(me, r)
+    }
+
+    /// A new epoch: fresh key for the members of `r`, every item re-sealed.
+    fn rotate(&self, me: &Me, mut r: Roster) -> Result<RosterUpdate, Error> {
+        if self.has_changes() {
+            return Err(Error::PendingChanges);
+        }
         r.epoch += 1;
         let vk = random_key();
         r.key_check = key_check(&vk, &self.id, r.epoch);
@@ -439,7 +470,7 @@ impl Vault {
             items.insert(*id, h(&blob));
             upserts.push(ItemBlob { id: *id, blob: B64(blob) });
         }
-        let rotation = VaultPut { expected_counter: self.counter, manifest: self.seal_manifest(me, &vk, r.epoch, items), upserts, deletes: vec![] };
+        let rotation = VaultPut { expected_counter: self.counter, manifest: self.seal_manifest(me, &vk, r.epoch, r.version, items), upserts, deletes: vec![] };
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: Some(rotation) })
     }
 

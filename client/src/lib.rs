@@ -117,6 +117,9 @@ pub struct Session<T: Transport> {
     keyring_dirty: bool,
     pub admin: bool,
     pub vaults: BTreeMap<Hex, Vault>,
+    /// Vaults the server stopped listing. Their verified state is kept, so if
+    /// they come back the server can't hand us an older copy as if new.
+    pub hidden: BTreeMap<Hex, Vault>,
 }
 
 impl<T: Transport> Session<T> {
@@ -128,7 +131,16 @@ impl<T: Transport> Session<T> {
         let (sk, mut s) = plaintext_core::signup(username, password, invite.filter(|c| c.contains('.')))?;
         s.request.setup = setup.map(String::from);
         call::<_, ()>(&t, "POST", "/v1/signup", None, Some(&s.request))?;
-        let session = Self::login(t, &derive(password, &sk), device)?;
+        let mut session = Self::login(t, &derive(password, &sk), device)?;
+        // The invite names who sent it and their fingerprint: pin and verify them.
+        if let Some((inviter, fp)) = invite.and_then(plaintext_core::identity::invite_sender) {
+            session.pin_user(&inviter)?;
+            if session.fingerprint(&inviter).map(|f| f.replace(' ', "")) == Some(fp) {
+                session.mark_verified(&inviter)?;
+            } else {
+                return Err(plaintext_core::Error::KeyChanged(inviter).into());
+            }
+        }
         Ok((sk, session))
     }
 
@@ -147,6 +159,7 @@ impl<T: Transport> Session<T> {
             keyring_dirty: false,
             admin: acct.admin,
             vaults: BTreeMap::new(),
+            hidden: BTreeMap::new(),
         })
     }
 
@@ -155,7 +168,7 @@ impl<T: Transport> Session<T> {
     pub fn resume(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&token), NONE)?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new() })
     }
 
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -174,10 +187,16 @@ impl<T: Transport> Session<T> {
     pub fn sync(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
         self.admin = acct.admin;
-        self.vaults.retain(|id, _| acct.vaults.contains(id));
+        let unlisted: Vec<Hex> = self.vaults.keys().filter(|id| !acct.vaults.contains(id)).copied().collect();
+        for id in unlisted {
+            let v = self.vaults.remove(&id).expect("listed above");
+            self.hidden.insert(id, v);
+        }
         for id in &acct.vaults {
-            self.vaults.entry(*id).or_insert_with(|| Vault::new(*id));
+            let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
+            self.vaults.entry(*id).or_insert(v);
             self.sync_vault(id)?;
+            self.revoke_expired(id)?;
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
@@ -217,6 +236,45 @@ impl<T: Transport> Session<T> {
         Err(Error::Server(409, "the vault kept changing; try again".into()))
     }
 
+    /// Members whose access expired get removed for real (new vault key) by
+    /// whichever owner's device notices first.
+    fn revoke_expired(&mut self, id: &Hex) -> Result<()> {
+        let me = self.username().to_string();
+        let Some(v) = self.vaults.get(id) else { return Ok(()) };
+        if v.role(&me, now()) != Some(Role::Owner) || v.has_changes() {
+            return Ok(());
+        }
+        let expired: Vec<String> = v
+            .roster
+            .iter()
+            .flat_map(|r| &r.members)
+            .filter(|m| m.expires.is_some_and(|e| now() >= e))
+            .map(|m| m.username.clone())
+            .collect();
+        for name in expired {
+            self.revoke(id, &name)?;
+        }
+        Ok(())
+    }
+
+    /// Fold in this device's own copy of the keyring (saved after the last run):
+    /// pins it holds can't be erased by a server serving an older keyring.
+    pub fn merge_local_keyring(&mut self, local_blob: &[u8]) -> Result<()> {
+        let mut local = Keyring::open(&self.account, local_blob)?;
+        if local.username != self.keyring.username {
+            return Err(plaintext_core::Error::Tampered.into());
+        }
+        self.keyring_dirty |= local.merge_from(&self.keyring);
+        self.keyring = local;
+        self.save_keyring()
+    }
+
+    /// This device's copy of the keyring, sealed with the Account Key. Persist it
+    /// and pass it to `merge_local_keyring` after signing in again.
+    pub fn keyring_snapshot(&self) -> Vec<u8> {
+        self.keyring.seal(&self.account)
+    }
+
     /// Upload the keyring if pins changed. On a conflict, merge with the server's
     /// copy: pins are only ever added, and a pin this device made wins.
     pub fn save_keyring(&mut self) -> Result<()> {
@@ -232,14 +290,8 @@ impl<T: Transport> Session<T> {
                 }
                 Err(Error::Server(409, _)) => {
                     let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
-                    let mut server = Keyring::open(&self.account, &acct.keyring.0)?;
-                    for (name, c) in std::mem::take(&mut server.contacts) {
-                        let mine = self.keyring.contacts.entry(name).or_insert_with(|| c.clone());
-                        mine.verified |= c.verified && mine.sign_pk == c.sign_pk && mine.enc_pk == c.enc_pk;
-                    }
-                    for (id, s) in std::mem::take(&mut server.invites) {
-                        self.keyring.invites.entry(id).or_insert(s);
-                    }
+                    let server = Keyring::open(&self.account, &acct.keyring.0)?;
+                    self.keyring.merge_from(&server);
                     self.keyring_counter = acct.keyring_counter;
                 }
                 Err(e) => return Err(e),
@@ -372,17 +424,25 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// The vault new items go to by default: the first one named Personal, else any we can write.
+    /// The vault new items go to by default: the one this account made at signup,
+    /// else one it created itself. Never a vault someone else shared, so nobody
+    /// can collect your new logins by sharing you a vault called "Personal".
     pub fn default_vault(&self) -> Result<Hex> {
         let me = self.username().to_string();
-        let writable = |v: &&Vault| v.role(&me, now()).is_some_and(|r| r >= Role::Writer);
-        self.vaults
-            .values()
-            .filter(writable)
-            .find(|v| v.meta.name == "Personal")
-            .or_else(|| self.vaults.values().find(writable))
+        let own = |v: &&Vault| v.creator == me && v.role(&me, now()).is_some_and(|r| r >= Role::Writer);
+        self.keyring
+            .default_vault
+            .and_then(|id| self.vaults.get(&id))
+            .filter(own)
+            .or_else(|| self.vaults.values().find(own))
             .map(|v| v.id)
             .ok_or(Error::Core(plaintext_core::Error::ReadOnly))
+    }
+
+    /// One of our own vaults by name (for imports), never one shared with us.
+    pub fn own_vault(&self, name: &str) -> Option<Hex> {
+        let me = self.username();
+        self.vaults.values().find(|v| v.creator == me && v.meta.name.eq_ignore_ascii_case(name)).map(|v| v.id)
     }
 
     /// Items matching `query` (title, username, URL, tags, non-secret fields), or

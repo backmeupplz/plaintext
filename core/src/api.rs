@@ -134,6 +134,8 @@ pub struct ManifestEnvelope {
     pub vault_id: Hex,
     pub counter: u64,
     pub epoch: u64,
+    /// The roster version the writer acted under: their role is checked there.
+    pub roster: u64,
     /// SHA-256 of the previous manifest's signed body; empty for the first.
     pub prev: B64,
     /// Sealed `{meta, items: {id → hash}}` with the vault key.

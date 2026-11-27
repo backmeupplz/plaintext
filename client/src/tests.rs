@@ -51,6 +51,7 @@ fn family_agent_and_sharing() {
     assert_eq!(status(Session::signup(Http::new(&url), "carol", "pw", Some(&code), "x")), 403); // used up
     alice.sync().unwrap();
     assert!(alice.keyring.contacts["bob"].verified, "the invite proof verifies bob for alice");
+    assert!(bob.keyring.contacts["alice"].verified, "the invite code verifies alice for bob");
 
     // Personal items sync to alice's second device.
     alice.sync().unwrap();
@@ -153,5 +154,84 @@ fn family_agent_and_sharing() {
     ] {
         assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "found {needle:?} in the database");
     }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A server that lies: it can serve an old keyring, hide a vault, or replay an
+/// old (genuine) vault response.
+struct Evil {
+    inner: Http,
+    old_keyring: std::cell::RefCell<Option<B64>>,
+    hide: std::cell::Cell<Option<Hex>>,
+    replay: std::cell::RefCell<Option<(String, Vec<u8>)>>,
+}
+
+impl Transport for Evil {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        if let Some((prefix, bytes)) = &*self.replay.borrow()
+            && method == "GET"
+            && path.starts_with(prefix.as_str())
+        {
+            return Ok((200, bytes.clone()));
+        }
+        let (status, bytes) = self.inner.send(method, path, token, body)?;
+        if method == "GET" && path == "/v1/account" && status == 200 {
+            let mut acct: AccountResponse = serde_json::from_slice(&bytes).unwrap();
+            if let Some(k) = &*self.old_keyring.borrow() {
+                acct.keyring = k.clone();
+            }
+            if let Some(h) = self.hide.get() {
+                acct.vaults.retain(|v| *v != h);
+            }
+            return Ok((status, serde_json::to_vec(&acct).unwrap()));
+        }
+        Ok((status, bytes))
+    }
+}
+
+fn evil(url: &str) -> Evil {
+    Evil { inner: Http::new(url), old_keyring: Default::default(), hide: Default::default(), replay: Default::default() }
+}
+
+#[test]
+fn lying_server_and_hostile_users() {
+    let (url, path) = server();
+    let (ask, mut alice) = Session::signup(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop").unwrap();
+    let signup_keyring = alice.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().keyring;
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = Session::signup(Http::new(&url), "bob", "bob pw", Some(&code), "phone").unwrap();
+    alice.sync().unwrap();
+    assert!(alice.keyring.contacts["bob"].verified);
+    let local = alice.keyring_snapshot();
+
+    // 1. A rolled-back keyring can't erase pins this device saved.
+    let mut a2 = Session::login(evil(&url), &derive("alice pw", &ask), "laptop").unwrap();
+    *a2.t.old_keyring.borrow_mut() = Some(signup_keyring.clone());
+    a2 = Session::login(a2.t, &derive("alice pw", &ask), "laptop").unwrap();
+    assert!(!a2.keyring.contacts.contains_key("bob"), "the server served the old keyring");
+    a2.merge_local_keyring(&local).unwrap();
+    assert!(a2.keyring.contacts["bob"].verified, "the device's own copy restores the pin");
+
+    // 2. Nobody can collect your new items by sharing you a vault called "Personal".
+    bob.sync().unwrap();
+    let trap = bob.create_vault("Personal").unwrap();
+    bob.share_vault(&trap, "alice", Role::Writer, None).unwrap();
+    alice.sync().unwrap();
+    let mine = alice.default_vault().unwrap();
+    assert_ne!(mine, trap);
+    assert_eq!(alice.vaults[&mine].creator, "alice");
+    assert!(alice.own_vault("personal").is_some_and(|v| v != trap));
+
+    // 3. Hiding a vault and bringing it back with an older copy is caught.
+    let mut a3 = Session::login(evil(&url), &derive("alice pw", &ask), "laptop").unwrap();
+    a3.sync().unwrap();
+    let old: Vec<u8> = a3.t.inner.send("GET", &format!("/v1/vaults/{mine}?since=0"), Some(&a3.token), None).unwrap().1;
+    a3.put_item(&mine, plaintext_core::new_item_id(), item("Later", "added-later")).unwrap();
+    a3.t.hide.set(Some(mine));
+    a3.sync().unwrap();
+    assert!(!a3.vaults.contains_key(&mine) && a3.hidden.contains_key(&mine));
+    a3.t.hide.set(None);
+    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
+    assert!(matches!(a3.sync(), Err(Error::Core(plaintext_core::Error::Rollback))));
     let _ = std::fs::remove_file(&path);
 }

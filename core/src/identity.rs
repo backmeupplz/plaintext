@@ -34,6 +34,10 @@ pub struct Keyring {
     /// Secrets of invites this account sent and nobody has used yet.
     #[serde(default)]
     pub invites: BTreeMap<Hex, B64>,
+    /// The vault this account made for itself at signup: where new items go
+    /// unless told otherwise (never a vault someone else shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_vault: Option<Hex>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -94,6 +98,7 @@ impl Keyring {
             enc_sk: B64(random::<32>().to_vec()),
             contacts: BTreeMap::new(),
             invites: BTreeMap::new(),
+            default_vault: None,
             extra: Default::default(),
         }
     }
@@ -156,16 +161,38 @@ impl Keyring {
         Ok(id)
     }
 
+    /// Fold another copy of this keyring (the server's) into this one, which wins:
+    /// pins are only ever added, a pin this copy holds is never replaced, and
+    /// verification marks carry over only for identical keys. Returns true if
+    /// the result differs from `other` (so it should be uploaded).
+    pub fn merge_from(&mut self, other: &Keyring) -> bool {
+        for (name, c) in &other.contacts {
+            let mine = self.contacts.entry(name.clone()).or_insert_with(|| c.clone());
+            if mine.sign_pk == c.sign_pk && mine.enc_pk == c.enc_pk {
+                mine.verified |= c.verified;
+            }
+        }
+        for (id, s) in &other.invites {
+            self.invites.entry(*id).or_insert_with(|| s.clone());
+        }
+        if self.default_vault.is_none() {
+            self.default_vault = other.default_vault;
+        }
+        self.contacts != other.contacts || self.invites != other.invites || self.default_vault != other.default_vault
+    }
+
     pub fn mark_verified(&mut self, username: &str) -> bool {
         self.contacts.get_mut(username).map(|c| !std::mem::replace(&mut c.verified, true)).unwrap_or(false)
     }
 
-    /// Make an invite: the server gets the id, the link carries id + secret.
+    /// Make an invite: the server gets the id; the code carries id, secret, and
+    /// our username and fingerprint, so each side verifies the other on signup.
     pub fn new_invite(&mut self) -> (Hex, String) {
         let id = Hex(random());
         let secret: [u8; 16] = random();
         self.invites.insert(id, B64(secret.to_vec()));
-        (id, format!("{}.{}", id, hex::encode(secret)))
+        let fp = self.me().fingerprint().replace(' ', "");
+        (id, format!("{}.{}.{}.{fp}", id, hex::encode(secret), self.username))
     }
 
     /// Mark users who signed up with one of our invites as verified, using the
@@ -188,9 +215,17 @@ impl Keyring {
     }
 }
 
-/// Parse an invite code (`<id>.<secret>`) into what signup sends.
+/// Who sent an invite code and their fingerprint, if the code carries them.
+pub fn invite_sender(code: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = code.trim().split('.').collect();
+    // Usernames may contain dots: the fingerprint is last, the username in between.
+    (parts.len() >= 4).then(|| (parts[2..parts.len() - 1].join("."), parts[parts.len() - 1].to_string()))
+}
+
+/// Parse an invite code (`<id>.<secret>[.<inviter>.<fingerprint>]`) into what signup sends.
 pub fn invite_proof(code: &str, identity: &Signed) -> Result<InviteProof, Error> {
-    let (id, secret) = code.trim().split_once('.').ok_or(Error::BadInvite)?;
+    let mut parts = code.trim().split('.');
+    let (Some(id), Some(secret)) = (parts.next(), parts.next()) else { return Err(Error::BadInvite) };
     let id: Hex = id.parse().map_err(|_| Error::BadInvite)?;
     let secret = hex::decode(secret).map_err(|_| Error::BadInvite)?;
     Ok(InviteProof { id, proof: B64(hmac(&secret, &identity.body.0).to_vec()) })

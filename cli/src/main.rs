@@ -191,6 +191,8 @@ enum Cmd {
         #[arg(long)]
         end: Option<String>,
     },
+    /// Open a share link (https://getplaintext.org/s/#…) and show the item
+    Open { link: String },
     /// Serve the Model Context Protocol on stdio, for AI agents
     Mcp,
 }
@@ -393,8 +395,9 @@ fn show(item: &Item, vault: &str) {
 /// Resolve `pt://Vault/Item/field` (item by title or id; field by label).
 pub fn resolve(s: &S, reference: &str) -> Res<String> {
     let rest = reference.strip_prefix("pt://").ok_or("references look like pt://Vault/Item/field")?;
-    let parts: Vec<&str> = rest.splitn(3, '/').collect();
-    let [vault, item, field] = parts.as_slice() else { return Err("references look like pt://Vault/Item/field".into()) };
+    // Vault names have no slash; the field is the last segment; titles may contain '/'.
+    let (vault, rest) = rest.split_once('/').ok_or("references look like pt://Vault/Item/field")?;
+    let (item, field) = rest.rsplit_once('/').ok_or("references look like pt://Vault/Item/field")?;
     let vid = s.vault(vault)?;
     let (_, _, it) = s.one(item, Some(&vid))?;
     if field.eq_ignore_ascii_case("totp") || field.eq_ignore_ascii_case("otp") {
@@ -638,7 +641,15 @@ fn run(cli: Cli) -> Res<()> {
             }
             out.push_str(rest);
             match output {
-                Some(f) => std::fs::write(f, out)?,
+                Some(f) => {
+                    #[cfg(unix)]
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut o = std::fs::OpenOptions::new();
+                    o.write(true).create(true).truncate(true);
+                    #[cfg(unix)]
+                    o.mode(0o600);
+                    o.open(f)?.write_all(out.as_bytes())?;
+                }
                 None => std::io::stdout().write_all(out.as_bytes())?,
             }
         }
@@ -673,9 +684,10 @@ fn run(cli: Cli) -> Res<()> {
                 let vid = match (&vault, v.name.is_empty()) {
                     (Some(name), _) => s.vault(name)?,
                     (None, true) => s.default_vault()?,
-                    (None, false) => match s.vault(&v.name) {
-                        Ok(id) => id,
-                        Err(_) => s.create_vault(&v.name)?,
+                    (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
+                    (None, false) => match s.own_vault(&v.name) {
+                        Some(id) => id,
+                        None => s.create_vault(&v.name)?,
                     },
                 };
                 for (it, files) in v.items {
@@ -715,6 +727,13 @@ fn run(cli: Cli) -> Res<()> {
             for d in s.sessions()? {
                 println!("{}  {:<32} {}", d.id, d.device, if d.current { "(this one)" } else { "" });
             }
+        }
+        Cmd::Open { link } => {
+            let frag = link.split_once('#').map(|(_, f)| f).ok_or("that's not a Plaintext share link")?;
+            let (server_and_id, key) = frag.rsplit_once('/').ok_or("that's not a Plaintext share link")?;
+            let (server, id) = server_and_id.rsplit_once('/').ok_or("that's not a Plaintext share link")?;
+            let item = plaintext_client::open_link(&Http::new(server), &id.parse()?, key)?;
+            show(&item, "a share link");
         }
         Cmd::Mcp => mcp::serve()?,
     }
@@ -821,7 +840,8 @@ fn user_cmd(u: UserCmd) -> Res<()> {
         }
         UserCmd::Disable { user } => {
             s.disable_user(&user)?;
-            println!("Disabled {user}.");
+            println!("Disabled {user}: they can't sign in any more.");
+            println!("They still know the keys of vaults they were in; run `plaintext vault revoke VAULT {user}` to replace those keys.");
         }
     }
     Ok(())

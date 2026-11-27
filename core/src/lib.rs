@@ -100,11 +100,12 @@ fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<String>, i
         return Err(Error::BadUsername);
     }
     let account = Account { id: d.account_id, account_key: random_key() };
-    let keyring = Keyring::new(username);
+    let mut keyring = Keyring::new(username);
     let identity = keyring.identity(kind, owner);
     let (vault, new_vault) = match kind {
         Kind::Human => {
             let (v, nv) = Vault::create(&keyring.me(), "Personal")?;
+            keyring.default_vault = Some(v.id);
             (Some(v), Some(nv))
         }
         Kind::Agent => (None, None),

@@ -42,7 +42,7 @@ DATABASE_URL="pt://Infra/Prod DB/password" plaintext run -- ./migrate
 plaintext inject -i config.tpl -o config.yml       # {{ pt://Infra/Prod DB/password }}
 ```
 
-`plaintext mcp` is a Model Context Protocol server for AI agents. It can search items and read their non-secret fields, run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It never returns a secret to the model unless `PLAINTEXT_MCP_REVEAL=1`. Every agent read is in the vault's audit log (`plaintext vault audit Infra`).
+`plaintext mcp` is a Model Context Protocol server for AI agents. It can search items and read their non-secret fields, run commands with secrets injected (scrubbed from the output), save new logins with generated passwords, and ask the owner for access. It doesn't hand secret values to the model unless `PLAINTEXT_MCP_REVEAL=1`, which keeps them out of transcripts by accident; a model that runs commands can still reach anything in the vaults its agent account can read, so give agents only the vaults they need. Every agent read is in the vault's audit log (`plaintext vault audit Infra`).
 
 ## Develop
 

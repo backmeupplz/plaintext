@@ -47,7 +47,8 @@ The client signs `"plaintext/v1/login" ‖ account_id ‖ unix_ms`. The server s
 - Usernames are per server (2–32 of `a-z 0-9 . _ -`). The first account is the admin (if the server was started with `PLAINTEXT_SETUP_CODE`, it must present that code); everyone else needs a one-use invite (7 days) from an admin. No emails are stored.
 - Each account publishes a self-signed identity `{username, kind: human|agent, owner?, sign_pk, enc_pk}`.
 - **Pinning.** A client pins a user's keys the first time it sees them (directory lookup, a vault roster, an inbox message) and refuses any later difference (`KeyChanged`). Pins live in the synced keyring.
-- **Verification** marks a pin as confirmed out of band. Two ways: compare the fingerprint (`fingerprint(username, sign_pk, enc_pk)`, 4 groups of 6) in person or by QR; or the invite proof. An invite code is `id.secret`; the inviter's keyring keeps the secret; the new user sends `HMAC(secret, identity)` at signup; the inviter's devices check it and mark the new user verified. A server that substitutes the new user's identity can't produce the proof.
+- **Verification** marks a pin as confirmed out of band. Two ways: compare the fingerprint (`fingerprint(username, sign_pk, enc_pk)`, 4 groups of 6) in person or by QR; or an invite, which verifies both sides. An invite code is `id.secret.inviter.fingerprint`. The inviter's keyring keeps the secret; the new user sends `HMAC(secret, identity)` at signup, and the inviter's devices check it and mark the new user verified (a server that substitutes the new user's identity can't produce the proof). The new user's client looks the inviter up and marks them verified only if their fingerprint matches the one in the code.
+- **The keyring can be rolled back by the server**, so each device also keeps its own sealed copy and merges it in after signing in: pins are only ever added, and a pin the device holds is never replaced by the server's copy. A brand-new device trusts the server's keyring (first-use trust).
 - Apps show "not verified" next to anyone unverified, everywhere it matters (sharing, vault members, inbox).
 
 ## Vaults, roles and sharing
@@ -58,10 +59,10 @@ A vault's membership is a **roster**, a signed and hash-chained document:
 
 - Version 0 is signed by an owner listed in it; every later version is signed by an owner of the previous version. Clients verify the whole chain from version 0 the first time they see a vault, then each new version. Every member's keys are pinned on sight.
 - The **vault key** for each epoch is sealed to each member's X25519 key (`ephemeral ECDH → HKDF → XChaCha20-Poly1305`, AD names vault, epoch and username). Because anyone can seal to a public key, the roster carries `key_check = HMAC(vault key, "plaintext/v1/key-check" ‖ vault_id ‖ epoch)`, signed by the owner. A member accepts an unwrapped key only if it matches.
-- **Granting** (add someone, change a role or expiry) is a new roster version; a new member also gets the current vault key and can read the vault's history.
+- **Granting** (add someone, promote, change expiry) is a new roster version; a new member also gets the current vault key and can read the vault's history. **Demoting** a writer or owner rotates the key like a removal, since the demoted member still holds it.
 - **Revoking** starts a new epoch: a fresh vault key, sealed to the remaining members, and every item re-sealed in the same request. Nothing written afterwards is readable with the old key. Attachments keep their own keys (below), so they are not re-uploaded; a removed member who saved an item's file key while they had access can still decrypt that one file if they also kept its download.
-- **Roles.** Readers hold the vault key, so they could produce a valid blob; what stops them is that every manifest must be signed by a writer or owner in the current roster, and clients reject any other. The server enforces roles too, for honest deployments.
-- **Expiry** (for people and agents) makes a member count as removed after the time; it doesn't rotate the key. Use revoke when the key must change.
+- **Roles.** Readers hold the vault key, so they could produce a valid blob; what stops them is that every manifest names the roster version it was written under and must be signed by a writer or owner of that version, in that version's epoch, and the latest manifest must be in the current epoch. Because demotion and removal start a new epoch, anything accepted under the current key was written by someone who could write at the time. The server enforces roles too, for honest deployments.
+- **Expiry** (for people and agents) makes a member count as removed after the time: the server stops serving them, and the first device of an owner that syncs afterwards revokes them for real (new key). Until then, an expired member who kept the key could still write through a malicious server.
 
 ## Blobs
 
@@ -87,12 +88,13 @@ An item is one JSON object: `kind` (login, password, note, card, identity, docum
 
 ## Sync
 
-Each vault has a counter and a **manifest chain**. A manifest is a signed envelope `{vault_id, counter, epoch, prev = SHA256(previous manifest's signed body), sealed}`, where `sealed` holds the vault name and `{item_id → SHA256(item blob)}`.
+Each vault has a counter and a **manifest chain**. A manifest is a signed envelope `{vault_id, counter, epoch, roster (version), prev = SHA256(previous manifest's signed body), sealed}`, where `sealed` holds the vault name and `{item_id → SHA256(item blob)}`.
 
 - **Pull** `GET /v1/vaults/{id}?since=N&roster=V` returns every roster after V, every manifest after N, the caller's wrapped key for the current epoch, and every item written after N. The client checks: the roster chain; the key against `key_check`; that the manifests are consecutive, each links to the one before (starting from the last one this device verified), and each is signed by someone who could write; that the latest is under the current epoch and signed by a current, unexpired writer; and that every item blob matches the latest manifest's hash. Any failure rejects the whole response and changes nothing.
 - **Push** `PUT /v1/vaults/{id}` carries `expected_counter`, a new signed manifest, upserts and deletes. The server applies it only if the counter matches and the manifest extends its chain; otherwise 409, and the client pulls, merges and retries.
 - **Merge.** Local unpushed edits win. If the server's copy of an item also changed since the local edit began, it is kept as a conflict copy ("… (conflict)") so nothing is lost.
-- **Rollback guard.** Each device persists its last verified counter and manifest hash (in its sealed snapshot). The server can't serve an older state, or a different branch, to a device that has seen a newer one: the hash chain won't link.
+- **Rollback guard.** Each device persists its last verified counter and manifest hash (in its sealed snapshot). The server can't serve an older state, or a different branch, to a device that has seen a newer one: the hash chain won't link. A vault the server stops listing keeps its verified state on the device, so it can't come back older. A device with no state starts from the latest manifest (`latest=true`) instead of replaying the whole chain.
+- **Default vault.** New items go to the vault the account made at signup (recorded in the keyring) or another vault it created, never a vault someone shared with it, so nobody can collect your logins by sharing you a vault called "Personal".
 
 ## Inbox, requests and links
 
@@ -107,7 +109,7 @@ Agents are first-class accounts owned by a human, built for automation and AI to
 - `plaintext agent create ci-bot --vault CI --role reader --expires 30d` makes the account, pins and verifies it for the owner, grants access, and prints the `ptk_…` key once.
 - Access is per vault, with a role and an expiry, enforced by keys (an agent only ever receives the keys of vaults it's in). Agents can't create vaults, invite people or create agents. The owner (or an admin) can disable an agent instantly.
 - Every agent read and every write is in the vault's audit log, visible to its owners.
-- **Use without seeing:** `plaintext run -- cmd` and `plaintext inject` resolve `pt://Vault/Item/field` references into environment variables or files. The MCP server (`plaintext mcp`) gives AI agents search, non-secret fields, `run_with_secrets` (secrets go into the command's environment and are scrubbed from its output), `create_item` with a generated password the model never sees, and `request_access`. Returning secret values to the model at all needs `PLAINTEXT_MCP_REVEAL=1`.
+- **Use without seeing:** `plaintext run -- cmd` and `plaintext inject` resolve `pt://Vault/Item/field` references into environment variables or files. The MCP server (`plaintext mcp`) gives AI agents search, non-secret fields, `run_with_secrets` (secrets go into the command's environment and are scrubbed from its output), `create_item` with a generated password the model never sees, and `request_access`. Returning secret values to the model needs `PLAINTEXT_MCP_REVEAL=1`. This keeps secrets out of model context and transcripts by accident; it is not a boundary against a model determined to read them (a command can transform a secret before printing it). The boundary is which vaults the agent account can read.
 
 ## Wire API
 

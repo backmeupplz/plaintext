@@ -429,7 +429,8 @@ async fn create_invite(State(db): State<Db>, h: HeaderMap, Json(req): Json<NewIn
 fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()> {
     for m in &r.members {
         let id: Identity = parse(&serde_json::from_str::<Signed>(
-            &tx.query_row("SELECT identity FROM accounts WHERE username = ? AND disabled = 0", [&m.username], |row| row.get::<_, String>(0))
+            // Disabled accounts may stay listed (they can't sign in); revoke them to change the key.
+            &tx.query_row("SELECT identity FROM accounts WHERE username = ?", [&m.username], |row| row.get::<_, String>(0))
                 .optional()
                 .map_err(db_err)?
                 .ok_or((BAD, "a member doesn't exist"))?,
@@ -474,16 +475,21 @@ fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
 fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> R<()> {
     verify_signed(tx, &put.manifest, "manifest", username)?;
     let env: ManifestEnvelope = parse(&put.manifest)?;
-    let (counter, epoch, last): (u64, u64, Option<Vec<u8>>) = tx
-        .query_row("SELECT counter, epoch, manifest_hash FROM vaults WHERE id = ?", [vault], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let (counter, epoch, last, roster): (u64, u64, Option<Vec<u8>>, u64) = tx
+        .query_row("SELECT counter, epoch, manifest_hash, roster_version FROM vaults WHERE id = ?", [vault], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .map_err(db_err)?;
     if counter != put.expected_counter {
         return Err((StatusCode::CONFLICT, "vault changed, pull first"));
     }
-    if env.vault_id.0[..] != *vault || env.counter != counter + 1 || env.epoch != epoch || env.prev.0 != last.unwrap_or_default() {
+    if env.vault_id.0[..] != *vault || env.counter != counter + 1 || env.epoch != epoch || env.roster > roster || env.prev.0 != last.unwrap_or_default() {
         return Err((BAD, "manifest doesn't extend the chain"));
     }
-    check_blob(&env.sealed)?;
+    // A manifest lists every item (~90 bytes each), so it gets more room than an item.
+    if env.sealed.0.is_empty() || env.sealed.0.len() > 16 * MAX_BLOB {
+        return Err((BAD, "manifest size"));
+    }
     for u in &put.upserts {
         check_blob(&u.blob)?;
         tx.execute(
@@ -537,6 +543,9 @@ struct Since {
     #[serde(default)]
     since: u64,
     roster: Option<u64>,
+    /// Only the latest manifest (for a device with no state yet).
+    #[serde(default)]
+    latest: bool,
 }
 
 async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<Since>) -> R<Json<VaultResponse>> {
@@ -556,7 +565,11 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
             .map(|s| serde_json::from_str(&s.map_err(db_err)?).map_err(db_err))
             .collect()
     };
-    let manifests = signed_list("SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter", q.since as i64)?;
+    let manifests = if q.latest {
+        signed_list("SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter DESC LIMIT 1", q.since as i64)?
+    } else {
+        signed_list("SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter", q.since as i64)?
+    };
     let rosters = signed_list(
         "SELECT signed FROM rosters WHERE vault_id = ? AND version > ? ORDER BY version",
         q.roster.map_or(-1, |v| v as i64),

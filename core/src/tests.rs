@@ -162,9 +162,6 @@ fn sync_and_server_tampering() {
     dropped.items.pop();
     assert_eq!(fresh(&mut a, &dropped), Err(Error::ManifestMismatch));
 
-    let mut gap = good.clone();
-    gap.manifests.remove(0);
-    assert_eq!(fresh(&mut a, &gap), Err(Error::Rollback));
 
     let mut lie = good.clone();
     lie.counter = 9;
@@ -350,4 +347,74 @@ fn agents_are_pinned_by_their_owner() {
     let id: Identity = serde_json::from_slice(&s.request.identity.body.0).unwrap();
     assert_eq!((id.kind, id.owner.as_deref()), (Kind::Agent, Some("alice")));
     assert_eq!(derive_agent(&AgentKey::parse(&key.encode()).unwrap()).account_id, s.account.id);
+}
+
+#[test]
+fn expired_writer_history_stays_valid_and_demotion_rotates() {
+    let (mut a, mut b) = pair();
+    let (am, bm) = (a.me(), b.me());
+    let (v, nv) = Vault::create(&am, "Team").unwrap();
+    let mut log = Log::new(&nv);
+    let g = v.grant(&am, &a, "bob", Role::Writer, Some(100), 0).unwrap();
+    assert!(g.rotation.is_none());
+    log.roster(&g);
+    // Bob writes last, before his access expires.
+    let mut vb = Vault::new(v.id);
+    vb.apply(&log.full("bob"), &mut b, 50).unwrap();
+    vb.put(new_item_id(), login("bob's", "x"));
+    let p = vb.push(&bm, 50).unwrap();
+    log.put(&p);
+    // Long after the expiry, a new device of alice's still syncs: bob could write then.
+    let mut fresh = Vault::new(v.id);
+    fresh.apply(&log.full("alice"), &mut a, 10_000).unwrap();
+    assert_eq!(fresh.items().count(), 1);
+    assert_eq!(fresh.creator, "alice");
+
+    // Demoting bob to reader replaces the key; he keeps reading under the new one.
+    let d = fresh.grant(&am, &a, "bob", Role::Reader, None, 10_000).unwrap();
+    assert!(d.rotation.is_some());
+    log.roster(&d);
+    let mut vb2 = Vault::new(v.id);
+    vb2.apply(&log.full("bob"), &mut b, 10_000).unwrap();
+    assert_eq!(vb2.items().count(), 1);
+    assert_eq!(vb2.role("bob", 10_000), Some(Role::Reader));
+}
+
+#[test]
+fn fresh_device_can_start_from_the_latest_manifest() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    for i in 0..3 {
+        v.put(new_item_id(), login(&format!("i{i}"), "p"));
+        let p = v.push(&me, 0).unwrap();
+        v.pushed(&p);
+        log.put(&p);
+    }
+    let mut latest = log.full("alice");
+    latest.manifests = vec![latest.manifests.pop().unwrap()];
+    let mut d = Vault::new(v.id);
+    d.apply(&latest, &mut a, 0).unwrap();
+    assert_eq!((d.items().count(), d.counter), (3, 4));
+    // But a device with state still needs every link.
+    let mut stale = log.full("alice");
+    stale.manifests.truncate(2);
+    stale.counter = 2;
+    stale.items.clear();
+    let mut e = Vault::new(v.id);
+    e.apply(&Log::new(&nv).full("alice"), &mut a, 0).unwrap();
+    let mut skip = log.full("alice");
+    skip.manifests = vec![skip.manifests.pop().unwrap()];
+    skip.rosters.clear();
+    assert_eq!(e.apply(&skip, &mut a, 0).err(), Some(Error::Rollback));
+}
+
+/// Cross-checked by tools/kat.py.
+#[test]
+fn agent_and_fingerprint_vectors() {
+    let d = derive_agent(&AgentKey(Zeroizing::new([5u8; 32])));
+    assert_eq!(hex::encode(d.account_id), "272662a8c3c49ef130dfea9152628f6a");
+    assert_eq!(hex::encode(d.auth.verifying_key().to_bytes()), "c4fad018f30f508ab8f9d287954471fb8c8fdf4b6a1b028bb6eb9072f8d10bfa");
+    assert_eq!(fingerprint("alice", &[1u8; 32], &[2u8; 32]), "K45K00 6D7D9J H3NF4F PN9AAK");
 }
