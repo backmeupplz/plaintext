@@ -235,3 +235,46 @@ fn lying_server_and_hostile_users() {
     assert!(matches!(a3.sync(), Err(Error::Core(plaintext_core::Error::Rollback))));
     let _ = std::fs::remove_file(&path);
 }
+
+/// What an app keeps on the device: snapshots that survive a restart (with the
+/// rollback guard), an offline open that queues edits, and imports.
+#[test]
+fn device_state_offline_and_import() {
+    let (url, path) = server();
+    let dir = std::env::temp_dir().join(format!("plaintext-local-{}", hex::encode(plaintext_core::crypto::random::<8>())));
+    let (sk, mut alice) = Session::signup(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "phone").unwrap();
+    alice.sync().unwrap();
+    let mine = alice.default_vault().unwrap();
+    assert_eq!(alice.import(import::onepux(&import::tests::onepux_fixture()).unwrap(), None).unwrap(), 8);
+    let shared = alice.own_vault("Shared").expect("the 1PUX vault named Shared was made");
+    let (vid, logo_id, logo) = alice.one("KeePassXC Logo", None).unwrap();
+    assert_eq!(vid, mine);
+    assert_eq!(alice.download_file(&vid, &logo.files[0]).unwrap(), b"\x89PNG logo");
+    let old: Vec<u8> = alice.t.send("GET", &format!("/v1/vaults/{mine}?since=0"), Some(&alice.token), None).unwrap().1;
+    alice.put_item(&mine, plaintext_core::new_item_id(), item("Later", "added-later")).unwrap();
+    alice.save_local(&dir).unwrap();
+
+    // Restart: the snapshots carry the rollback guard, so a replayed old vault is caught.
+    let mut again = Session::login(evil(&url), &derive("alice pw", &sk), "phone").unwrap();
+    again.load_local(&dir).unwrap();
+    assert!(again.vaults[&mine].counter > 0 && again.vaults.contains_key(&shared));
+    *again.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
+    assert!(matches!(again.sync(), Err(Error::Core(plaintext_core::Error::Rollback))));
+
+    // Offline: open from the device's copies with a dead server, edit, sync later.
+    let token = alice.token.clone();
+    let (aid, akey) = (alice.account.id, alice.account.account_key.clone());
+    let account = || plaintext_core::Account { id: aid, account_key: akey.clone() };
+    let mut off = Session::offline(Http::new("http://127.0.0.1:9"), token.clone(), account(), &dir).unwrap();
+    assert_eq!(off.one("later", None).unwrap().2.password, "added-later");
+    assert!(matches!(off.put_item(&mine, logo_id, item("Edited offline", "offline-pw")), Err(Error::Network(_))));
+    off.save_local(&dir).unwrap();
+    let mut back = Session::offline(Http::new(&url), token, account(), &dir).unwrap();
+    back.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.vaults[&mine].get(&logo_id).unwrap().title, "Edited offline", "the queued edit reached the server");
+    assert!(back.admin && back.keyring.default_vault == Some(mine));
+    assert!(Session::offline(Http::new(&url), alice.token.clone(), account(), Path::new("/nonexistent")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}

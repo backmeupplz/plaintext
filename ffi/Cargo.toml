@@ -1,0 +1,31 @@
+[package]
+name = "plaintext-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI bindings for the Plaintext apps (Swift, Kotlin)"
+
+[lib]
+name = "plaintext_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+plaintext-client = { path = "../client" }
+hex = "0.4"
+serde_json = "1"
+uniffi = "0.33"
+zeroize = "1"
+
+[dev-dependencies]
+plaintext-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+axum = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
