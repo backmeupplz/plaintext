@@ -82,7 +82,7 @@ fun concealed(kind: String) = kind == "concealed" || kind == "ssh_key"
  * ponytail: mirrors core's `safe_file_name`; switch to the Rust export once the FFI has it (after PR #14).
  */
 fun safeName(name: String): String {
-    var base = name.substringAfterLast('/').substringAfterLast('\\').filterNot { Character.isISOControl(it) }.trim()
+    var base = name.substringAfterLast('/').substringAfterLast('\\').filterNot { Character.isISOControl(it) }.trim().take(200)
     // File names are limited to 255 bytes, not characters.
     while (base.toByteArray().size > 200) base = base.dropLast(if (base.length > 1 && base[base.length - 2].isHighSurrogate()) 2 else 1)
     return if (base.isEmpty() || base == "." || base == "..") "attachment" else base

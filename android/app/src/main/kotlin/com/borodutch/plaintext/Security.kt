@@ -247,8 +247,18 @@ class Vault(private val context: Context) {
          * A strong fingerprint or face sensor with something enrolled, on Android 11 or later. Before that, a key usable for
          * a few seconds after authenticating also opens with the screen lock PIN and survives a new enrolment.
          */
-        fun biometricsAvailable(context: Context) = Build.VERSION.SDK_INT >= 30 &&
+        fun biometricsAvailable(context: Context) = Build.VERSION.SDK_INT >= 30 && canPrompt(context)
+
+        /** A strong biometric prompt works (on any version): enough for a fresh check before showing a secret. */
+        fun canPrompt(context: Context) =
             BiometricManager.from(context).canAuthenticate(BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+
+        /** Why biometric unlock is off, for settings and onboarding copy; null when it's available. */
+        fun biometricsMissing(context: Context) = when {
+            !canPrompt(context) -> "Set up a fingerprint or face in Android's settings to unlock with it."
+            Build.VERSION.SDK_INT < 30 -> "Unlocking with a fingerprint or face needs Android 11 or later."
+            else -> null
+        }
     }
 }
 

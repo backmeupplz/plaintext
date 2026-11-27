@@ -192,7 +192,7 @@ class Model(val context: Context) {
             remember(info, sk, u)
             if (epoch != e) {
                 abandonSetup()
-                core.lock(!sessionsStored)
+                if (locked) core.lock(!sessionsStored) else reload()
             }
             r
         }.await()
@@ -238,43 +238,46 @@ class Model(val context: Context) {
         if (!locked || unlocking) return
         unlocking = true
         val e = epoch
+        opening++ // from the start: a lock while the Keystore decrypts must still go through
         scope.launch {
-            val sessions = try {
-                withContext(Dispatchers.IO) { vault.sessions() }
-            } catch (x: Exception) {
-                if (x is KeyPermanentlyInvalidatedException || x is UnrecoverableKeyException) {
-                    // A new fingerprint or face was enrolled (or the key is gone): the password is needed once.
-                    vault.forgetAllSessions()
-                    banner = "Your fingerprints or face changed, so enter your password once to turn biometric unlock back on."
-                } else {
-                    banner = "Couldn't open your vaults with your fingerprint. Try again, or use your password."
-                }
-                unlocking = false
-                return@launch
-            }
-            val errors = mutableListOf<String>()
-            opening++
-            for (k in known) {
-                if (epoch != e) break
-                val u = sessions[k.id] ?: continue
-                if (account(k.id) != null) continue
-                try {
-                    call { it.resume(k.server, u) }
-                } catch (x: PlaintextException.SignedOut) {
-                    vault.forgetSession(k.id)
-                    errors += "${k.name} was signed out. Enter its password to sign in again."
+            try {
+                val sessions = try {
+                    withContext(Dispatchers.IO) { vault.sessions() }
                 } catch (x: Exception) {
-                    errors += errorText(x)
+                    if (x is KeyPermanentlyInvalidatedException || x is UnrecoverableKeyException) {
+                        // A new fingerprint or face was enrolled (or the key is gone): the password is needed once.
+                        vault.forgetAllSessions()
+                        banner = "Your fingerprints or face changed, so enter your password once to turn biometric unlock back on."
+                    } else {
+                        banner = "Couldn't open your vaults with your fingerprint. Try again, or use your password."
+                    }
+                    unlocking = false
+                    return@launch
                 }
+                val errors = mutableListOf<String>()
+                for (k in known) {
+                    if (epoch != e) break
+                    val u = sessions[k.id] ?: continue
+                    if (account(k.id) != null) continue
+                    try {
+                        call { it.resume(k.server, u) }
+                    } catch (x: PlaintextException.SignedOut) {
+                        vault.forgetSession(k.id)
+                        errors += "${k.name} was signed out. Enter its password to sign in again."
+                    } catch (x: Exception) {
+                        errors += errorText(x)
+                    }
+                }
+                sessions.values.forEach { it.accountKey.fill(0) }
+                unlocking = false
+                // Locked again while opening (the screen went off), and still locked: stay that way.
+                if (epoch != e && locked) return@launch core.lock(!sessionsStored)
+                reload()
+                if (accounts.isNotEmpty()) unlocked()
+                banner = errors.firstOrNull()
+            } finally {
+                opening--
             }
-            opening--
-            sessions.values.forEach { it.accountKey.fill(0) }
-            unlocking = false
-            // Locked again while opening (the screen went off): stay locked.
-            if (epoch != e) return@launch core.lock(!sessionsStored)
-            reload()
-            if (accounts.isNotEmpty()) unlocked()
-            banner = errors.firstOrNull()
         }
     }
 
@@ -285,8 +288,8 @@ class Model(val context: Context) {
         opening++
         val r = try { call { it.login(k.server, sk, password) } } finally { opening-- }
         saveSession(k.id, r.unlock)
-        // Locked again while signing in: stay locked.
-        if (epoch != e) return core.lock(!sessionsStored)
+        // Locked again while signing in, and still locked: stay that way.
+        if (epoch != e && locked) return core.lock(!sessionsStored)
         unlocked()
     }
 

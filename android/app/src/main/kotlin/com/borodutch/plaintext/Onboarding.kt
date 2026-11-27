@@ -358,6 +358,7 @@ private fun BiometricsStep(flow: Flow, done: () -> Unit) {
     StepPage(
         "Unlock with your fingerprint",
         if (available) "Open Plaintext with your fingerprint or face instead of typing your password each time. Your password is never stored; the keys stay in this phone's secure hardware."
+        else if (Vault.canPrompt(LocalContext.current)) "Unlocking with a fingerprint or face needs Android 11 or later, so you'll type your password to unlock."
         else "This phone has no fingerprint or face unlock set up, so you'll type your password to unlock. You can turn biometric unlock on later in Settings.",
         onBack = null,
         actions = {

@@ -161,7 +161,7 @@ fun SecurityScreen() {
             }
             Text(
                 "Plaintext also locks when the screen turns off, and it never appears in screenshots, screen recordings or the recent apps view." +
-                    if (!Vault.biometricsAvailable(context)) " Set up a fingerprint or face in Android's settings to unlock with it." else "",
+                    (Vault.biometricsMissing(context)?.let { " $it" } ?: ""),
                 color = P.muted, style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -304,7 +304,7 @@ fun AddDeviceScreen(account: String) {
     fun show() {
         val sk = model.vault.secretKey(account) ?: run { model.banner = "This device lost its copy of the Secret Key. Sign in again with your Emergency Kit."; return }
         val reveal = { code = runCatching { model.core.addDeviceCode(account, sk) }.getOrElse { model.show(it); null } }
-        if (Vault.biometricsAvailable(context)) promptBiometrics(context as FragmentActivity, "Show the sign-in code") { reveal() } else reveal()
+        if (Vault.canPrompt(context)) promptBiometrics(context as FragmentActivity, "Show the sign-in code") { reveal() } else reveal()
     }
     Screen("Add a device", onBack = { model.pop() }) { m ->
         Column(m.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(20.dp)) {
