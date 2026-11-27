@@ -86,7 +86,8 @@ impl From<core::Error> for PlaintextError {
             E::KeyChanged(username) => PlaintextError::KeyChanged { username },
             E::Rollback => PlaintextError::Rollback,
             E::ManifestMismatch => PlaintextError::ManifestMismatch,
-            E::Tampered => PlaintextError::WrongPassword,
+            // Wrong-password paths map it themselves (`password_error`).
+            E::Tampered => PlaintextError::Invalid { message: "this data didn't check out: it was damaged or changed on its way".into() },
             E::BadSecretKey => PlaintextError::BadSecretKey,
             E::BadInvite => PlaintextError::BadInvite,
             E::BadUsername => PlaintextError::BadUsername,
@@ -106,6 +107,24 @@ impl From<ClientError> for PlaintextError {
             ClientError::NotFound(message) => PlaintextError::NotFound { message },
             ClientError::Refused(message) => PlaintextError::Invalid { message },
         }
+    }
+}
+
+/// Signing in or changing the password: a refusal or a key that doesn't open
+/// means the password (or Secret Key) is wrong.
+fn password_error(e: ClientError) -> PlaintextError {
+    match e {
+        ClientError::Server(401 | 403, _) | ClientError::Core(core::Error::Tampered) => PlaintextError::WrongPassword,
+        e => e.into(),
+    }
+}
+
+/// A damaged copy on this device (`Session::load_local`) is replaced on the next
+/// save, as the CLI does: say so, but don't keep the account locked. Call after
+/// the first sync, which clears `problems`.
+fn local_warning(s: &mut S, loaded: Result<(), ClientError>) {
+    if loaded.is_err() {
+        s.problems.push("this device's saved copy couldn't be read, so it was replaced with the server's".into());
     }
 }
 
@@ -349,7 +368,7 @@ fn item_data(i: &Item) -> ItemData {
         tags: i.tags.clone(),
         favorite: i.favorite,
         archived: i.archived,
-        files: i.files.iter().map(|f| FileData { id: f.id.to_string(), name: f.name.clone(), size: f.size }).collect(),
+        files: i.files.iter().map(|f| FileData { id: f.id.to_string(), name: core::item::safe_file_name(&f.name), size: f.size }).collect(),
         password_history: i.password_history.iter().map(|p| OldPasswordData { password: p.password.clone(), changed: p.changed }).collect(),
         history: i
             .history
@@ -392,7 +411,8 @@ fn apply(base: &Item, d: ItemData) -> Item {
     next.tags = d.tags.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
     next.favorite = d.favorite;
     next.archived = d.archived;
-    next.files.retain(|f| d.files.iter().any(|k| k.id == f.id.to_string()));
+    // Attachments change only through `attach_file` and `remove_file`: an editor
+    // open meanwhile mustn't drop a file another device just attached.
     next
 }
 
@@ -491,6 +511,13 @@ pub struct AgentAccess {
     pub vault_name: String,
     pub role: Role,
     pub expires: Option<u64>,
+}
+
+/// A new agent's key (show it once) and, when giving it the vault failed, why.
+#[derive(uniffi::Record)]
+pub struct NewAgentKey {
+    pub key: String,
+    pub warning: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -927,6 +954,17 @@ fn writable(s: &S, vid: &Hex) -> Res<()> {
     }
 }
 
+/// Add a new item and push it. If that fails, take it back out (its delete is
+/// harmless if the put did arrive), so trying again doesn't leave a second copy.
+fn put_new(s: &mut S, vid: &Hex, iid: Hex, it: Item) -> Res<()> {
+    s.put_item(vid, iid, it).map_err(|e| {
+        if let Some(v) = s.vaults.get_mut(vid) {
+            v.delete(iid);
+        }
+        e.into()
+    })
+}
+
 fn get_item(s: &S, vid: &Hex, iid: &Hex) -> Res<Item> {
     s.vaults.get(vid).and_then(|v| v.get(iid)).cloned().ok_or_else(|| not_found("that item"))
 }
@@ -983,14 +1021,12 @@ impl PlaintextApp {
         let server = normalize_server(&server)?;
         let sk = SecretKey::parse(&secret_key)?;
         let password = Zeroizing::new(password);
-        let mut s = match Session::login(Http::new(&server), &derive(&password, &sk), &self.device) {
-            Err(ClientError::Server(401, _)) => return Err(PlaintextError::WrongPassword),
-            r => r?,
-        };
-        s.load_local(&self.dir_for(&s.account))?;
+        let mut s = Session::login(Http::new(&server), &derive(&password, &sk), &self.device).map_err(password_error)?;
+        let loaded = s.load_local(&self.dir_for(&s.account));
         // Signed in either way: what this sync couldn't do (a full account, a
         // server error) shows on the next one instead of locking the device out.
         let _ = s.sync();
+        local_warning(&mut s, loaded);
         let unlock = unlock_of(&s);
         let account = self.start(s, server)?;
         Ok(LoginResult { account, unlock })
@@ -1003,8 +1039,10 @@ impl PlaintextApp {
         let account = account_of(&unlock)?;
         let s = match Session::resume(Http::new(&server), unlock.token.clone(), account) {
             Ok(mut s) => {
-                s.load_local(&self.dir_for(&s.account))?;
-                match s.sync() {
+                let loaded = s.load_local(&self.dir_for(&s.account));
+                let synced = s.sync();
+                local_warning(&mut s, loaded);
+                match synced {
                     Ok(()) | Err(ClientError::Network(_) | ClientError::Server(500.., _)) => s,
                     // Signed out: stays locked until the password signs in again.
                     Err(ClientError::Server(401, _)) => return Err(PlaintextError::SignedOut),
@@ -1055,10 +1093,16 @@ impl PlaintextApp {
     }
 
     /// Sign this device out of one account: end the session on the server (when
-    /// reachable) and delete this device's copies.
-    pub fn sign_out(&self, account: String) {
+    /// reachable) and delete this device's copies. A locked account's session is
+    /// ended with what the keychain kept for it (`stored`), when there is any.
+    pub fn sign_out(&self, account: String, server: String, stored: Option<UnlockData>) {
         let Ok(a) = self.acct(&account) else {
-            // Locked: no session to end here, but the copies still go.
+            if let Some(u) = stored
+                && let Ok(acct) = account_of(&u)
+                && let Ok(s) = Session::resume(Http::new(&server), u.token, acct)
+            {
+                let _ = s.logout();
+            }
             if account.len() == 32 && hex::decode(&account).is_ok() {
                 let _ = std::fs::remove_dir_all(self.dir.join("vaults").join(&account[..16]));
             }
@@ -1087,10 +1131,7 @@ impl PlaintextApp {
     pub fn change_password(&self, account: String, secret_key: String, old_password: String, new_password: String) -> Res<()> {
         let sk = SecretKey::parse(&secret_key)?;
         let old = Zeroizing::new(old_password);
-        self.with(&account, |s| match s.change_password(&derive(&old, &sk), &sk, &new_password) {
-            Err(ClientError::Server(401 | 403, _)) => Err(PlaintextError::WrongPassword),
-            r => Ok(r?),
-        })
+        self.with(&account, |s| s.change_password(&derive(&old, &sk), &sk, &new_password).map_err(password_error))
     }
 
     /// The QR another device scans to sign in (needs this account's Secret Key).
@@ -1232,7 +1273,7 @@ impl PlaintextApp {
             for (name, data) in &files {
                 it.files.push(s.upload_file(&to, name, data)?);
             }
-            Ok(s.put_item(&to, nid, it)?)
+            put_new(s, &to, nid, it)
         })?;
         self.with(&account, |s| Ok(s.delete_item(&vid, iid)?))?;
         Ok(nid.to_string())
@@ -1244,6 +1285,17 @@ impl PlaintextApp {
             writable(s, &vid)?;
             let mut it = get_item(s, &vid, &iid)?;
             it.files.push(s.upload_file(&vid, &name, &data)?);
+            Ok(s.put_item(&vid, iid, it)?)
+        })
+    }
+
+    /// Take an attachment off an item. The file itself stays on the server until a
+    /// later sync collects it (another device may still bring the item back with it).
+    pub fn remove_file(&self, account: String, vault: String, id: String, file: String) -> Res<()> {
+        let (vid, iid) = (hex_id(&vault)?, hex_id(&id)?);
+        self.local_first(&account, &vid, |s| {
+            let mut it = get_item(s, &vid, &iid)?;
+            it.files.retain(|f| f.id.to_string() != file);
             Ok(s.put_item(&vid, iid, it)?)
         })
     }
@@ -1472,7 +1524,8 @@ impl PlaintextApp {
                 .into_iter()
                 .map(|(from, r)| {
                     let verified = s.keyring.contacts.get(&from).is_some_and(|c| c.verified);
-                    let from_agent_of_mine = agents.contains(&from);
+                    // An agent's owner claim is its own; the owner pinned and verified it when making it.
+                    let from_agent_of_mine = verified && agents.contains(&from);
                     match r {
                         Ok((m, c)) => InboxEntry {
                             id: m.id.to_string(),
@@ -1514,8 +1567,9 @@ impl PlaintextApp {
             };
             let iid = core::new_item_id();
             (item.created, item.updated) = (now_ms(), now_ms());
-            s.put_item(&vid, iid, item)?;
-            s.delete_message(&mid)?;
+            put_new(s, &vid, iid, item)?;
+            // Saved either way: a message left behind can still be dismissed.
+            let _ = s.delete_message(&mid);
             Ok(iid.to_string())
         })
     }
@@ -1527,14 +1581,18 @@ impl PlaintextApp {
 
     // ----- Agents -----
 
-    /// Make an agent with access to one vault. Returns its `ptk_…` key: show it once.
-    pub fn create_agent(&self, account: String, name: String, vault: String, role: Role, expires: Option<u64>) -> Res<String> {
+    /// Make an agent with access to one vault. Returns its `ptk_…` key: show it
+    /// once. The agent exists once it's made, so its key comes back even when
+    /// sharing the vault with it fails (the warning says so).
+    pub fn create_agent(&self, account: String, name: String, vault: String, role: Role, expires: Option<u64>) -> Res<NewAgentKey> {
         let vid = hex_id(&vault)?;
         let name = name.trim().to_lowercase();
         self.with(&account, |s| {
-            let key = s.create_agent(&name)?;
-            s.share_vault(&vid, &name, role.into(), expires)?;
-            Ok(key.encode())
+            let key = s.create_agent(&name)?.encode();
+            let warning = s.share_vault(&vid, &name, role.into(), expires).err().map(|e| {
+                format!("{name} was made, but giving it the vault failed ({}). Share the vault with {name} to try again.", PlaintextError::from(e))
+            });
+            Ok(NewAgentKey { key, warning })
         })
     }
 
