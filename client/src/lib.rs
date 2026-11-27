@@ -156,6 +156,9 @@ fn raw<T: Transport>(t: &T, method: &str, path: &str, token: Option<&str>, body:
 
 pub const NONE: Option<&()> = None;
 
+/// How long a file no item refers to stays on the server (`Session::collect_files`).
+pub const FILE_GRACE: u64 = 7 * 24 * 3600;
+
 /// A signed-in, unlocked account.
 pub struct Session<T: Transport> {
     pub t: T,
@@ -285,8 +288,14 @@ impl<T: Transport> Session<T> {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
             match self.sync_vault(id).and_then(|_| self.remove_members(id, None)) {
-                Ok(()) => {}
-                Err(e @ Error::Server(409 | 413, _)) => full = Some(e),
+                // Best effort: an older server or a role that changed mid-run just means next time.
+                Ok(()) => drop(self.collect_files(id, 0)),
+                // Every 409 and 413 comes after a pull, so collecting is still safe, and
+                // over quota it's what makes room for the refused change.
+                Err(e @ Error::Server(409 | 413, _)) => {
+                    drop(self.collect_files(id, 0));
+                    full = Some(e);
+                }
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
@@ -656,19 +665,12 @@ impl<T: Transport> Session<T> {
         self.sync_vault(vault)
     }
 
-    /// Delete an item and push. Its attachments are deleted too unless another item
-    /// in the vault refers to them.
+    /// Delete an item and push. Its attachments stay on the server until a later
+    /// sync collects them (`collect_files`), so another device that brings the item
+    /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        let v = self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?;
-        let files = v.get(&id).map(file_ids).unwrap_or_default();
-        v.delete(id);
-        self.sync_vault(vault)?;
-        let v = self.vaults.get(vault).ok_or(Error::NotFound("vault".into()))?;
-        let kept: Vec<Hex> = v.items().flat_map(|(_, i)| file_ids(i)).collect();
-        for f in files.iter().filter(|f| !kept.contains(f)) {
-            self.delete_file(vault, f)?;
-        }
-        Ok(())
+        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.delete(id);
+        self.sync_vault(vault)
     }
 
     // ---------- Files ----------
@@ -685,6 +687,31 @@ impl<T: Transport> Session<T> {
             key: B64(key.to_vec()),
             hash: B64(plaintext_core::crypto::sha256(&blob).to_vec()),
         })
+    }
+
+    /// The files uploaded to a vault, with their sealed sizes, whether or not an item lists them (writers).
+    pub fn files(&self, vault: &Hex) -> Result<FileList> {
+        self.call("GET", &format!("/v1/vaults/{vault}/files"), NONE)
+    }
+
+    /// Delete the vault's files that no item refers to once this device has seen
+    /// them so for `FILE_GRACE` (`Vault::collect_files`). They come from deleted
+    /// items, edits that dropped them, and uploads whose item never got pushed;
+    /// they count against the quota until then. Writers only, and only right
+    /// after a pull (`sync` does that). The grace runs on the server's clock;
+    /// tests move it forward by `skew` seconds.
+    pub(crate) fn collect_files(&mut self, vault: &Hex, skew: u64) -> Result<()> {
+        let v = self.vaults.get(vault).ok_or(Error::NotFound("vault".into()))?;
+        if v.role(self.username(), now()).is_none_or(|r| r < Role::Writer) {
+            return Ok(());
+        }
+        let list = self.files(vault)?;
+        let listed: Vec<Hex> = list.files.into_iter().map(|f| f.id).collect();
+        let due = self.vaults.get_mut(vault).expect("checked above").collect_files(&listed, list.now + skew, FILE_GRACE);
+        for f in &due {
+            self.delete_file(vault, f)?;
+        }
+        Ok(())
     }
 
     /// Delete an uploaded file from the server (items that list it can no longer fetch it).
@@ -738,13 +765,6 @@ impl<T: Transport> Session<T> {
         self.call::<()>("POST", "/v1/links", Some(&link))?;
         Ok(format!("{}#{}/{}/{}", page.split('#').next().unwrap_or_default(), server.trim_end_matches('/'), link.id, fragment))
     }
-}
-
-/// The files an item refers to, in its current fields and its earlier versions.
-fn file_ids(item: &Item) -> Vec<Hex> {
-    let earlier = item.history.iter().flat_map(|h| h.get("files").and_then(|f| f.as_array()).into_iter().flatten());
-    let earlier = earlier.filter_map(|f| f.get("id")?.as_str()?.parse().ok());
-    item.files.iter().map(|f| f.id).chain(earlier).collect()
 }
 
 fn zeroize_key(raw: &[u8]) -> Option<plaintext_core::crypto::Key> {
