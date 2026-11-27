@@ -59,6 +59,7 @@ import kotlinx.coroutines.launch
 import uniffi.plaintext_ffi.LoginResult
 import uniffi.plaintext_ffi.Recipe
 import uniffi.plaintext_ffi.ServerInfo
+import uniffi.plaintext_ffi.PlaintextException
 import uniffi.plaintext_ffi.SignupResult
 import uniffi.plaintext_ffi.cloudServer
 import uniffi.plaintext_ffi.generatePassword
@@ -88,6 +89,11 @@ private class Flow {
     fun go(s: Step) = path.add(s)
     fun back() { if (path.isNotEmpty()) path.removeAt(path.lastIndex) }
 }
+
+/** Rust's network message talks about items already on this device, and there are none yet. */
+private fun setupError(e: Throwable) =
+    if (e is PlaintextException.Network) "Couldn't reach that server. Check the address, and add http:// if it doesn't use https."
+    else errorText(e)
 
 /**
  * Welcome → Server → Create account → Emergency Kit → biometrics, or Welcome → Server → username → Secret Key
@@ -183,7 +189,7 @@ private fun ServerStep(flow: Flow) {
                 model.vault.recentServers = listOf(address.url) + model.vault.recentServers.filter { it != address.url }
                 if (flow.path.lastOrNull() == Step.Server) flow.go(if (flow.create) Step.Create else Step.Username)
             } catch (e: Exception) {
-                error = errorText(e)
+                error = setupError(e)
             } finally {
                 busy = false
             }
@@ -260,7 +266,7 @@ private fun CreateStep(flow: Flow) {
                 flow.password = ""
                 flow.go(Step.Kit)
             } catch (e: Exception) {
-                error = errorText(e)
+                error = setupError(e)
             } finally {
                 busy = false
             }
@@ -424,7 +430,7 @@ private fun PasswordStep(flow: Flow) {
                 flow.password = ""
                 flow.go(Step.Biometrics)
             } catch (e: Exception) {
-                error = errorText(e)
+                error = setupError(e)
             } finally {
                 busy = false
             }
