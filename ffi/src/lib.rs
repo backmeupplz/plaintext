@@ -1632,7 +1632,12 @@ impl PlaintextApp {
             accounts.push(a.clone());
         }
         let s = a.session.lock().unwrap_or_else(|e| e.into_inner());
-        self.persist(&a, &s)?;
+        match self.persist(&a, &s) {
+            // Locked right away: still hand back what the caller needs (signup's
+            // Secret Key); the app resumes it from the keychain data.
+            Err(PlaintextError::Locked) => {}
+            r => r?,
+        }
         let info = a.info.read().expect("lock").clone();
         Ok(info)
     }
@@ -1689,6 +1694,10 @@ impl PlaintextApp {
         let mut s = a.session.lock().unwrap_or_else(|e| e.into_inner());
         let r = f(&mut s);
         let saved = self.persist(&a, &s);
+        // Locked meanwhile: nothing was kept, so this didn't happen (even offline).
+        if let Err(PlaintextError::Locked) = saved {
+            return Err(PlaintextError::Locked);
+        }
         let r = r?;
         saved?;
         Ok(r)

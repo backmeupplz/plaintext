@@ -97,7 +97,7 @@ if [ "${MAC:-}" = 1 ]; then
   xcodebuild -quiet -project apple/Plaintext.xcodeproj -scheme Plaintext -destination 'platform=macOS,arch=arm64' -derivedDataPath "$dd" build
   data="$HOME/Library/Containers/com.borodutch.plaintext/Data"
   rm -rf "$data/tmp/shots" "$data/Library/Application Support/Plaintext" "$data/Library/Preferences/com.borodutch.plaintext.plist"
-  PT_SHOTS=1 PT_LOGIN="$(printf '%s\t%s\t%s' "$url" "$sk" "bob's long password")" PT_INVITE2=$(pt user invite | sed -n 's/.*--invite \([^ ]*\).*/\1/p') \
+  PT_SHOTS=1 PT_LOGIN="$(printf '%s\t%s\t%s' "$url" "$sk" "bob's long password")" PT_INVITE2=$(pt user invite | tr -d '\r' | sed -n 's/.*--invite \([^ ]*\).*/\1/p') \
     "$dd/Build/Products/Debug/Plaintext.app/Contents/MacOS/Plaintext" >/dev/null 2>&1 || true
   cp "$data/tmp/shots/"*.png "$out/"
   rm -rf "$data/Library/Application Support/Plaintext" "$data/Library/Preferences/com.borodutch.plaintext.plist"

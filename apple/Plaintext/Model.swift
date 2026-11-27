@@ -81,6 +81,9 @@ final class AppModel: ObservableObject {
     /// The first account's onboarding is still on screen (Emergency Kit, biometrics)
     /// although `known` already holds the account.
     @Published var onboarding = false
+    /// An account was just made or signed in and its kit or biometrics step is on
+    /// screen: locking mustn't end that session before it's stored.
+    var settingUp = false
 
     @Published var vaults: [VaultInfo] = []
     @Published var items: [ItemSummary] = []
@@ -175,6 +178,7 @@ final class AppModel: ObservableObject {
     func remember(_ info: AccountInfo, secretKey: String) {
         let k = KnownAccount(id: info.id, server: info.server, username: info.username)
         if known.isEmpty { onboarding = true }
+        settingUp = true
         // Same name, same keychain items: an old account of a reset server is gone.
         known.removeAll { $0.id == k.id || $0.name == k.name }
         known.append(k)
@@ -185,9 +189,11 @@ final class AppModel: ObservableObject {
     func added(_ info: AccountInfo, unlock: UnlockData, secretKey: String) {
         remember(info, secretKey: secretKey)
         onboarding = false
+        settingUp = false
         guard let k = known(info.id) else { return }
         saveSession(unlock, for: k)
         locked = false
+        reload()
         Task {
             // The app locked meanwhile (say, while writing the kit down): open it again.
             if account(info.id) == nil, !core.accounts().contains(where: { $0.id == info.id }) {
@@ -270,7 +276,7 @@ final class AppModel: ObservableObject {
     func lock() {
         // Without a stored session the next unlock signs in again, so end these.
         // Not mid-onboarding, though: that session is about to be stored.
-        core.lock(endSessions: !sessionsStored && !onboarding)
+        core.lock(endSessions: !sessionsStored && !settingUp)
         accounts = []
         items = []
         vaults = []

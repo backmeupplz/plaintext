@@ -41,6 +41,8 @@ struct Onboarding: View {
             take(model.incoming)
         }
         .onChange(of: model.incoming) { _, l in take(l) }
+        // Closed before finishing (say, Add account cancelled on the kit step).
+        .onDisappear { model.settingUp = false }
     }
 
     private func take(_ link: AppModel.IncomingLink?) {

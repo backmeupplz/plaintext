@@ -119,8 +119,10 @@ struct ItemDetail: View {
             if canEdit { Button("Edit") { model.edit(ref) }.keyboardShortcut("e") }
             Menu {
                 if let s = summary {
-                    Button { model.setFlags(ref, favorite: !s.favorite, archived: s.archived) } label: {
-                        Label(s.favorite ? "Remove from Favorites" : "Add to Favorites", systemImage: s.favorite ? "star.slash" : "star")
+                    if canEdit {
+                        Button { model.setFlags(ref, favorite: !s.favorite, archived: s.archived) } label: {
+                            Label(s.favorite ? "Remove from Favorites" : "Add to Favorites", systemImage: s.favorite ? "star.slash" : "star")
+                        }
                     }
                     Button { sharing = true } label: { Label("Share…", systemImage: "square.and.arrow.up") }
                     if canEdit {
