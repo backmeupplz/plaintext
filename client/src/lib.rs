@@ -330,8 +330,10 @@ impl<T: Transport> Session<T> {
                 Err(e) => return Err(e),
             }
         }
-        for id in &acct.through_agents {
-            self.problems.push(format!("vault {id} counts against your storage through an agent of yours (to stop that: plaintext vault leave {id})"));
+        for id in &acct.paid_unlisted {
+            self.problems.push(format!(
+                "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"
+            ));
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
@@ -584,32 +586,15 @@ impl<T: Transport> Session<T> {
             Err(e) if !e.held_back() => return Err(e),
             _ => {}
         }
-        let me = self.username().to_string();
         let mut blocking = Vec::new();
-        for v in self.vaults.values() {
-            let Some(r) = &v.roster else { continue };
-            if v.role(&me, now()) != Some(Role::Owner) {
-                continue;
-            }
-            // Who keeps the vault, as the server counts them: current members other
-            // than us, our agents, and disabled or deleted accounts.
-            let gone = self.gone.get(&v.id).map(Vec::as_slice).unwrap_or_default();
-            let mut keepers = Vec::new();
-            for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
-                match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
-                    Err(Error::Server(404, _)) => {}
-                    Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
-                    Ok(_) => keepers.push(m.role),
-                    Err(e) => return Err(e),
-                }
-            }
-            if !keepers.is_empty() && !keepers.contains(&Role::Owner) {
+        for (id, v) in &self.vaults {
+            if self.leaves_ownerless(id)? {
                 blocking.push(v.meta.name.clone());
             }
         }
         if !blocking.is_empty() {
             return Err(Error::Refused(format!(
-                "you're the only owner of {}, which others use: make one of them an owner, or remove them, first",
+                "you're the only owner of {}, which others use: make one of them an owner, remove them, or leave it, first",
                 blocking.join(", ")
             )));
         }
@@ -671,9 +656,32 @@ impl<T: Transport> Session<T> {
         self.save_keyring()
     }
 
+    /// Whether we're the only owner of vault `id` and others would keep using it
+    /// without us, as the server counts them: current members other than us, our
+    /// agents, and disabled or deleted accounts.
+    pub fn leaves_ownerless(&self, id: &Hex) -> Result<bool> {
+        let me = self.username().to_string();
+        let Some(v) = self.vaults.get(id) else { return Ok(false) };
+        let Some(r) = &v.roster else { return Ok(false) };
+        if v.role(&me, now()) != Some(Role::Owner) {
+            return Ok(false);
+        }
+        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut keepers = Vec::new();
+        for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
+            match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
+                Err(Error::Server(404, _)) => {}
+                Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
+                Ok(_) => keepers.push(m.role),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(!keepers.is_empty() && !keepers.contains(&Role::Owner))
+    }
+
     /// Stop using a vault, along with your agents. Its owners' devices replace the
-    /// key. The vault is deleted if nobody else uses it; refused (409) while you're
-    /// its only owner and others use it.
+    /// key. The vault is deleted if nobody else uses it; as its only owner, you
+    /// leave the others a vault whose members and key can't change any more.
     pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
         let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
         self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;

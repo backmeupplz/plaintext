@@ -1044,6 +1044,8 @@ fn nobody_is_stuck_paying_for_a_vault() {
     let old = carol.create_vault("Old").unwrap();
     carol.share_vault(&old, "bob", Role::Owner, None).unwrap();
     exec(&path, "UPDATE members SET expires = 1 WHERE username = 'carol'");
+    carol.sync().unwrap();
+    assert!(carol.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {old}"))), "{:?}", carol.problems);
     carol.leave_vault(&old).unwrap();
     assert_eq!(creator(&old).as_deref(), Some("bob"));
 
@@ -1055,7 +1057,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     mallory.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift).as_deref(), Some("bob"));
     let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
-    assert_eq!(acct.through_agents, vec![gift]);
+    assert_eq!(acct.paid_unlisted, vec![gift]);
     bob.sync().unwrap();
     assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
     bob.leave_vault(&gift).unwrap();

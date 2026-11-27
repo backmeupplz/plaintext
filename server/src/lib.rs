@@ -638,10 +638,10 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
         .filter_map(|v| v.ok()?.try_into().ok().map(Hex))
         .collect();
     let usage = usage(&db, Some(&c.username))?;
-    let through_agents = db
-        .prepare("SELECT id FROM vaults WHERE creator = ?1 AND id NOT IN (SELECT vault_id FROM members WHERE username = ?1)")
+    let paid_unlisted = db
+        .prepare("SELECT id FROM vaults WHERE creator = ?1 AND id NOT IN (SELECT vault_id FROM members WHERE username = ?1 AND (expires IS NULL OR expires > ?2))")
         .map_err(db_err)?
-        .query_map([&c.username], |r| r.get::<_, Vec<u8>>(0))
+        .query_map(params![c.username, now()], |r| r.get::<_, Vec<u8>>(0))
         .map_err(db_err)?
         .filter_map(|v| v.ok()?.try_into().ok().map(Hex))
         .collect();
@@ -654,7 +654,7 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
         vaults,
         quota: cfg.quota,
         usage,
-        through_agents,
+        paid_unlisted,
     }))
 }
 
@@ -730,7 +730,7 @@ fn leave_vault(tx: &Transaction, vault: &[u8], username: &str, why: &str, keep_a
         )
         .map_err(db_err)?;
     if owns && !rest.iter().any(|(_, role)| role == "owner") {
-        return Err((StatusCode::CONFLICT, "you're the only owner of a vault others use: make one of them an owner, or remove them, first"));
+        return Err((StatusCode::CONFLICT, "you're the only owner of a vault others use: make one of them an owner, remove them, or leave it, first"));
     }
     for table in ["members", "vault_keys", "staged"] {
         tx.execute(&format!("DELETE FROM {table} WHERE vault_id = ?2 AND {}", in_set("username")), params![username, vault]).map_err(db_err)?;
@@ -1050,14 +1050,19 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
     Ok(())
 }
 
-/// Wrapped keys for members of the roster just stored, at its epoch; older
-/// epochs' keys go (pulls serve only the current one), so they never pile up.
+/// Wrapped keys for members of the roster just stored, at its epoch. Keys of
+/// other epochs (pulls serve only the current one) and of anyone no longer listed
+/// go, so they never pile up.
 fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
     if keys.len() > MAX_MEMBERS {
         return Err((BAD, "too many keys"));
     }
     let epoch: u64 = tx.query_row("SELECT epoch FROM vaults WHERE id = ?", [vault], |r| r.get(0)).map_err(db_err)?;
-    tx.execute("DELETE FROM vault_keys WHERE vault_id = ? AND epoch != ?", params![vault, epoch]).map_err(db_err)?;
+    tx.execute(
+        "DELETE FROM vault_keys WHERE vault_id = ?1 AND (epoch != ?2 OR username NOT IN (SELECT username FROM members WHERE vault_id = ?1))",
+        params![vault, epoch],
+    )
+    .map_err(db_err)?;
     for k in keys {
         if k.key.0.is_empty() || k.key.0.len() > 1024 {
             return Err((BAD, "key size"));
@@ -1311,7 +1316,7 @@ async fn stage(
     let first: Option<u64> = tx
         .query_row("SELECT MIN(created) FROM staged WHERE vault_id = ? AND username = ?", params![&vault[..], c.username], |r| r.get(0))
         .map_err(db_err)?;
-    if first.is_none() {
+    if first.is_none() && !req.upserts.is_empty() {
         audit_log(&tx, &vault, &c.username, "staging a big push")?;
     }
     for u in &req.upserts {
@@ -1330,7 +1335,11 @@ async fn stage(
         Some(TOO_BIG)
     } else if let Some(quota) = cfg.quota {
         let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
-        let all = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ?", &[&&vault[..]])?;
+        // Owners' stages only: a writer's stage stays within the quota anyway, and mustn't use up the allowance.
+        let all = sum(
+            "SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ?1 AND username IN (SELECT username FROM members WHERE vault_id = ?1 AND role = 'owner')",
+            &[&&vault[..]],
+        )?;
         let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && all <= items;
         (!rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota).then_some(FULL)
     } else {

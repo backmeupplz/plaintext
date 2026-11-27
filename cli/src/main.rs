@@ -1057,11 +1057,7 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             };
             let (what, name) = if known { ("name", s.vaults[&id].meta.name.clone()) } else { ("full id", id.to_string()) };
             println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
-            let me = s.username().to_string();
-            if let Some(r) = s.vaults.get(&id).and_then(|v| v.roster.as_ref())
-                && r.members.len() > 1
-                && !r.members.iter().any(|m| m.role == Role::Owner && m.username != me)
-            {
+            if s.leaves_ownerless(&id)? {
                 println!("You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.");
             }
             if s.vaults.get(&id).is_some_and(|v| v.has_changes()) {
