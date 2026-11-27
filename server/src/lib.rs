@@ -38,6 +38,35 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     Ok(c)
 }
 
+/// Writes a consistent copy of the database at `db_path` to `<dir>/backup/<name>`,
+/// for volume backups that copy files one by one while the server writes. Uses
+/// its own connection (WAL lets it read while requests write) and replaces the
+/// previous copy atomically, so a backup sees either the old or the new copy.
+pub fn backup_copy(db_path: &str) -> std::io::Result<std::path::PathBuf> {
+    let db = std::path::Path::new(db_path);
+    let dir = db.parent().unwrap_or(std::path::Path::new("")).join("backup");
+    std::fs::create_dir_all(&dir)?;
+    let name = db.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let dest = dir.join(name);
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = dir.join(tmp_name);
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let c = Connection::open(db).map_err(std::io::Error::other)?;
+    let tmp_str = tmp.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
+    if let Err(e) = c.execute("VACUUM INTO ?1", [tmp_str]) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::other(e));
+    }
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &dest)?;
+    std::fs::File::open(&dir)?.sync_all()?;
+    Ok(dest)
+}
+
 #[derive(Clone)]
 struct Setup(Option<String>);
 
@@ -769,4 +798,46 @@ async fn delete_link(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
     let c = caller(&db, &h)?;
     db.execute("DELETE FROM links WHERE id = ? AND creator = ?", params![&id[..], c.username]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn backup_copy_has_the_same_rows() {
+        let dir = std::env::temp_dir().join(format!("plaintext-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backup")).unwrap();
+        let path = dir.join("plaintext.db");
+        let path = path.to_str().unwrap();
+        // The writer stays open, so the rows live only in the WAL, as on a running server.
+        let db = super::open_db(path).unwrap();
+        let rows = |c: &rusqlite::Connection| -> Vec<(Vec<u8>, String)> {
+            let mut st = c.prepare("SELECT id, created_by FROM invites ORDER BY id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        for i in 0..50u8 {
+            db.execute("INSERT INTO invites(id, created_by, expires) VALUES (?1, ?2, 0)", rusqlite::params![vec![i; 16], format!("user{i}")])
+                .unwrap();
+        }
+        assert!(std::fs::metadata(dir.join("plaintext.db-wal")).unwrap().len() > 0);
+        // A copy interrupted mid-write leaves a junk temp file behind; the next run must cope.
+        std::fs::write(dir.join("backup/plaintext.db.tmp"), b"junk").unwrap();
+        let dest = super::backup_copy(path).unwrap();
+        assert_eq!(dest, dir.join("backup/plaintext.db"));
+        assert!(!dir.join("backup/plaintext.db.tmp").exists());
+        let copy = rusqlite::Connection::open(&dest).unwrap();
+        let ok: String = copy.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok");
+        assert_eq!(rows(&copy).len(), 50);
+        assert_eq!(rows(&copy), rows(&db));
+        drop(copy);
+
+        db.execute("DELETE FROM invites WHERE created_by = 'user7'", []).unwrap();
+        super::backup_copy(path).unwrap();
+        let copy = rusqlite::Connection::open(&dest).unwrap();
+        assert_eq!(rows(&copy).len(), 49);
+        assert_eq!(rows(&copy), rows(&db));
+        drop((copy, db));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

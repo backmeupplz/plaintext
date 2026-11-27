@@ -8,10 +8,23 @@ Site: https://getplaintext.org. Status: the protocol, server, command line and M
 
 ```sh
 docker build -t plaintext .
-docker run -d -v plaintext:/data -p 8080:8080 plaintext
+docker run -d --name plaintext -v plaintext:/data -p 8080:8080 plaintext
 ```
 
 Put it behind HTTPS. The first account to sign up becomes the admin; everyone after that needs an invite from an admin (`plaintext user invite`). On a server reachable from the internet, set `PLAINTEXT_SETUP_CODE` to a random string so nobody can sign up before you, and pass it as `--invite` when you create the first account.
+
+### Backups
+
+Back up the `plaintext` volume. Copying a live SQLite database file by file can catch it halfway through a write, so the server also writes a consistent copy of itself to `/data/backup/plaintext.db` when it starts and every hour after that, replacing the previous copy in one step. Every backup of the volume therefore holds a whole database that is at most an hour old, even if the live files in it don't match.
+
+To restore, stop the server first and keep it stopped until the copy is in place, because a running server would overwrite the good copy with one of the restored live files. Put the volume back from your backup, then replace the live database with the copy and delete the live write-ahead log next to it, since SQLite would otherwise replay the old log onto the restored file:
+
+```sh
+docker stop plaintext
+# restore the plaintext volume from your backup here
+docker run --rm -v plaintext:/data busybox sh -c 'rm -f /data/plaintext.db-wal /data/plaintext.db-shm && cp /data/backup/plaintext.db /data/plaintext.db && chown -R 65532:65532 /data'
+docker start plaintext
+```
 
 ## The command line
 
