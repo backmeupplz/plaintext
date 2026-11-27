@@ -191,15 +191,16 @@ struct ItemDetail: View {
     }
 
     private func attach(_ url: URL) {
+        let ok = url.startAccessingSecurityScopedResource()
         // The server takes files up to 64 MiB.
-        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 64 << 20 {
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 64 << 20 else {
+            if ok { url.stopAccessingSecurityScopedResource() }
             model.banner = "Attachments can be up to 64 MB."
             return
         }
         let name = url.lastPathComponent
         busy = true
         Task {
-            let ok = url.startAccessingSecurityScopedResource()
             defer {
                 if ok { url.stopAccessingSecurityScopedResource() }
                 busy = false

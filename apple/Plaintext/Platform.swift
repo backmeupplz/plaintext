@@ -110,36 +110,39 @@ enum Clipboard {
 @MainActor
 enum Activity {
     private(set) static var last = Date()
-    /// Called when the app has gone unused for `Guard.idleLimit`.
-    static var onIdle: () -> Void = {}
+    /// Called when the app has gone unused for `Guard.idleLimit`; true if it locked.
+    static var onIdle: () -> Bool = { false }
 
     /// Someone used the app. The first use after too long locks instead (a
-    /// timer may not have fired while the app was away or napping).
-    static func touch() {
-        check()
+    /// timer may not have fired while the app was away or napping). True if it
+    /// locked: that event mustn't reach the screen that's going away.
+    @discardableResult
+    static func touch() -> Bool {
+        let locked = check()
         last = Date()
+        return locked
     }
 
     /// Unlocked: count from now.
     static func reset() { last = Date() }
 
-    static func check() {
-        if Date().timeIntervalSince(last) >= Guard.idleLimit { onIdle() }
+    @discardableResult
+    static func check() -> Bool {
+        Date().timeIntervalSince(last) >= Guard.idleLimit && onIdle()
     }
 
     /// Start counting touches, typing, VoiceOver moves and clicks (once).
     static func watch() {
         #if os(iOS)
         for name in [UITextField.textDidChangeNotification, UITextView.textDidChangeNotification, UIAccessibility.elementFocusedNotification] {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in MainActor.assumeIsolated { touch() } }
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in _ = MainActor.assumeIsolated { touch() } }
         }
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { TouchWatcher.install() }
         }
         #else
         NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]) { e in
-            MainActor.assumeIsolated { touch() }
-            return e
+            MainActor.assumeIsolated { touch() } ? nil : e
         }
         #endif
     }
@@ -149,7 +152,7 @@ enum Activity {
 import UIKit.UIGestureRecognizerSubclass
 
 /// Sees every touch in a window (sheets included) without taking any.
-private final class TouchWatcher: UIGestureRecognizer, UIGestureRecognizerDelegate {
+final class TouchWatcher: UIGestureRecognizer, UIGestureRecognizerDelegate {
     static func install() {
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
             for w in scene.windows where !(w.gestureRecognizers ?? []).contains(where: { $0 is TouchWatcher }) {

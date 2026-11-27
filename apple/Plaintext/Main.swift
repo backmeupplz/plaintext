@@ -78,9 +78,13 @@ enum Guard {
         func on(_ name: Notification.Name, _ f: @escaping @MainActor (Notification) -> Void) {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { n in MainActor.assumeIsolated { f(n) } }
         }
-        Activity.onIdle = { [weak model] in if let model, !model.locked { model.lock() } }
+        Activity.onIdle = { [weak model] in
+            guard let model, !model.locked else { return false }
+            model.lock()
+            return true
+        }
         Activity.watch()
-        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in MainActor.assumeIsolated { Activity.check() } }
+        RunLoop.main.add(Timer(timeInterval: 15, repeats: true) { _ in MainActor.assumeIsolated { _ = Activity.check() } }, forMode: .common)
         #if os(iOS)
         on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 { model.lock() } }
         // Time away counts as time without use.
@@ -88,7 +92,10 @@ enum Guard {
         on(UIApplication.protectedDataWillBecomeUnavailableNotification) { _ in model.lock() }
         // The app switcher snapshot shows nothing, onboarding (the Secret Key) included.
         on(UIScene.willDeactivateNotification) { n in PrivacyCover.set(n.object as? UIWindowScene, true) }
-        on(UIScene.didActivateNotification) { n in PrivacyCover.set(n.object as? UIWindowScene, PrivacyCover.capturedHidden) }
+        on(UIScene.didActivateNotification) { n in
+            PrivacyCover.set(n.object as? UIWindowScene, PrivacyCover.capturedHidden)
+            TouchWatcher.install() // a new iPad window too
+        }
         on(UIScreen.capturedDidChangeNotification) { _ in PrivacyCover.refresh() }
         on(UserDefaults.didChangeNotification) { _ in PrivacyCover.refresh() }
         #else
