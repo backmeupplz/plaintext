@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS audit(
 CREATE INDEX IF NOT EXISTS audit_vault ON audit(vault_id, ts);
 
 -- Item blobs of a push too big for one request, until the push that names the
--- stage commits them. One stage per member and vault; deleted a day after its last part.
+-- stage commits them. One stage per member and vault; deleted a day after its first part.
 CREATE TABLE IF NOT EXISTS staged(
   vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
   username TEXT NOT NULL,

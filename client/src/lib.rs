@@ -322,10 +322,16 @@ impl<T: Transport> Session<T> {
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
-                    self.problems.push(format!("vault {} wasn't updated: {e}", known.unwrap_or_else(|| id.to_string())));
+                    match known {
+                        Some(name) => self.problems.push(format!("vault {name} wasn't updated: {e}")),
+                        None => self.problems.push(format!("vault {id} wasn't updated: {e} (if you don't want it: plaintext vault leave {id})")),
+                    }
                 }
                 Err(e) => return Err(e),
             }
+        }
+        for id in &acct.through_agents {
+            self.problems.push(format!("vault {id} counts against your storage through an agent of yours (to stop that: plaintext vault leave {id})"));
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {

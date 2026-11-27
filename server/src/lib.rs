@@ -638,6 +638,13 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
         .filter_map(|v| v.ok()?.try_into().ok().map(Hex))
         .collect();
     let usage = usage(&db, Some(&c.username))?;
+    let through_agents = db
+        .prepare("SELECT id FROM vaults WHERE creator = ?1 AND id NOT IN (SELECT vault_id FROM members WHERE username = ?1)")
+        .map_err(db_err)?
+        .query_map([&c.username], |r| r.get::<_, Vec<u8>>(0))
+        .map_err(db_err)?
+        .filter_map(|v| v.ok()?.try_into().ok().map(Hex))
+        .collect();
     Ok(Json(AccountResponse {
         username: c.username,
         admin: c.admin,
@@ -647,6 +654,7 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
         vaults,
         quota: cfg.quota,
         usage,
+        through_agents,
     }))
 }
 
@@ -693,8 +701,9 @@ fn in_set(col: &str) -> String {
 
 /// Takes `username` and their agents out of `vault`, which the remaining members'
 /// owners then rekey (`gone` in the vault response). The vault is deleted if
-/// nobody else uses it. Refused while `username` is its only owner and others use it.
-fn leave_vault(tx: &Transaction, vault: &[u8], username: &str, why: &str) -> R<()> {
+/// nobody else uses it. With `keep_an_owner`, refused while `username` is its only
+/// owner and others use it.
+fn leave_vault(tx: &Transaction, vault: &[u8], username: &str, why: &str, keep_an_owner: bool) -> R<()> {
     // Members who keep the vault: current, not disabled, not leaving.
     let rest: Vec<(String, String)> = tx
         .prepare(&format!(
@@ -712,7 +721,8 @@ fn leave_vault(tx: &Transaction, vault: &[u8], username: &str, why: &str) -> R<(
         tx.execute("DELETE FROM vaults WHERE id = ?", [vault]).map_err(db_err)?;
         return Ok(());
     }
-    let owns: bool = tx
+    let owns: bool = keep_an_owner
+        && tx
         .query_row(
             &format!("SELECT COUNT(*) FROM members WHERE vault_id = ?2 AND role = 'owner' AND (expires IS NULL OR expires > ?3) AND {}", in_set("username")),
             params![username, vault, now()],
@@ -788,7 +798,7 @@ async fn delete_account(
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
     for v in vaults {
-        leave_vault(&tx, &v, &c.username, "account deleted")?;
+        leave_vault(&tx, &v, &c.username, "account deleted", true)?;
     }
     // Including keys from vaults they were removed from earlier.
     tx.execute(&format!("DELETE FROM vault_keys WHERE {}", in_set("username")), [&c.username]).map_err(db_err)?;
@@ -1040,13 +1050,23 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
     Ok(())
 }
 
+/// Wrapped keys for members of the roster just stored, at its epoch; older
+/// epochs' keys go (pulls serve only the current one), so they never pile up.
 fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
     if keys.len() > MAX_MEMBERS {
         return Err((BAD, "too many keys"));
     }
+    let epoch: u64 = tx.query_row("SELECT epoch FROM vaults WHERE id = ?", [vault], |r| r.get(0)).map_err(db_err)?;
+    tx.execute("DELETE FROM vault_keys WHERE vault_id = ? AND epoch != ?", params![vault, epoch]).map_err(db_err)?;
     for k in keys {
         if k.key.0.is_empty() || k.key.0.len() > 1024 {
             return Err((BAD, "key size"));
+        }
+        let member: bool = tx
+            .query_row("SELECT COUNT(*) FROM members WHERE vault_id = ? AND username = ?", params![vault, k.username], |r| r.get(0))
+            .map_err(db_err)?;
+        if k.epoch != epoch || !member {
+            return Err((BAD, "a key is for someone outside the roster or for another key epoch"));
         }
         tx.execute(
             "INSERT OR REPLACE INTO vault_keys(vault_id, username, epoch, key) VALUES(?,?,?,?)",
@@ -1242,7 +1262,10 @@ async fn put_vault(
     res.map(|()| StatusCode::NO_CONTENT)
 }
 
-/// The caller (and their agents) stop using a vault; see `leave_vault`.
+/// The caller (and their agents) stop using a vault; see `leave_vault`. Anyone
+/// listed can leave, expired or not, through an agent, and even as its only owner
+/// (the others keep the vault, though its members and key can't change any more):
+/// nobody is asked before being added, so nobody may be stuck paying for a vault.
 /// Signed by the caller's identity key, so a stolen session token alone can't
 /// delete a vault nobody else uses.
 async fn leave(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Json(s): Json<Signed>) -> R<StatusCode> {
@@ -1250,13 +1273,18 @@ async fn leave(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Json(
     let mut db = lock(&db);
     let c = caller(&db, &h)?;
     let tx = db.transaction().map_err(db_err)?;
-    need_role(&tx, &vault, &c.username, Role::Reader)?;
+    let listed: bool = tx
+        .query_row(&format!("SELECT COUNT(*) FROM members WHERE vault_id = ?2 AND {}", in_set("username")), params![c.username, &vault[..]], |r| r.get(0))
+        .map_err(db_err)?;
+    if !listed {
+        return Err((StatusCode::NOT_FOUND, "no such vault"));
+    }
     verify_signed(&tx, &s, "leave", &c.username)?;
     let req: LeaveVault = parse(&s)?;
     if req.vault_id.0 != vault || req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS {
         return Err((BAD, "the request names another vault or time"));
     }
-    leave_vault(&tx, &vault, &c.username, "left")?;
+    leave_vault(&tx, &vault, &c.username, "left", false)?;
     tx.commit().map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1279,25 +1307,31 @@ async fn stage(
     need_role(&tx, &vault, &c.username, Role::Writer)?;
     tx.execute("DELETE FROM staged WHERE vault_id = ? AND username = ? AND stage != ?", params![&vault[..], c.username, &req.stage.0[..]])
         .map_err(db_err)?;
+    // The stage expires a day after its first part (`store_put` and `cleanup`).
+    let first: Option<u64> = tx
+        .query_row("SELECT MIN(created) FROM staged WHERE vault_id = ? AND username = ?", params![&vault[..], c.username], |r| r.get(0))
+        .map_err(db_err)?;
+    if first.is_none() {
+        audit_log(&tx, &vault, &c.username, "staging a big push")?;
+    }
     for u in &req.upserts {
         tx.execute(
             "INSERT OR REPLACE INTO staged(vault_id, username, stage, id, blob, created) VALUES(?,?,?,?,?,?)",
-            params![&vault[..], c.username, &req.stage.0[..], &u.id.0[..], u.blob.0, now()],
+            params![&vault[..], c.username, &req.stage.0[..], &u.id.0[..], u.blob.0, first.unwrap_or_else(now)],
         )
         .map_err(db_err)?;
     }
-    // The stage expires a day after its last part.
-    tx.execute("UPDATE staged SET created = ? WHERE vault_id = ? AND username = ?", params![now(), &vault[..], c.username]).map_err(db_err)?;
     // Staged items count against the vault's creator. Over the quota, an owner may
     // still stage up to the size of the vault's items, which is what re-sealing
-    // them all for a new key takes.
+    // them all for a new key takes: once per vault, whichever owner it is.
     let sum = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> R<u64> { tx.query_row(sql, p, |r| r.get(0)).map_err(db_err) };
     let mine = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", &[&&vault[..], &c.username])?;
     let refused = if mine > MAX_PUSH as u64 {
         Some(TOO_BIG)
     } else if let Some(quota) = cfg.quota {
         let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
-        let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && mine <= items;
+        let all = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ?", &[&&vault[..]])?;
+        let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && all <= items;
         (!rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota).then_some(FULL)
     } else {
         None

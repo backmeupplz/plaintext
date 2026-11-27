@@ -338,7 +338,7 @@ enum VaultCmd {
     },
     /// Remove someone and replace the vault key
     Revoke { vault: String, user: String },
-    /// Stop using a shared vault (your agents leave it too); deletes it if nobody else uses it
+    /// Stop using a vault (your agents leave it too), even one this device can't open (give its full id); deletes it if nobody else uses it
     Leave { vault: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
@@ -818,6 +818,10 @@ fn run(cli: Cli) -> Res<()> {
             say!("Saved {out}.");
         }
         Cmd::Import { format, file, vault } => {
+            // Agents keep nothing on the device, so a refused push would lose the import.
+            if std::env::var("PLAINTEXT_AGENT_KEY").is_ok() {
+                return Err("agents can't import; import as yourself and share the vault with the agent".into());
+            }
             let mut s = state::open()?;
             let data = std::fs::read(&file)?;
             let imported = match format.as_str() {
@@ -1045,18 +1049,30 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             say!("Removed {user} and replaced the vault key.");
         }
         VaultCmd::Leave { vault } => {
-            let id = s.vault(&vault)?;
-            let name = s.vaults[&id].meta.name.clone();
+            // Also a vault this device can't open (sync names it by its full id),
+            // or one only an agent of yours is in.
+            let (id, known) = match s.vault(&vault) {
+                Ok(id) => (id, s.vaults[&id].roster.is_some()),
+                Err(e) => (vault.parse::<Hex>().map_err(|_| e)?, false),
+            };
+            let (what, name) = if known { ("name", s.vaults[&id].meta.name.clone()) } else { ("full id", id.to_string()) };
             println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
-            if s.vaults[&id].has_changes() {
+            let me = s.username().to_string();
+            if let Some(r) = s.vaults.get(&id).and_then(|v| v.roster.as_ref())
+                && r.members.len() > 1
+                && !r.members.iter().any(|m| m.role == Role::Owner && m.username != me)
+            {
+                println!("You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.");
+            }
+            if s.vaults.get(&id).is_some_and(|v| v.has_changes()) {
                 println!("Changes to it that haven't reached the server yet are lost.");
             }
-            print!("Type the vault's name ({name}) to confirm: ");
+            print!("Type the vault's {what} ({name}) to confirm: ");
             std::io::stdout().flush()?;
             let mut typed = String::new();
             std::io::stdin().read_line(&mut typed)?;
             if typed.trim() != name {
-                return Err("that's not the vault's name; you're still in it".into());
+                return Err(format!("that's not the vault's {what}; you're still in it").into());
             }
             s.leave_vault(&id)?;
             say!("Left {vault}.");

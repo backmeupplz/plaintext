@@ -872,6 +872,14 @@ fn large_pushes() {
     let stage = format!("/v1/vaults/{personal}/stage");
     alice.call::<()>("POST", &stage, Some(&StageRequest { stage: a, upserts: put.upserts.clone() })).unwrap();
     alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
+    // A stage expires a day after its first part, and its first part is audited.
+    let audited = "SELECT COUNT(*) FROM audit WHERE action = 'staging a big push'";
+    let (logged, t) = (count(&path, audited), count(&path, "SELECT created FROM staged"));
+    exec(&path, "UPDATE staged SET created = created - 1000");
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
+    assert_eq!(count(&path, "SELECT created FROM staged"), t - 1000);
+    assert_eq!(count(&path, audited), logged);
+    assert!(logged >= 3, "the first push, the new key and each stage above");
     let stale = VaultPut { upserts: vec![], staged: Some(Staged { id: a, count: 1 }), ..put };
     assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&stale))), 409);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 1, "a failed push drops only the stage it named");
@@ -969,12 +977,9 @@ fn leaving_a_vault() {
 
     // An owner leaves rather than taking themselves out of the roster.
     assert_eq!(status(alice.revoke(&fam, "alice")), 400);
-    // The only owner can't leave a vault others use.
-    let gift = bob.create_vault("Gift").unwrap();
-    bob.share_vault(&gift, "carol", Role::Reader, None).unwrap();
-    assert_eq!(status(bob.leave_vault(&gift)), 409);
     // Bob makes carol an owner and deletes his account: the vault now counts
     // against carol, who can leave it, which deletes it.
+    let gift = bob.create_vault("Gift").unwrap();
     bob.share_vault(&gift, "carol", Role::Owner, None).unwrap();
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 2);
@@ -982,6 +987,79 @@ fn leaving_a_vault() {
     carol.leave_vault(&gift).unwrap();
     assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 1);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults"), 4, "alice's three and carol's own");
+    let _ = std::fs::remove_file(&path);
+}
+
+fn exec(path: &std::path::Path, sql: &str) {
+    plaintext_server::open_db(path.to_str().unwrap()).unwrap().execute(sql, []).unwrap();
+}
+
+/// Whoever a vault ends up counting against can always leave it: even if their
+/// device can't open it, as its only owner, once their membership expired, or
+/// when only an agent of theirs is in it.
+#[test]
+fn nobody_is_stuck_paying_for_a_vault() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut mallory) = join(Http::new(&url), "mallory", "mallory pw", None, "t");
+    let (_, mut mallory2) = join(Http::new(&url), "mallory2", "mallory2 pw", None, "t");
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    let creator = |v: &Hex| {
+        plaintext_server::open_db(path.to_str().unwrap())
+            .unwrap()
+            .query_row("SELECT creator FROM vaults WHERE id = ?", [&v.0[..]], |r| r.get::<_, String>(0))
+            .ok()
+    };
+
+    // Mallory makes bob an owner of a vault his device can't open (a garbage key),
+    // with her second account in it too, and leaves: it counts against bob.
+    let trap = mallory.create_vault("Trap").unwrap();
+    mallory.put_item(&trap, plaintext_core::new_item_id(), item("Junk", "x".repeat(10_000).as_str())).unwrap();
+    mallory.share_vault(&trap, "mallory2", Role::Writer, None).unwrap();
+    mallory.pin_user("bob").unwrap();
+    let me = mallory.me();
+    let mut u = mallory.vaults[&trap].grant(&me, &mallory.keyring, "bob", Role::Owner, None, now()).unwrap();
+    // Wrapped keys are only for roster members, at the roster's epoch.
+    let mut stray = u.clone();
+    stray.keys.push(WrappedKey { epoch: 7, ..u.keys[0].clone() });
+    assert_eq!(status(mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&stray))), 400);
+    stray.keys = vec![WrappedKey { username: "nobody".into(), ..u.keys[0].clone() }];
+    assert_eq!(status(mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&stray))), 400);
+    u.keys[0].key = B64(vec![1; 100]);
+    mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&u)).unwrap();
+    mallory.sync().unwrap();
+    mallory.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap).as_deref(), Some("bob"));
+    // Bob's sync names the vault by id and how to leave it, and he can, as its only owner.
+    bob.sync().unwrap();
+    assert!(!bob.vaults.contains_key(&trap));
+    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {trap}"))), "{:?}", bob.problems);
+    bob.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
+    // The last one out deletes it.
+    mallory2.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap), None);
+
+    // A creator whose membership expired can still leave.
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let old = carol.create_vault("Old").unwrap();
+    carol.share_vault(&old, "bob", Role::Owner, None).unwrap();
+    exec(&path, "UPDATE members SET expires = 1 WHERE username = 'carol'");
+    carol.leave_vault(&old).unwrap();
+    assert_eq!(creator(&old).as_deref(), Some("bob"));
+
+    // Mallory makes bob's agent the owner of a vault and leaves: it counts against
+    // bob, his sync says so, and he takes the agent out, which deletes it.
+    bob.create_agent("bob-bot").unwrap();
+    let gift = mallory.create_vault("Gift").unwrap();
+    mallory.share_vault(&gift, "bob-bot", Role::Owner, None).unwrap();
+    mallory.leave_vault(&gift).unwrap();
+    assert_eq!(creator(&gift).as_deref(), Some("bob"));
+    let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
+    assert_eq!(acct.through_agents, vec![gift]);
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
+    bob.leave_vault(&gift).unwrap();
+    assert_eq!(creator(&gift), None);
     let _ = std::fs::remove_file(&path);
 }
 

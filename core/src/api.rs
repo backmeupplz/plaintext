@@ -283,6 +283,10 @@ pub struct AccountResponse {
     /// Bytes of items and files in the vaults this account created.
     #[serde(default)]
     pub usage: u64,
+    /// Vaults that count against this account although it isn't listed in them
+    /// (one of its agents is): `POST /v1/vaults/{id}/leave` takes the agents out.
+    #[serde(default)]
+    pub through_agents: Vec<Hex>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
