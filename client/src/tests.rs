@@ -579,6 +579,27 @@ fn storage_quota() {
     let id = plaintext_core::new_item_id();
     alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bank", "b4nk") }).unwrap();
     alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    // An item another client sealed more compactly (without `kind` and `title`):
+    // this client's copy of it would take a padding step more.
+    let compact = plaintext_core::new_item_id();
+    alice.put_item(&personal, compact, Item { notes: "n".repeat(240), ..Default::default() }).unwrap();
+    {
+        let mut v = serde_json::to_value(&alice.vaults[&personal]).unwrap();
+        let key: B64 = serde_json::from_value(v["key"].clone()).unwrap();
+        let mut json = serde_json::to_vec(&serde_json::json!({ "notes": "n".repeat(240) })).unwrap();
+        json.resize(256, b' ');
+        let ad = plaintext_core::crypto::ad("item", &[&personal.0, &compact.0]);
+        let blob = plaintext_core::crypto::seal(&zeroize::Zeroizing::new(key.0[..].try_into().unwrap()), &ad, &json);
+        v["entries"][compact.to_string()]["blob"] = serde_json::to_value(B64(blob.clone())).unwrap();
+        let mut vault: plaintext_core::Vault = serde_json::from_value(v).unwrap();
+        let mut put = vault.push(&alice.me(), now()).unwrap();
+        put.upserts.push(ItemBlob { id: compact, blob: B64(blob) });
+        alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&put)).unwrap();
+        vault.pushed(&put);
+        alice.vaults.insert(personal, vault);
+    }
+    let compact_len = || count(&path, &format!("SELECT length(blob) FROM items WHERE id = x'{compact}'"));
+    assert_eq!(compact_len(), 256 + 41);
     // A roster change carrying fields the server doesn't know (say, from a newer client).
     let padded = |s: &mut Session<Http>, role: Role, pad: usize| {
         let u = s.vaults[&personal].grant(&s.me(), &s.keyring, "bob", role, None, now()).unwrap();
@@ -650,8 +671,11 @@ fn storage_quota() {
     assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
     // Over the quota, a promotion and removing someone (a new key) still work;
     // adding someone doesn't.
+    // The new key re-seals each item's stored bytes, so none takes more room.
     alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
     alice.revoke(&personal, "bob").unwrap();
+    assert_eq!(compact_len(), 256 + 41);
+    assert_eq!(alice.vaults[&personal].get(&compact).unwrap().notes.len(), 240);
     assert_eq!(status(alice.share_vault(&personal, "bob", Role::Reader, None)), 507);
 
     // Deleting an item leaves its attachment until the grace has passed, then

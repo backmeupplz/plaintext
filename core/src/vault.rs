@@ -643,10 +643,15 @@ impl Vault {
         let vk = random_key();
         r.key_check = key_check(&vk, &self.id, r.epoch);
         let keys = r.members.iter().map(|m| wrap(&vk, &self.id, r.epoch, m)).collect::<Result<_, _>>()?;
+        let old = self.key()?;
         let mut upserts = Vec::new();
         let mut items = BTreeMap::new();
         for (id, e) in &self.entries {
-            let blob = seal_json(&vk, &self.item_ad(id), &e.item);
+            // The stored bytes, not this client's serialisation of them: a copy that
+            // came out a padding step bigger would be refused over the quota (and
+            // fields this client doesn't know would be lost).
+            let ad = self.item_ad(id);
+            let blob = open(&old, &ad, &e.blob).map_or_else(|_| seal_json(&vk, &ad, &e.item), |raw| seal(&vk, &ad, &raw));
             items.insert(*id, h(&blob));
             upserts.push(ItemBlob { id: *id, blob: B64(blob) });
         }
