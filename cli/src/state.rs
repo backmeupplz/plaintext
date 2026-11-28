@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use plaintext_client::plaintext_core::Account;
-use plaintext_client::plaintext_core::api::Hex;
 use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent, server_host};
-use plaintext_client::plaintext_core::vault::Vault;
 use plaintext_client::{Error, Http, Session, Transport, now};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -330,20 +328,8 @@ pub fn snapshot_dir(s: &S) -> PathBuf {
 }
 
 fn load_snapshots(s: &mut S) {
-    // This device's own keyring copy: pins it holds survive a server serving an old keyring.
-    if let Ok(blob) = std::fs::read(snapshot_dir(s).join("keyring.bin"))
-        && let Err(e) = s.merge_local_keyring(&blob)
-    {
+    if let Err(e) = s.load_local(&snapshot_dir(s)) {
         eprintln!("plaintext: warning: {e}");
-    }
-    let Ok(dir) = std::fs::read_dir(snapshot_dir(s)) else { return };
-    for f in dir.flatten() {
-        let Some(id) = f.file_name().to_str().and_then(|n| n.strip_suffix(".bin")).and_then(|n| n.parse::<Hex>().ok()) else { continue };
-        if let Ok(blob) = std::fs::read(f.path())
-            && let Ok(v) = Vault::restore(&s.account, id, &blob)
-        {
-            s.vaults.insert(id, v);
-        }
     }
 }
 
@@ -352,18 +338,7 @@ pub fn save(s: &S) -> Res<()> {
     if std::env::var("PLAINTEXT_AGENT_KEY").is_ok() {
         return Ok(());
     }
-    let dir = snapshot_dir(s);
-    std::fs::create_dir_all(&dir)?;
-    let write = |name: String, data: Vec<u8>| -> Res<()> {
-        let tmp = dir.join(format!("{name}.tmp"));
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(tmp, dir.join(format!("{name}.bin")))?;
-        Ok(())
-    };
-    for (id, v) in s.vaults.iter().chain(&s.hidden) {
-        write(id.to_string(), v.snapshot(&s.account))?;
-    }
-    write("keyring".into(), s.keyring_snapshot())
+    Ok(s.save_local(&snapshot_dir(s))?)
 }
 
 #[cfg(test)]
