@@ -1,5 +1,5 @@
 // Settings: add and remove accounts, auto-lock, the fill shortcut.
-import { ask, el, explain } from './lib/ui.js'
+import { ask, el, explain, problemText } from './lib/ui.js'
 
 const $ = (id) => document.getElementById(id)
 const FIREFOX = chrome.runtime.getURL('').startsWith('moz-extension:')
@@ -46,7 +46,7 @@ $('add').addEventListener('submit', (e) => {
   ask('add', { server: url.href, secretKey: $('sk').value, password: $('pw').value })
     .then((r) => {
       msg.className = ''
-      msg.textContent = `Signed in as ${r.username}.${r.problems.length ? ` ${r.problems.map((p) => p.text).join(' ')}` : ''}`
+      msg.textContent = `Signed in as ${r.username}.${r.problems.length ? ` ${r.problems.map((p) => problemText(p.text)).join(' ')}` : ''}`
       $('add').reset()
       refresh()
     })

@@ -34,6 +34,7 @@ struct VaultsView: View {
     @EnvironmentObject var model: AppModel
     @State private var creating: String?
     @State private var name = ""
+    @State private var leaving: AppModel.LeaveRequest?
 
     var body: some View {
         List {
@@ -54,6 +55,19 @@ struct VaultsView: View {
                         }
                         .listRowBackground(Palette.surface)
                     }
+                    // Vaults the last sync couldn't update or that count against this account's storage.
+                    ForEach(Array(zip(a.problems, a.problemVaults).compactMap { p, v in v.map { (p, $0) } }.enumerated()), id: \.offset) { _, row in
+                        let (p, id) = row
+                        HStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Palette.warn).frame(width: 28)
+                            Text(model.problemText(p)).font(.subheadline).foregroundStyle(Palette.fg).fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                            Button("Leave…") { Task { leaving = await model.leaveRequest(account: a.id, vault: id) } }
+                                .buttonStyle(.borderless)
+                        }
+                        .frame(minHeight: 52)
+                        .listRowBackground(Palette.surface)
+                    }
                     Button { creating = a.id } label: { Label("New vault", systemImage: "plus") }
                         .listRowBackground(Palette.surface)
                 } header: {
@@ -64,6 +78,7 @@ struct VaultsView: View {
         .scrollContentBackground(.hidden)
         .background(Palette.bg)
         .navigationTitle("Vaults")
+        .leaveDialog($leaving)
         .alert("New vault", isPresented: Binding(get: { creating != nil }, set: { if !$0 { creating = nil } })) {
             TextField("Name", text: $name)
             Button("Create") { create() }
@@ -94,6 +109,8 @@ struct VaultDetail: View {
     @State private var working: String?
     @State private var renaming = false
     @State private var newName = ""
+    @State private var leaving: AppModel.LeaveRequest?
+    @Environment(\.dismiss) private var dismiss
 
     private var info: VaultInfo? { model.vault(account: account, id: vault) }
     private var owner: Bool { info?.role == .owner }
@@ -146,11 +163,29 @@ struct VaultDetail: View {
                 }
                 .listRowBackground(Palette.surface)
             }
+            // Not the default vault: new items go there.
+            if info?.isDefault == false {
+                Section {
+                    Button("Leave vault", role: .destructive) { Task { leaving = await model.leaveRequest(account: account, vault: vault) } }
+                }
+                .listRowBackground(Palette.surface)
+            }
         }
         .scrollContentBackground(.hidden)
         .background(Palette.bg)
         .navigationTitle(info?.name ?? "Vault")
         .task { await load() }
+        .leaveDialog($leaving)
+        // Left (here or elsewhere): there's nothing to show. A split view's
+        // detail column may not close, so it says so instead.
+        .onChange(of: info == nil) { _, gone in if gone { dismiss() } }
+        .overlay {
+            if info == nil {
+                ContentUnavailableView("You're no longer in this vault", systemImage: "person.2.slash")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Palette.bg)
+            }
+        }
         .sheet(isPresented: $sharing, onDismiss: { Task { await load() } }) { ShareVaultSheet(account: account, vault: vault) }
         .confirmationDialog("Remove \(removing?.username ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
             Button("Remove", role: .destructive) { if let m = removing { remove(m) } }

@@ -1,7 +1,7 @@
 // The toolbar popup: unlock, the current site's logins first, fill, copy, the
 // generator and an item view. Secrets come from the background one item at a
 // time, only when the user opens or copies them.
-import { ask, copy, el, explain, icon, iconButton, monogram } from './lib/ui.js'
+import { ask, copy, el, explain, icon, iconButton, monogram, problemText } from './lib/ui.js'
 
 const main = document.getElementById('main')
 const status = document.getElementById('status')
@@ -191,7 +191,7 @@ async function offerSave(note) {
       say(explain(e), 'error')
     }
   }
-  note.querySelector('.offer')?.remove()
+  note.querySelector('.offer:not(.leave)')?.remove()
   note.prepend(banner)
 }
 
@@ -243,31 +243,102 @@ async function lockedAccounts(note) {
 
 function showProblems(note, problems) {
   for (const old of note.querySelectorAll('.problem')) old.remove()
+  const banners = problems.map((p) => problem(note, p))
+  // An open leave confirmation outlives a sync while its vault still offers Leave,
+  // standing in for that vault's new banner; it goes once nothing offers it.
+  for (const box of note.querySelectorAll('.leave')) {
+    box.banner = banners.find((x) => x.leaveKey === box.leaveKey)
+    if (!box.banner && !box.busy) box.remove()
+  }
   // A review the person has open stays while its warning does, word for word:
   // one that now reads differently (no longer shared, say) needs a new review.
-  const open = (p) => p.unsent && note.querySelector(`.unsent${unsentSelector(p)}`)
   for (const box of note.querySelectorAll('.unsent')) {
     if (!problems.some((p) => p.key === box.dataset.key && p.unsent === box.dataset.vault && p.text === box.dataset.text)) box.remove()
   }
-  note.append(...problems.filter((p) => !open(p)).map(problem))
+  const open = new Set([...note.querySelectorAll('.leave')].map((x) => x.leaveKey))
+  const reviewing = (p) => p.unsent && note.querySelector(`.unsent${unsentSelector(p)}`)
+  note.append(...banners.filter((b, i) => !open.has(b.leaveKey) && !reviewing(problems[i])))
 }
 
 const unsentSelector = (p) => `[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"][data-text="${CSS.escape(p.text)}"]`
 
-/** One sync problem; one about changes that can't be sent offers to show and drop them. */
-function problem(p) {
+/** One sync problem; one that names a vault you didn't create offers to leave it,
+ *  one about changes that can't be sent offers to show and drop them. */
+function problem(note, p) {
   const banner = el(
     'div',
     { class: 'banner warn problem', role: 'alert', 'data-key': p.unsent && p.key, 'data-vault': p.unsent, 'data-text': p.unsent && p.text },
     icon('triangle-alert'),
-    el('span', { class: 'row-text' }, p.text),
+    el('span', { class: 'row-text' }, problemText(p.text)),
   )
-  if (p.unsent) banner.append(el('button', { class: 'small', type: 'button', onclick: () => reviewUnsent(banner, p) }, 'Review…'))
+  banner.about = p.about && `${p.key} ${p.about}`
+  banner.leaveKey = p.vault && `${p.key} ${p.vault}`
+  if (p.vault) banner.append(el('button', { class: 'small', type: 'button', onclick: () => confirmLeave(note, banner, p) }, 'Leave…'))
+  if (p.unsent) banner.append(el('button', { class: 'small', type: 'button', onclick: () => reviewUnsent(note, banner, p) }, 'Review…'))
   return banner
 }
 
+/** Say what leaving does, as the CLI does, before it happens. */
+async function confirmLeave(note, banner, p) {
+  let c
+  try {
+    c = await ask('leaveCheck', { key: p.key, vault: p.vault })
+  } catch (e) {
+    return say(explain(e), 'error')
+  }
+  const name = c.name || 'this vault'
+  const warnings = [
+    // A vault this device can't open has no name here: say which one by its id.
+    c.name ? null : `Vault ${p.vault}.`,
+    "This takes you and your agents out of the vault. If nobody else uses it, it's deleted with everything in it.",
+    c.only_owner && "You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.",
+    c.unsent && "Changes to it that haven't reached the server yet are lost.",
+  ]
+  const key = banner.leaveKey
+  // Already open for this vault (a second click while the check was out).
+  const already = [...note.querySelectorAll('.leave')].find((x) => x.leaveKey === key)
+  if (already) return already.querySelector('button').focus()
+  const cancel = el('button', { class: 'small', type: 'button', onclick: () => back() }, 'Cancel')
+  const box = el(
+    'div',
+    { class: 'banner offer leave', role: 'group', 'aria-label': `Leave ${name}` },
+    el('div', { class: 'row-text' }, el('div', {}, `Leave ${name}?`), el('div', { class: 'muted small-text' }, warnings.filter(Boolean).join(' '))),
+    el('div', { class: 'row-actions' }, cancel, el('button', { class: 'primary small', type: 'button', onclick: () => leave() }, 'Leave vault')),
+  )
+  box.leaveKey = key
+  // A sync during the check may have rebuilt the banners: stand in for this vault's current one.
+  box.banner = banner.isConnected ? banner : [...note.querySelectorAll('.problem')].find((x) => x.leaveKey === key)
+  if (box.banner) box.banner.replaceWith(box)
+  else note.append(box)
+  cancel.focus()
+  /** Back to the vault's banner, if a problem still offers it. */
+  function back() {
+    const b = box.banner
+    if (b) {
+      box.replaceWith(b)
+      b.querySelector('button')?.focus()
+    } else box.remove()
+  }
+  async function leave() {
+    box.busy = true
+    for (const b of box.querySelectorAll('button')) b.disabled = true
+    try {
+      await ask('leave', { key: p.key, vault: p.vault })
+      box.remove()
+      // Nothing the last sync said about the vault applies any more.
+      for (const b of note.querySelectorAll('.problem, .unsent')) if (b.about === `${p.key} ${p.vault}`) b.remove()
+      say(`Left ${c.name || 'the vault'}.`)
+      render(document.getElementById('list'))
+    } catch (e) {
+      box.busy = false
+      back()
+      say(explain(e), 'error')
+    }
+  }
+}
+
 /** What dropping would lose, shown before anything is dropped. */
-async function reviewUnsent(banner, p) {
+async function reviewUnsent(note, banner, p) {
   let c
   try {
     c = await ask('unsentChanges', { key: p.key, vault: p.unsent })
@@ -276,7 +347,7 @@ async function reviewUnsent(banner, p) {
   }
   // A sync that finished meanwhile put up a new banner for it, or none, or one that
   // reads differently (that one has its own Review…).
-  if (!banner.isConnected) banner = document.querySelector(`.problem${unsentSelector(p)}`)
+  if (!banner.isConnected) banner = note.querySelector(`.problem${unsentSelector(p)}`)
   if (!banner) return
   const shown = c.changed.slice(0, 8)
   const lines = [
@@ -285,7 +356,7 @@ async function reviewUnsent(banner, p) {
     c.renamed && "The vault's name or description changed",
   ].filter(Boolean)
   const drop = el('button', { class: 'primary small', type: 'button', onclick: () => discard() }, 'Drop changes')
-  const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(problem(p)) }, 'Keep')
+  const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(problem(note, p)) }, 'Keep')
   const box = el(
     'div',
     { class: 'banner unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}`, 'data-key': p.key, 'data-vault': p.unsent, 'data-text': p.text },
@@ -305,6 +376,8 @@ async function reviewUnsent(banner, p) {
       el('div', { class: 'row-actions' }, keep, drop),
     ),
   )
+  // Leaving the vault drops its changes: this goes with its banner.
+  box.about = `${p.key} ${p.unsent}`
   banner.replaceWith(box)
   // Not the button that drops them: Enter shouldn't.
   keep.focus()

@@ -213,7 +213,7 @@ fn a_full_vault_is_a_warning_not_a_failed_sync() {
 
     // The sync still counts: the other device's item arrives and the warning is a problem.
     let problems = run(sync(&mut s)).unwrap();
-    assert!(problems.iter().any(|p| p["text"].as_str().unwrap().contains("until there's room")), "{problems:?}");
+    assert!(problems.iter().any(|p| p.contains("until there's room")), "{problems:?}");
     assert_eq!(list(&s, None, "From the CLI").len(), 1);
     // The refused change is in this device's copy, for the next sync.
     let back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
@@ -273,8 +273,8 @@ fn changes_a_reader_cant_send_are_shown_and_dropped() {
     assert_eq!(code(&unsent_changes(&s, &fam.to_string()).unwrap_err()), "refused");
     alice.share_vault(&fam, "hal", Role::Reader, None).unwrap();
     let problems = run(sync(&mut s)).unwrap();
-    let p = problems.iter().find(|p| p["unsent"] == json!(fam.to_string())).unwrap_or_else(|| panic!("{problems:?}"));
-    assert!(p["text"].as_str().unwrap().ends_with("can't be sent"), "{p}");
+    let p = problems.iter().find(|p| p.unsent == Some(fam)).unwrap_or_else(|| panic!("{problems:?}"));
+    assert!(p.ends_with("can't be sent"), "{p}");
 
     // The browser suspended the background meanwhile: picked up from this device's copy.
     let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
@@ -310,7 +310,7 @@ fn changes_to_a_vault_no_longer_shared_are_dropped_once_the_server_agrees() {
     s.vaults.insert(fam, v);
     alice.revoke(&fam, "jon").unwrap();
     let problems = run(sync(&mut s)).unwrap();
-    assert!(problems.iter().any(|p| p["unsent"] == json!(fam.to_string()) && p["text"].as_str().unwrap().contains("isn't listed")), "{problems:?}");
+    assert!(problems.iter().any(|p| p.unsent == Some(fam) && p.contains("isn't listed")), "{problems:?}");
 
     // Picked up from this device's copy, it's still out of sight.
     let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
@@ -324,4 +324,46 @@ fn changes_to_a_vault_no_longer_shared_are_dropped_once_the_server_agrees() {
     assert_eq!(run(discard_changes(&mut back, &fam.to_string())).unwrap(), 1);
     let back = restore(Later(Http::new(&url)), &session_state(&back), &local_state(&back)).unwrap();
     assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap()["changed"], json!([]));
+}
+
+/// Leaving a vault a sync problem names: an owner who left hands bob a vault
+/// that counts against his storage, and the popup offers to leave it.
+#[test]
+fn leaving_a_vault_a_problem_names() {
+    let url = server_with(plaintext_server::Config { open_signup: true, quota: Some(64 << 20), ..Default::default() });
+    let mut alice = Session::signup(Http::new(&url), "alice", "pw", None, "cli").unwrap().1.unwrap();
+    alice.sync().unwrap();
+    let (sk, bob) = Session::signup(Http::new(&url), "bob", "pw", None, "cli").unwrap();
+    bob.unwrap().sync().unwrap();
+    let (mut s, _) = run(add(Later(Http::new(&url)), "pw", &sk.encode(), "x")).unwrap();
+    run(sync(&mut s)).unwrap();
+
+    // Alice is the only owner of a vault bob writes to: she's warned.
+    let team = alice.create_vault("Team").unwrap();
+    alice.share_vault(&team, "bob", Role::Writer, None).unwrap();
+    assert_eq!(run(leave_check(&alice, &team.to_string())).unwrap(), json!({ "name": "Team", "only_owner": true, "unsent": false }));
+
+    // She makes bob an owner and leaves: his sync names the vault, with its id to leave.
+    alice.share_vault(&team, "bob", Role::Owner, None).unwrap();
+    alice.leave_vault(&team).unwrap();
+    let problems = run(sync(&mut s)).unwrap();
+    let named: Vec<_> = problems.iter().filter(|p| p.leave == Some(team)).collect();
+    assert!(named.len() == 1 && named[0].contains("counts against your storage, though alice created it"), "{problems:?}");
+    assert!(problems.iter().all(|p| p.leave == Some(team)), "{problems:?}");
+    let sent = json!(problems);
+    assert_eq!(sent[0]["leave"], team.to_string());
+
+    // A change to it wasn't sent, and a problem about it offers no leave (as when
+    // the server stops listing it): the change is warned about.
+    s.vaults.get_mut(&team).unwrap().put(plaintext_client::plaintext_core::new_item_id(), Item { title: "Unsent".into(), ..Default::default() });
+    s.problems.push(plaintext_client::Problem { text: "vault Team isn't listed for you any more".into(), leave: None, vault: Some(team), unsent: None });
+    assert_eq!(run(leave_check(&s, &team.to_string())).unwrap(), json!({ "name": "Team", "only_owner": false, "unsent": true }));
+
+    // Nobody else uses it: leaving deletes it with the change and every problem
+    // about it, and the next sync is clean.
+    run(leave(&mut s, &team.to_string())).unwrap();
+    assert!(!s.vaults.contains_key(&team) && s.problems.is_empty());
+    assert_eq!(run(leave_check(&s, &team.to_string())).unwrap()["unsent"], false);
+    assert!(run(sync(&mut s)).unwrap().is_empty());
+    assert_eq!(code(&run(leave(&mut s, "not a vault")).unwrap_err()), "not_found");
 }

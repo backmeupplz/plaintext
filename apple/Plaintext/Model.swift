@@ -126,6 +126,14 @@ final class AppModel: ObservableObject {
     @Published var editor: EditorRequest?
     @Published var toast: Toast?
     @Published var banner: String?
+    /// The vault the banner's problem offers to leave, while that banner shows.
+    @Published var bannerLeave: (text: String, account: String, vault: String)?
+    /// A vault to leave, once the person confirms (`leaveDialog`).
+    struct LeaveRequest {
+        let account: String
+        let vault: String
+        let check: LeaveCheck
+    }
     /// The vault whose unsent changes the banner's problem offers to drop, while that banner shows.
     @Published var bannerUnsent: (text: String, account: String, vault: String)?
     /// How many sync problems the banner has shown (`showProblems`).
@@ -543,18 +551,30 @@ final class AppModel: ObservableObject {
     private func showProblems() {
         // Sent after all (made a writer again), dropped elsewhere, or its warning now reads
         // differently (no longer shared, say): its banner goes, so the current one shows.
-        if let u = bannerUnsent, u.text == banner, warning(account: u.account, vault: u.vault).map(bannerText) != u.text {
+        if let u = bannerUnsent, u.text == banner, warning(account: u.account, vault: u.vault).map(problemText) != u.text {
             banner = nil
         }
-        let all = accounts.flatMap { a in zip(a.problems, a.problemUnsent).map { (account: a.id, text: $0, unsent: $1) } }
+        let all = accounts.flatMap { a in zip(a.problems, zip(a.problemVaults, a.problemUnsent)).map { (account: a.id, text: $0, leave: $1.0, unsent: $1.1) } }
         // The banner shows one at a time, each in turn: the same one every time would
         // hide the rest (a vault that didn't verify, or another's Review).
         guard banner == nil, !all.isEmpty else { return }
         let p = all[problemTurn % all.count]
         problemTurn += 1
-        let text = bannerText(p.text)
+        let text = problemText(p.text)
         banner = text
+        bannerLeave = p.leave.map { (text, p.account, $0) }
         bannerUnsent = p.unsent.map { (text, p.account, $0) }
+    }
+
+    /// Ask the server what leaving would do, to confirm with `leaveDialog`.
+    func leaveRequest(account: String, vault: String) async -> LeaveRequest? {
+        do {
+            let check = try await call { try $0.leaveCheck(account: account, vault: vault) }
+            return LeaveRequest(account: account, vault: vault, check: check)
+        } catch {
+            show(error)
+            return nil
+        }
     }
 
     /// What dropping a vault's unsent changes would lose, to confirm with `unsentDialog`.
@@ -570,6 +590,26 @@ final class AppModel: ObservableObject {
             // Locked meanwhile: no error over the lock screen either.
             if !lockedSince(gen) { show(error) }
             return nil
+        }
+    }
+
+    func leave(_ r: LeaveRequest) async {
+        // A problem about the vault shown on the banner goes with it (the client drops them all).
+        let shown = banner
+        let isProblem = { (b: String?) in self.account(r.account)?.problems.contains { self.problemText($0) == b } ?? false }
+        // (Or the banner offered this leave, though a sync since cleared its problem.)
+        let wasProblem = isProblem(shown) || bannerLeave.map { $0.text == shown && $0.account == r.account && $0.vault == r.vault } == true
+        do {
+            try await call { try $0.leaveVault(account: r.account, vault: r.vault) }
+            if case .vault(r.account, r.vault)? = nav { nav = .all }
+            reload()
+            if wasProblem, banner == shown, !isProblem(shown) { banner = nil }
+            showProblems()
+            flash("Left \(r.check.name ?? "the vault")")
+        } catch {
+            // The server may have taken the leave before a local save failed.
+            reload()
+            show(error)
         }
     }
 
@@ -596,8 +636,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The client's text can end with a CLI hint; the app has its own Verify screen.
-    private func bannerText(_ s: String) -> String { capitalized(s.components(separatedBy: " (plaintext ").first ?? s) }
+    /// The client's text can end with a CLI hint; the app has its own Verify screen and Leave action.
+    func problemText(_ p: String) -> String { capitalized(p.components(separatedBy: " (plaintext ").first ?? p) }
 
     private func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 

@@ -49,11 +49,15 @@ async function remember(a, acct) {
 }
 
 /** Sync, keep this device's copies, and return what the user should know:
- *  `{ text, key, unsent }`, where `unsent` is a vault whose changes here can't be sent. */
+ *  `{ text, key, vault, about, unsent }`, where `vault` is one the problem offers
+ *  to leave, `about` the vault it's about, and `unsent` a vault whose changes
+ *  here can't be sent. */
 async function sync(a, acct) {
   let problems
   try {
-    problems = JSON.parse(await acct.sync()).map((p) => ({ text: p.text, key: a.key, unsent: p.unsent }))
+    // The client's text starts lower case ("vault Team wasn't updated…"); other
+    // problems (one starting with a username, say) are shown as they are.
+    problems = JSON.parse(await acct.sync()).map((p) => ({ text: p.text.charAt(0).toUpperCase() + p.text.slice(1), key: a.key, vault: p.leave, about: p.vault, unsent: p.unsent }))
   } catch (e) {
     // The server ended the session (expired, or signed out elsewhere): unlock again.
     if (e.name === 'signed_out') await forget(a.key)
@@ -330,26 +334,25 @@ async function fromPage(msg) {
       await touch()
       return problems
     }
-    case 'unsentChanges': {
-      const [, acct] = (await unlocked()).find(([a]) => a.key === msg.key) ?? []
-      if (!acct) throw fail('locked', 'Unlock Plaintext first.')
-      await touch()
-      return JSON.parse(acct.unsentChanges(msg.vault))
-    }
+    case 'unsentChanges':
+      return JSON.parse(await withAccount(msg.key, (acct) => acct.unsentChanges(msg.vault)))
     case 'discardChanges': {
-      const [a, acct] = (await unlocked()).find(([x]) => x.key === msg.key) ?? []
-      if (!acct) throw fail('locked', 'Unlock Plaintext first.')
-      await touch()
       let n
-      try {
-        n = await acct.discardChanges(msg.vault)
-      } catch (e) {
-        if (e.name === 'signed_out') await forget(a.key)
-        throw e
-      }
+      const acct = await withAccount(msg.key, async (acct) => ((n = await acct.discardChanges(msg.vault)), acct))
       // Or a restored copy would bring the changes back.
-      await save(a.key, acct)
+      await save(msg.key, acct)
       return n
+    }
+    case 'leaveCheck':
+      return JSON.parse(await withAccount(msg.key, (acct) => acct.leaveCheck(msg.vault)))
+    case 'leave': {
+      const acct = await withAccount(msg.key, async (acct) => (await acct.leaveVault(msg.vault), acct))
+      // The leave happened either way. If this save fails, the stored copy still
+      // has the vault: after a restart it comes back until the next sync hides it
+      // again, and if it had unsent changes, every sync reports it as no longer
+      // listed for you.
+      await save(msg.key, acct).catch(() => {})
+      return true
     }
     case 'pending': {
       const p = await pending(msg.tabId)
@@ -413,6 +416,19 @@ async function fromPage(msg) {
   throw fail('refused', `unknown action ${msg.action}`)
 }
 
+/** Run `f(acct, a)` on an unlocked account; an ended session locks it again. */
+async function withAccount(key, f) {
+  const [a, acct] = (await unlocked()).find(([x]) => x.key === key) ?? []
+  if (!acct) throw fail('locked', 'Unlock Plaintext first.')
+  await touch()
+  try {
+    return await f(acct, a)
+  } catch (e) {
+    if (e.name === 'signed_out') await forget(a.key)
+    throw e
+  }
+}
+
 async function add({ server, secretKey, password }) {
   await ready
   const base = server.trim().replace(/\/+$/, '')
@@ -450,7 +466,7 @@ async function settle(a, acct) {
   try {
     problems.push(...(await sync(a, acct)))
   } catch (e) {
-    problems.push({ text: e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : e.message })
+    problems.push({ text: e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : `Couldn't sync: ${e.message}` })
   }
   return problems
 }
