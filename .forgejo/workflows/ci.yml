@@ -25,6 +25,10 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: libudev for the CLI's security keys (ctap-hid-fido2)
+        run: |
+          s=; [ "$(id -u)" = 0 ] || s=sudo
+          $s apt-get update -qq && $s apt-get install -y -qq libudev-dev pkg-config
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - name: The landing page shows the release key docs/install checks

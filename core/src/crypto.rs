@@ -168,6 +168,28 @@ pub fn open_secret_key(password: &str, blob: &[u8]) -> Result<SecretKey, Error> 
     Ok(SecretKey(Zeroizing::new(raw[..].try_into().map_err(|_| Error::Tampered)?)))
 }
 
+/// What a security key unlocks on one device: the Account Key and a session
+/// token, sealed with a key from the authenticator's hmac-secret output for the
+/// device's salt. The AD names the account and the credential, so a sealed copy
+/// can't be moved to another account or key.
+pub fn seal_for_security_key(output: &[u8; 32], account_id: &Id, cred: &[u8], account_key: &Key, token: &str) -> Vec<u8> {
+    seal(&security_key_key(output), &[&ad("security-key", &[account_id])[..], cred].concat(), &Zeroizing::new([&account_key[..], token.as_bytes()].concat()))
+}
+
+/// `Tampered` means another key, another credential, or a damaged blob.
+pub fn open_for_security_key(output: &[u8; 32], account_id: &Id, cred: &[u8], blob: &[u8]) -> Result<(Key, Zeroizing<String>), Error> {
+    let raw = open(&security_key_key(output), &[&ad("security-key", &[account_id])[..], cred].concat(), blob)?;
+    let (key, token) = raw.split_at_checked(32).ok_or(Error::Tampered)?;
+    let token = Zeroizing::new(String::from_utf8(token.to_vec()).map_err(|_| Error::Tampered)?);
+    Ok((Zeroizing::new(key.try_into().expect("32 bytes")), token))
+}
+
+fn security_key_key(output: &[u8; 32]) -> Key {
+    let mut k = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, output).expand(b"plaintext/v1/security-key", &mut k[..]).expect("valid length");
+    k
+}
+
 fn expand_keys(hk: &Hkdf<Sha256>, account_id: Id) -> Derived {
     let mut unlock_key = Zeroizing::new([0u8; 32]);
     let mut auth_seed = Zeroizing::new([0u8; 32]);

@@ -22,3 +22,12 @@ base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Security keys (see build.rs for why only these).
+[target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))'.dependencies]
+ctap-hid-fido2 = "3.6"
+anyhow = "1"
+
+[dev-dependencies]
+plaintext-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
