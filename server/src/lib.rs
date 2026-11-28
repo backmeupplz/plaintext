@@ -1414,17 +1414,24 @@ async fn update_roster(
                 return Err((StatusCode::CONFLICT, "someone left the vault: remove them with a new key first"));
             }
         }
-        // Adding someone, or growing the roster by fields the server doesn't know, needs
-        // room. Other changes (a promotion, removing someone with a new key) always go
-        // through, as long as the items don't grow.
+        // Adding someone needs room for the longer roster. Other changes (a promotion,
+        // removing someone with a new key) always go through, as long as the items don't grow.
         let store = || -> R<()> {
             store_roster(&tx, &vault, &u.roster, &r)?;
             store_keys(&tx, &vault, &u.keys)
         };
-        if r.members.iter().any(|m| !had(&m.username)) || padding(&u.roster, &r) > padding(&prev_signed, &prev) {
+        if r.members.iter().any(|m| !had(&m.username)) {
             within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), store)?;
         } else {
             store()?;
+        }
+        // As with a manifest, fields the server doesn't know may grow only while the
+        // account paying for the vault (from now on, if the creator was removed) has room.
+        if let Some(quota) = cfg.quota
+            && padding(&u.roster, &r) > padding(&prev_signed, &prev)
+            && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
+        {
+            return Err(FULL);
         }
         if let Some(put) = &u.rotation {
             push_within_quota(&tx, &cfg, &vault, || {

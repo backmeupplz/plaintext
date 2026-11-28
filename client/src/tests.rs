@@ -527,7 +527,8 @@ fn storage_quota() {
     assert_eq!(stage(&bob, &mine, st, 100_000), 200);
     assert_eq!(stage(&bob, &mine, st, 200_000), 507);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
-    // Over the quota, a roster change may keep its unknown fields but not grow them.
+    // Over the quota, a roster change (here an unchanged role) may keep its unknown
+    // fields but not grow them.
     assert_eq!(padded(&mut alice, Role::Writer, 2000), 507);
     assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
     // Over the quota, a promotion and removing someone (a new key) still work;
