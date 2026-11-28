@@ -1633,6 +1633,7 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(matches!(raced, Err(Error::Refused(_))), "{raced:?}");
     *bob.t.2.borrow_mut() = None;
     assert_eq!(bob.vaults[&fam].changes(), 3);
+    assert_eq!(bob.unsendable.len(), 1, "its warning stays");
     assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Refused(_))));
     assert!(matches!(bob.unsendable_changes(&fam), Err(Error::Refused(_))), "the drop's pull brought the new roster");
     assert_eq!(bob.vaults[&fam].changes(), 3);

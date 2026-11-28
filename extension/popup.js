@@ -310,13 +310,13 @@ async function reviewUnsent(banner, p) {
     drop.disabled = keep.disabled = true
     try {
       const n = await ask('discardChanges', { key: p.key, vault: p.unsent })
-      // Locked or re-rendered meanwhile: nothing to say over the lock screen.
-      if (!box.isConnected) return
+      // Locked meanwhile: nothing to say over the lock screen (#pw is its password field).
+      if (document.getElementById('pw')) return
       box.remove()
       say(n ? `Dropped ${n} unsent change${n > 1 ? 's' : ''} to ${c.name}.` : `Nothing was left to drop in ${c.name}.`)
       refreshList()
     } catch (e) {
-      if (!box.isConnected) return
+      if (document.getElementById('pw')) return
       drop.disabled = keep.disabled = false
       say(explain(e), 'error')
     }
