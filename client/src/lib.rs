@@ -4,6 +4,7 @@
 //! the UniFFI bindings for iOS/Android/desktop) uses this, so sync rules exist once.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plaintext_core::api::*;
@@ -58,6 +59,17 @@ impl From<plaintext_core::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What `Session::import` saved. Its items are on this device even when an error is set.
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub items: usize,
+    /// Attachments left out ("item title: file name") after `upload_error`.
+    pub skipped: Vec<String>,
+    pub upload_error: Option<Error>,
+    /// The first push that failed; the items go out with the next sync.
+    pub sync_error: Option<Error>,
+}
 
 /// Past this many bytes of items (and manifest), a push or key rotation stages its
 /// items in parts of about this size, well under the server's 32 MiB request limit.
@@ -276,6 +288,62 @@ impl<T: Transport> Session<T> {
         Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
     }
 
+    /// Open a stored session with no network: the token and Account Key from the
+    /// keychain plus this device's own sealed copies in `dir` (see `save_local`).
+    /// Items can be read and edited; `sync` sends the edits once the server is back.
+    pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
+        let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
+        let keyring = Keyring::open(&account, &blob)?;
+        let mut s = Session { t, token, account, keyring, keyring_counter: 0, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() };
+        s.load_vaults(dir);
+        Ok(s)
+    }
+
+    /// Load what this device saved in `dir`: its keyring copy (merged in, so pins
+    /// it holds survive a server serving an older keyring) and every vault
+    /// snapshot, which carries the rollback guard. Call after signing in.
+    pub fn load_local(&mut self, dir: &Path) -> Result<()> {
+        self.load_vaults(dir);
+        match std::fs::read(dir.join("keyring.bin")) {
+            Ok(blob) => self.merge_local_keyring(&blob),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn load_vaults(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for f in entries.flatten() {
+            let Some(name) = f.file_name().to_str().and_then(|n| n.strip_suffix(".bin")).map(str::to_owned) else { continue };
+            let (name, hidden) = name.strip_suffix(".hidden").map_or((name.as_str(), false), |n| (n, true));
+            let Ok(id) = name.parse::<Hex>() else { continue };
+            if let Ok(blob) = std::fs::read(f.path())
+                && let Ok(v) = Vault::restore(&self.account, id, &blob)
+            {
+                if hidden { &mut self.hidden } else { &mut self.vaults }.insert(id, v);
+            }
+        }
+    }
+
+    /// Save this device's state to `dir`, sealed with the Account Key: every vault
+    /// snapshot (hidden ones too, so they can't come back older, kept apart so
+    /// they stay hidden when opened offline) and the keyring.
+    pub fn save_local(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let write = |name: String, data: Vec<u8>| -> std::io::Result<()> {
+            let tmp = dir.join(format!("{name}.tmp"));
+            std::fs::write(&tmp, data)?;
+            std::fs::rename(tmp, dir.join(format!("{name}.bin")))
+        };
+        for (hidden, list) in [(false, &self.vaults), (true, &self.hidden)] {
+            for (id, v) in list {
+                let (name, other) = if hidden { (format!("{id}.hidden"), id.to_string()) } else { (id.to_string(), format!("{id}.hidden")) };
+                write(name, v.snapshot(&self.account))?;
+                let _ = std::fs::remove_file(dir.join(format!("{other}.bin")));
+            }
+        }
+        write("keyring".into(), self.keyring_snapshot())
+    }
+
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
         call(&self.t, method, path, Some(&self.token), body)
     }
@@ -292,6 +360,12 @@ impl<T: Transport> Session<T> {
     pub fn sync(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
         self.admin = acct.admin;
+        // Another device (or this one, opened offline) changed the keyring: fold it in.
+        if acct.keyring_counter != self.keyring_counter {
+            let server = Keyring::open(&self.account, &acct.keyring.0)?;
+            self.keyring_dirty |= self.keyring.merge_from(&server);
+            self.keyring_counter = acct.keyring_counter;
+        }
         let unlisted: Vec<Hex> = self.vaults.keys().filter(|id| !acct.vaults.contains(id)).copied().collect();
         for id in unlisted {
             let v = self.vaults.remove(&id).expect("listed above");
@@ -801,6 +875,85 @@ impl<T: Transport> Session<T> {
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
         self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.delete(id);
         self.sync_vault(vault)
+    }
+
+    /// Save imported items: each source vault goes to our own vault of that name
+    /// (made if needed; "Personal" and unnamed ones to the default vault), or all
+    /// to `into`. Refused before anything is saved if a vault would hold more than
+    /// one pull brings (`api::MAX_PUSH`). Every item goes into this device's copy
+    /// before anything is pushed, so a failed push loses nothing: the report
+    /// carries that error, and the items go out with the next sync. Once an upload
+    /// fails, the remaining attachments are left out and listed.
+    pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<ImportReport> {
+        let mut targets = Vec::new();
+        // Where each part goes: a vault we have, or (Err) one to make.
+        for v in imported {
+            let to = match into {
+                Some(id) => Ok(id),
+                None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => Ok(self.default_vault()?),
+                None => self.own_vault(&v.name).ok_or(v.name),
+            };
+            targets.push((to, v.items));
+        }
+        // Sealed, an item is padded to 256 bytes plus 41, and each attachment adds
+        // a reference of less than its name plus 256.
+        let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
+        let mut size = BTreeMap::<_, usize>::new();
+        for (to, items) in &targets {
+            let have = || to.as_ref().ok().and_then(|id| self.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
+            let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
+            *size.entry(to.clone().map_err(|n| n.to_ascii_lowercase())).or_insert_with(have) += adds;
+        }
+        if let Some((to, _)) = size.iter().find(|(_, n)| **n > MAX_PUSH) {
+            let name = match to {
+                Ok(id) => self.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
+                Err(name) => name.clone(),
+            };
+            return Err(Error::Refused(format!(
+                "that's more than one vault can hold (64 MiB of items, for {name}): split the file, make a vault for each part and import each part into its own vault"
+            )));
+        }
+        // The vaults first: if one can't be made, nothing is imported yet.
+        let mut made = Vec::new();
+        for (to, items) in targets {
+            let vid = match to {
+                Ok(id) => id,
+                Err(name) => match self.own_vault(&name) {
+                    Some(id) => id,
+                    None => self.create_vault(&name)?,
+                },
+            };
+            made.push((vid, items));
+        }
+        let mut r = ImportReport::default();
+        let mut vids = Vec::new();
+        for (vid, items) in made {
+            for (mut it, files) in items {
+                for (name, bytes) in files {
+                    if r.upload_error.is_none() {
+                        match self.upload_file(&vid, &name, &bytes) {
+                            Ok(f) => {
+                                it.files.push(f);
+                                continue;
+                            }
+                            Err(e) => r.upload_error = Some(e),
+                        }
+                    }
+                    r.skipped.push(format!("{}: {name}", it.title));
+                }
+                self.vaults.get_mut(&vid).ok_or(Error::NotFound("vault".into()))?.put(plaintext_core::new_item_id(), it);
+                r.items += 1;
+            }
+            if !vids.contains(&vid) {
+                vids.push(vid);
+            }
+        }
+        for vid in &vids {
+            if let Err(e) = self.sync_vault(vid) {
+                r.sync_error.get_or_insert(e);
+            }
+        }
+        Ok(r)
     }
 
     // ---------- Files ----------

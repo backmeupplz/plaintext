@@ -844,12 +844,13 @@ async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
 const USER_COLS: &str = "SELECT identity, admin, disabled, invite_id, invite_proof FROM accounts";
 
 /// The directory. On an open (hosted) server only admins see everyone; others
-/// see the people who joined with their invites, so their devices can verify them.
+/// see the people who joined with their invites, so their devices can verify them,
+/// and their own agents.
 async fn users(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap) -> R<Json<Vec<UserInfo>>> {
     let db = lock(&db);
     let c = caller(&db, &h)?;
     let (filter, who) = if cfg.open_signup && !c.admin {
-        (" WHERE invite_id IN (SELECT id FROM invites WHERE created_by = ?1)", c.username)
+        (" WHERE owner = ?1 OR invite_id IN (SELECT id FROM invites WHERE created_by = ?1)", c.username)
     } else {
         (" WHERE ?1 = ?1", String::new())
     };

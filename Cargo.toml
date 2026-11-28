@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "server", "client", "cli", "wasm"]
+members = ["core", "server", "client", "cli", "wasm", "ffi"]
 resolver = "3"
 
 [workspace.package]

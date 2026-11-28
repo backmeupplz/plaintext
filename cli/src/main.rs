@@ -829,89 +829,21 @@ fn run(cli: Cli) -> Res<()> {
                 "bitwarden" => import::bitwarden(&data)?,
                 _ => import::csv(&String::from_utf8_lossy(&data))?,
             };
-            let n = imported.iter().map(|v| v.items.len()).sum::<usize>();
-            // The vaults first: if one can't be made, nothing is imported yet.
-            // Where each part goes: a vault we have, or (Err) one to make.
-            let mut targets = Vec::new();
-            for v in imported {
-                let to = match (&vault, v.name.is_empty()) {
-                    (Some(name), _) => Ok(s.vault(name)?),
-                    (None, true) => Ok(s.default_vault()?),
-                    (None, false) if v.name.eq_ignore_ascii_case("personal") => Ok(s.default_vault()?),
-                    (None, false) => s.own_vault(&v.name).ok_or(v.name),
-                };
-                targets.push((to, v.items));
-            }
-            // A device pulls a vault's items in one response, so a vault holds at most
-            // one push's worth: sealed, an item is padded to 256 bytes plus 41, and
-            // each attachment adds a reference of less than its name plus 256.
-            let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
-            let mut size = std::collections::BTreeMap::<_, usize>::new();
-            for (to, items) in &targets {
-                let have = || to.as_ref().ok().and_then(|id| s.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
-                let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
-                *size.entry(to.clone().map_err(|n| n.to_ascii_lowercase())).or_insert_with(have) += adds;
-            }
-            if let Some((to, _)) = size.iter().find(|(_, n)| **n > plaintext_client::plaintext_core::api::MAX_PUSH) {
-                let name = match to {
-                    Ok(id) => s.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
-                    Err(name) => name.clone(),
-                };
-                return Err(format!("that's more than one vault can hold (64 MiB of items, for {name}): split the file, make a vault for each part (plaintext vault create NAME) and import each part with --vault NAME").into());
-            }
-            let mut made = Vec::new();
-            for (to, items) in targets {
-                let vid = match to {
-                    Ok(id) => id,
-                    Err(name) => match s.own_vault(&name) {
-                        Some(id) => id,
-                        None => s.create_vault(&name)?,
-                    },
-                };
-                made.push((vid, items));
-            }
-            let targets = made;
-            // Every item goes into this device's copy before anything is pushed, so a
-            // failed push loses nothing. Once an upload fails, the remaining
-            // attachments are left out and listed.
-            let (mut upload_err, mut skipped, mut vids, mut sync_err) = (None, Vec::new(), Vec::new(), None);
-            for (vid, items) in targets {
-                for (mut it, files) in items {
-                    for (name, bytes) in files {
-                        if upload_err.is_none() {
-                            match s.upload_file(&vid, &name, &bytes) {
-                                Ok(f) => {
-                                    it.files.push(f);
-                                    continue;
-                                }
-                                Err(e) => upload_err = Some(e),
-                            }
-                        }
-                        skipped.push(format!("{}: {name}", it.title));
-                    }
-                    s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
-                }
-                if !vids.contains(&vid) {
-                    vids.push(vid);
-                }
-            }
-            for vid in &vids {
-                if let Err(e) = s.sync_vault(vid) {
-                    sync_err.get_or_insert(e);
-                }
-            }
+            let into = vault.as_deref().map(|v| s.vault(v)).transpose()?;
+            let r = s.import(imported, into)?;
+            let n = r.items;
             state::save(&s)?;
-            if let Some(e) = upload_err {
+            if let Some(e) = r.upload_error {
                 eprintln!("warning: {e}");
                 say!("These attachments weren't uploaded; add them with `plaintext attach ITEM FILE`:");
-                for f in &skipped {
+                for f in &r.skipped {
                     say!("  {f}");
                 }
             }
-            if let Some(e) = sync_err {
+            if let Some(e) = r.sync_error {
                 return Err(format!("{e}\nThe {n} items are saved on this device and go to the server with the next sync; don't import {file} again.").into());
             }
-            if skipped.is_empty() {
+            if r.skipped.is_empty() {
                 say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
             } else {
                 say!("Imported {n} items. Delete {file} once the attachments above are in: it holds your passwords unencrypted.");
