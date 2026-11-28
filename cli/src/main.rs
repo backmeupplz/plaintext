@@ -999,7 +999,7 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             if s.leaves_ownerless(&id)? {
                 println!("You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.");
             }
-            if s.vaults.get(&id).is_some_and(|v| v.has_changes()) {
+            if s.vaults.get(&id).or(s.hidden.get(&id)).is_some_and(|v| v.has_changes()) {
                 println!("Changes to it that haven't reached the server yet are lost.");
             }
             print!("Type the vault's {what} ({name}) to confirm: ");

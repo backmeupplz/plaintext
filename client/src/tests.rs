@@ -1148,6 +1148,23 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
     bob.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift), None);
+
+    // Bob is taken out of a vault he made while his agent stays in, with a change
+    // his device hadn't sent: it's named by its name, and leaving drops the change.
+    let kept = bob.create_vault("Kept").unwrap();
+    bob.share_vault(&kept, "mallory", Role::Owner, None).unwrap();
+    bob.share_vault(&kept, "bob-bot", Role::Writer, None).unwrap();
+    bob.vaults.get_mut(&kept).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
+    mallory.sync().unwrap();
+    mallory.revoke(&kept, "bob").unwrap();
+    assert_eq!(creator(&kept).as_deref(), Some("bob"));
+    bob.sync().unwrap();
+    assert!(bob.unsendable.contains(&kept));
+    assert!(bob.problems.iter().any(|p| p.starts_with("vault Kept counts against your storage")), "{:?}", bob.problems);
+    bob.leave_vault(&kept).unwrap();
+    assert!(bob.unsendable.is_empty() && !bob.hidden[&kept].has_changes());
+    bob.sync().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains("Kept") || p.contains(&kept.to_string())), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
 
     // Without a quota, an openable vault someone handed you costs nothing and isn't

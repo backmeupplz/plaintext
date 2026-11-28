@@ -427,9 +427,13 @@ impl<T: AsyncTransport> Session<T> {
                     "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
                     v.meta.name, v.creator
                 )),
-                None => self.problems.push(format!(
-                    "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
-                )),
+                None => {
+                    // The name this device last saw, if it still keeps the vault's changes.
+                    let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
+                    self.problems.push(format!(
+                        "vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
+                    ))
+                }
             }
         }
         // Users who joined with our invites get verified through their proof.
@@ -1163,9 +1167,10 @@ impl<T: Transport> Session<T> {
         self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
         // Kept as a vault this device knows nothing about: unsent changes are
         // gone, and if someone adds us again it starts afresh.
-        if self.vaults.remove(id).is_some() {
+        if self.vaults.remove(id).is_some() || self.hidden.contains_key(id) {
             self.hidden.insert(*id, Vault::new(*id));
         }
+        self.unsendable.retain(|u| u != id);
         Ok(())
     }
 
