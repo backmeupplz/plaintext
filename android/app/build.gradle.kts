@@ -16,8 +16,9 @@ android {
         applicationId = "com.borodutch.plaintext"
         minSdk = 29
         targetSdk = 36
-        // Minutes since the epoch, so every build installs over the last one without a bump.
-        versionCode = (System.currentTimeMillis() / 60_000).toInt()
+        // Minutes since the epoch, so every build installs over the last one without a bump. CI pins it
+        // (ORG_GRADLE_PROJECT_versionCode), or each new minute would rebuild everything from the manifest on.
+        versionCode = providers.gradleProperty("versionCode").map { it.toInt() }.getOrElse((System.currentTimeMillis() / 60_000).toInt())
         versionName = providers.gradleProperty("versionName").getOrElse("0.1.0")
         // The ABIs build.sh compiles Rust for; dependencies' other ABIs would install on phones the app can't run on.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
