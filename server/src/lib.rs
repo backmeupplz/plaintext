@@ -1425,19 +1425,20 @@ async fn update_roster(
         } else {
             store()?;
         }
-        // As with a manifest, fields the server doesn't know may grow only while the
-        // account paying for the vault (from now on, if the creator was removed) has room.
-        if let Some(quota) = cfg.quota
-            && padding(&u.roster, &r) > padding(&prev_signed, &prev)
-            && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
-        {
-            return Err(FULL);
-        }
         if let Some(put) = &u.rotation {
             push_within_quota(&tx, &cfg, &vault, || {
                 tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
                 store_put(&tx, &vault, put, &c.username)
             })?;
+        }
+        // As with a manifest, fields the server doesn't know may grow only while the
+        // account paying for the vault (from now on, if the creator was removed; with any
+        // new key's items re-sealed) has room.
+        if let Some(quota) = cfg.quota
+            && padding(&u.roster, &r) > padding(&prev_signed, &prev)
+            && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
+        {
+            return Err(FULL);
         }
         audit_log(&tx, &vault, &c.username, &format!("roster v{}", r.version))?;
         tx.commit().map_err(db_err)
