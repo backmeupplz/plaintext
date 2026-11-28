@@ -24,6 +24,7 @@ import uniffi.plaintext_ffi.AccountInfo
 import uniffi.plaintext_ffi.InboxEntry
 import uniffi.plaintext_ffi.ItemData
 import uniffi.plaintext_ffi.ItemSummary
+import uniffi.plaintext_ffi.LoginResult
 import uniffi.plaintext_ffi.PlaintextApp
 import uniffi.plaintext_ffi.PlaintextException
 import uniffi.plaintext_ffi.Recipe
@@ -100,6 +101,9 @@ class Model(val context: Context) {
     var accounts by mutableStateOf(listOf<AccountInfo>())
     var locked by mutableStateOf(true)
     var unlocking by mutableStateOf(false)
+    /** A sign-in waiting for the account's security key (DESIGN "Signing in with a security key"): the server's approval page, which [KeyStep] opens. */
+    var keyPage by mutableStateOf<String?>(null)
+    private var afterKey: ((LoginResult) -> Unit)? = null
 
     var vaults by mutableStateOf(listOf<VaultInfo>())
     var items by mutableStateOf(listOf<ItemSummary>())
@@ -306,11 +310,37 @@ class Model(val context: Context) {
         val sk = vault.secretKey(k.id) ?: throw UserError("This device lost its copy of the Secret Key. Sign in again with your Emergency Kit.")
         val e = epoch
         opening++
-        val r = try { call { it.login(k.server, sk, password) } } finally { opening-- }
+        val r = try {
+            call { it.login(k.server, sk, password) }
+        } catch (x: PlaintextException.KeyNeeded) {
+            keyPage = core.pendingKeyPage()
+            afterKey = { unlocked(k, it, e) }
+            throw x
+        } finally {
+            opening--
+        }
+        unlocked(k, r, e)
+    }
+
+    private fun unlocked(k: KnownAccount, r: LoginResult, e: Int) {
         saveSession(k.id, r.unlock)
         // Locked again while signing in, and still locked: stay that way.
         if (epoch != e && locked) return core.lock(!sessionsStored)
         unlocked()
+    }
+
+    /** Finish an unlock that needed the security key: once the approval page has its answer, or with a recovery code. */
+    suspend fun finishUnlock(recovery: String?) {
+        val r = call { it.finishLogin(recovery) }
+        keyPage = null
+        afterKey?.invoke(r)
+        afterKey = null
+    }
+
+    fun cancelKeyStep() {
+        core.cancelLogin()
+        keyPage = null
+        afterKey = null
     }
 
     private fun unlocked() {
@@ -349,6 +379,7 @@ class Model(val context: Context) {
     }
 
     fun lock() {
+        cancelKeyStep()
         // The lock screen's sign-in may have opened an account (not in [accounts] while locked): close it too.
         val owner = ownerChecked
         ownerChecked = false

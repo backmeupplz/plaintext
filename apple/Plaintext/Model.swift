@@ -8,7 +8,7 @@ extension PlaintextError {
         switch self {
         case .Network(let m), .SignedOut(let m), .WrongPassword(let m), .BadSecretKey(let m), .BadInvite(let m), .BadUsername(let m),
              .KeyChanged(let m), .Rollback(let m), .ManifestMismatch(let m), .ReadOnly(let m), .Server(let m), .NotFound(let m),
-             .Invalid(let m), .Locked(let m):
+             .Invalid(let m), .Locked(let m), .KeyNeeded(let m):
             return m
         }
     }
@@ -126,6 +126,9 @@ final class AppModel: ObservableObject {
     @Published var editor: EditorRequest?
     @Published var toast: Toast?
     @Published var banner: String?
+    /// A sign-in waiting for the account's security key (DESIGN "Signing in with a
+    /// security key"): the server's approval page, which `KeyStepView` opens.
+    @Published var keyPage: String?
     /// The vault the banner's problem offers to leave, while that banner shows.
     @Published var bannerLeave: (text: String, account: String, vault: String)?
     /// A vault to leave, once the person confirms (`leaveDialog`).
@@ -363,7 +366,28 @@ final class AppModel: ObservableObject {
                 : "This device lost its copy of the Secret Key. Remove the account from this device, then sign in to it again with your Emergency Kit.")
         }
         let gen = lockGen
-        let r = try await call { try $0.login(server: k.server, secretKey: sk, password: password) }
+        let r = try await login(server: k.server, secretKey: sk, password: password)
+        unlocked(k, r, since: gen)
+    }
+
+    /// Signs in. When the account needs its security key, this throws `KeyNeeded`
+    /// and sets `keyPage`, for `KeyStepView` to finish.
+    func login(server: String, secretKey: String, password: String) async throws -> LoginResult {
+        do {
+            return try await call { try $0.login(server: server, secretKey: secretKey, password: password) }
+        } catch PlaintextError.KeyNeeded(let m) {
+            keyPage = core.pendingKeyPage()
+            throw PlaintextError.KeyNeeded(message: m)
+        }
+    }
+
+    func cancelKeyStep() {
+        core.cancelLogin()
+        keyPage = nil
+    }
+
+    /// After the password (and the security key, if it took one) signed `k` in.
+    func unlocked(_ k: KnownAccount, _ r: LoginResult, since gen: Int) {
         saveSession(r.unlock, for: k)
         if lockedSince(gen) { return }
         reload()
@@ -373,6 +397,7 @@ final class AppModel: ObservableObject {
     }
 
     func lock() {
+        cancelKeyStep()
         notDeleted += undoable.values
         undoable = [:]
         deleting = []

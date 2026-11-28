@@ -1074,7 +1074,7 @@ impl PlaintextApp {
     }
 
     /// Finish a sign-in that needed the security key, once the approval page
-    /// has its answer (until then this fails with `KeyNeeded`), or with a
+    /// has its answer (until then this fails, and can be tried again), or with a
     /// recovery code. This device isn't asked for the key again.
     pub fn finish_login(&self, recovery: Option<String>) -> Res<LoginResult> {
         let (server, mut p) = self.pending.lock().expect("lock").take().ok_or(PlaintextError::Invalid { message: "this sign-in took too long; sign in again".into() })?;
@@ -1088,7 +1088,9 @@ impl PlaintextApp {
             }
             Err(e) => {
                 let err = match &e {
-                    ClientError::Server(409, _) => PlaintextError::KeyNeeded,
+                    ClientError::Server(409, _) => {
+                        PlaintextError::Invalid { message: "your security key hasn't approved this sign-in yet: open the approval page, touch your key there, then continue".into() }
+                    }
                     ClientError::Server(401, m) if m.contains("recovery code") => PlaintextError::Invalid { message: "that recovery code is wrong or already used".into() },
                     ClientError::Server(401, m) if m.contains("too long") => return Err(PlaintextError::Invalid { message: "this sign-in took too long; sign in again".into() }),
                     _ => e.into(),

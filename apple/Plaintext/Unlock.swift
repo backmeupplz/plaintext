@@ -10,6 +10,9 @@ struct UnlockView: View {
     @State private var signingIn = false
     @State private var keyLost = false
     @State private var confirmRemove = false
+    /// The account a sign-in is waiting on its security key for.
+    @State private var keyFor: KnownAccount?
+    @State private var keyGen = 0
     @FocusState private var focused: Bool
 
     private var target: KnownAccount? { model.known(accountId) ?? model.lockedAccounts.first }
@@ -41,6 +44,9 @@ struct UnlockView: View {
                     .pickerStyle(.menu)
                     .labelsHidden()
                 }
+                if let k = keyFor, model.keyPage != nil {
+                    KeyStepView { r in model.unlocked(k, r, since: keyGen) }
+                } else {
                 HStack {
                     SecureField(model.known.count > 1 ? "Password for \(target?.username ?? "")" : "Password", text: $password)
                         .textContentType(.password)
@@ -59,6 +65,7 @@ struct UnlockView: View {
                 .frame(minHeight: 48)
                 .background(Palette.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Palette.line))
+                }
                 if let error { Note(text: error, icon: "exclamationmark.circle", color: Palette.danger) }
                 // No passcode, so no lock-screen sign-in: an account this device can't
                 // open any more (its Secret Key is gone) can at least be removed.
@@ -122,9 +129,71 @@ struct UnlockView: View {
             do {
                 try await model.unlock(k, password: pw)
                 password = ""
+            } catch PlaintextError.KeyNeeded {
+                keyFor = k
+                keyGen = model.lockGen
+                password = ""
             } catch {
                 self.error = errorText(error)
                 if case PlaintextError.BadSecretKey = error, !Biometrics.available { keyLost = true }
+            }
+        }
+    }
+}
+
+/// A sign-in waiting for the account's security key (DESIGN "Signing in with a
+/// security key"): the server's page in the browser asks the key (over NFC or
+/// USB), then Continue finishes here. Or a recovery code.
+struct KeyStepView: View {
+    @EnvironmentObject var model: AppModel
+    let done: (LoginResult) -> Void
+    @State private var code = ""
+    @State private var busy = false
+    @State private var error: String?
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("This account needs your security key to sign in on this device.").font(.headline)
+            Button {
+                if let p = model.keyPage, let u = URL(string: p) { openURL(u) }
+            } label: {
+                Label("Approve with my security key", systemImage: "key")
+            }
+            Text("That opens a page on your server in the browser, which asks your key: hold it to the device or plug it in. Then come back here and continue. This device won't ask again.")
+                .font(.footnote)
+                .foregroundStyle(Palette.muted)
+            TextField("Or a recovery code", text: $code)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+                .font(.body.monospaced())
+            if let error { Note(text: error, icon: "exclamationmark.circle", color: Palette.danger) }
+            HStack {
+                Button("Cancel") { model.cancelKeyStep() }
+                Spacer()
+                Button(action: finish) {
+                    if busy { ProgressView() } else { Text("Continue") }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(busy)
+            }
+        }
+    }
+
+    private func finish() {
+        busy = true
+        error = nil
+        let c = code.trimmingCharacters(in: .whitespaces)
+        Task {
+            defer { busy = false }
+            do {
+                let r = try await model.call { try $0.finishLogin(recovery: c.isEmpty ? nil : c) }
+                model.keyPage = nil
+                done(r)
+            } catch {
+                self.error = errorText(error)
             }
         }
     }

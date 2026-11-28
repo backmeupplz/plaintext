@@ -392,7 +392,7 @@ fn security_key_sign_in() {
     let page = phone.pending_key_page().unwrap();
     let c = page.rsplit_once('#').unwrap().1.to_string();
     assert!(page.starts_with(&format!("{url}/v1/login/key#")));
-    assert!(matches!(phone.finish_login(None), Err(PlaintextError::KeyNeeded)), "not approved yet");
+    assert!(matches!(phone.finish_login(None), Err(PlaintextError::Invalid { .. })), "not approved yet");
     assert!(matches!(phone.finish_login(Some("nope".into())), Err(PlaintextError::Invalid { .. })));
     let challenge = hex::decode(&c).unwrap();
     let a = serde_json::to_vec(&key.assert(&rp, &challenge, &url)).unwrap();

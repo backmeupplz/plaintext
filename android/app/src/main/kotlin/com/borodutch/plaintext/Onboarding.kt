@@ -431,6 +431,9 @@ private fun PasswordStep(flow: Flow) {
                 flow.login = model.addAccount({ it.login(server, sk, pw) }) { Triple(it.account, sk, it.unlock) }
                 flow.password = ""
                 flow.go(Step.Biometrics)
+            } catch (_: PlaintextException.KeyNeeded) {
+                flow.password = ""
+                model.keyPage = model.core.pendingKeyPage()
             } catch (e: Exception) {
                 error = setupError(e)
             } finally {
@@ -442,7 +445,11 @@ private fun PasswordStep(flow: Flow) {
         "Enter your password", accountLabel(flow.server, flow.username), onBack = if (busy) null else ({ flow.back() }),
         actions = { PrimaryButton("Sign in", ::signIn, enabled = flow.password.isNotEmpty(), busy = busy) },
     ) {
-        Field("Password", flow.password, { flow.password = it }, kind = Input.Password, onDone = ::signIn)
+        if (model.keyPage != null) KeyStep { code ->
+            val sk = flow.secretKey
+            flow.login = model.addAccount({ it.finishLogin(code) }) { Triple(it.account, sk, it.unlock) }
+            flow.go(Step.Biometrics)
+        } else Field("Password", flow.password, { flow.password = it }, kind = Input.Password, onDone = ::signIn)
         if (insecure) Note("Without https, anyone on your network can see which server you use.")
         ErrorNote(error)
     }

@@ -518,13 +518,20 @@ struct PasswordStep: View {
     @EnvironmentObject var flow: Flow
     @EnvironmentObject var model: AppModel
     @State private var busy = false
+    /// What a sign-in waiting for the security key continues with.
+    @State private var keySecret = ""
+    @State private var keyGen = 0
     @State private var error: String?
     @FocusState private var focused: Bool
 
     var body: some View {
         StepPage(title: "Enter your password", subtitle: "\(flow.username)@\(flow.server.components(separatedBy: "://").last ?? flow.server)") {
-            Field(label: "Password") {
-                SecureField("Password", text: $flow.password).textContentType(.password).focused($focused).onSubmit(signIn)
+            if model.keyPage != nil {
+                KeyStepView { l in signedIn(l, secretKey: keySecret, since: keyGen) }
+            } else {
+                Field(label: "Password") {
+                    SecureField("Password", text: $flow.password).textContentType(.password).focused($focused).onSubmit(signIn)
+                }
             }
             if let error { Note(text: error, icon: "exclamationmark.circle", color: Palette.danger) }
         } actions: {
@@ -552,15 +559,21 @@ struct PasswordStep: View {
         Task {
             defer { busy = false }
             do {
-                let l = try await model.call { try $0.login(server: server, secretKey: sk, password: pw) }
-                flow.login = l
-                model.remember(l.account, secretKey: sk)
-                if model.addInterrupted(flow, since: gen) { return }
+                signedIn(try await model.login(server: server, secretKey: sk, password: pw), secretKey: sk, since: gen)
+            } catch PlaintextError.KeyNeeded {
+                (keySecret, keyGen) = (sk, gen)
                 flow.password = ""
-                flow.path.append(.biometrics)
             } catch {
                 self.error = errorText(error)
             }
         }
+    }
+
+    private func signedIn(_ l: LoginResult, secretKey sk: String, since gen: Int) {
+        flow.login = l
+        model.remember(l.account, secretKey: sk)
+        if model.addInterrupted(flow, since: gen) { return }
+        flow.password = ""
+        flow.path.append(.biometrics)
     }
 }

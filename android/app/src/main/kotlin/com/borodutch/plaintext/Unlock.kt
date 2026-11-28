@@ -1,12 +1,15 @@
 package com.borodutch.plaintext
 
 import android.app.KeyguardManager
+import android.content.Intent
+import android.net.Uri
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -46,6 +49,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
+import uniffi.plaintext_ffi.PlaintextException
 
 /** One strong-biometric prompt; on success the stored sessions open (the Keystore key allows a few seconds). */
 fun promptBiometrics(
@@ -107,6 +111,8 @@ fun UnlockScreen() {
             try {
                 model.unlock(k, pw)
                 password = ""
+            } catch (_: PlaintextException.KeyNeeded) {
+                password = ""
             } catch (e: Exception) {
                 error = errorText(e)
             } finally {
@@ -159,7 +165,8 @@ fun UnlockScreen() {
                     }
                 }
             }
-            Field(
+            if (model.keyPage != null) KeyStep { model.finishUnlock(it) }
+            else Field(
                 if (model.known.size > 1) "Password for ${target?.username ?: ""}" else "Password", password, { password = it },
                 kind = Input.Password, onDone = ::unlock,
                 trailing = {
@@ -175,5 +182,50 @@ fun UnlockScreen() {
         if (context.getSystemService(KeyguardManager::class.java).isDeviceSecure) TextButton(onClick = {
             confirmOwner(activity, "Confirm it's you to add an account") { model.ownerConfirmed(); signingIn = true }
         }) { Text("Sign in with your Emergency Kit", color = P.muted) }
+    }
+}
+
+/**
+ * A sign-in waiting for the account's security key (DESIGN "Signing in with a security key"): the server's page in the
+ * browser asks the key (held to the phone, or plugged in), then Continue finishes here with [finish]. Or a recovery code.
+ */
+@Composable
+fun KeyStep(finish: suspend (recovery: String?) -> Unit) {
+    val context = LocalContext.current
+    val model = context.model
+    val scope = rememberCoroutineScope()
+    var code by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("This account needs your security key to sign in on this device.", style = MaterialTheme.typography.titleMedium)
+        SecondaryButton("Approve with my security key", {
+            val page = model.keyPage ?: return@SecondaryButton
+            model.external = true
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(page))) }
+        })
+        Text(
+            "That opens a page on your server in the browser, which asks your key: hold it to the phone or plug it in. Then come back here and continue. This phone won't ask again.",
+            color = P.muted, style = MaterialTheme.typography.bodySmall,
+        )
+        Field("Or a recovery code", code, { code = it }, kind = Input.Secret, revealed = true)
+        ErrorNote(error)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            TextButton(onClick = { model.cancelKeyStep() }, enabled = !busy) { Text("Cancel") }
+            PrimaryButton("Continue", {
+                busy = true
+                error = null
+                scope.launch {
+                    try {
+                        finish(code.trim().ifEmpty { null })
+                        model.keyPage = null
+                    } catch (e: Exception) {
+                        error = errorText(e)
+                    } finally {
+                        busy = false
+                    }
+                }
+            }, busy = busy)
+        }
     }
 }
