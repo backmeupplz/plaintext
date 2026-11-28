@@ -313,6 +313,8 @@ fn unsendable_changes() {
         bob.put_item(b.clone(), v.clone(), None, it.clone()).unwrap();
     }
     bob.delete_item(b.clone(), fam.clone(), router).unwrap();
+    // A writer's changes go out with the next sync: nothing to offer to drop.
+    assert!(matches!(bob.unsent_changes(b.clone(), fam.clone()), Err(PlaintextError::Invalid { .. })));
     for v in [&fam, &work] {
         alice.share_vault(a.clone(), v.clone(), "bob".into(), Role::Reader, None).unwrap();
     }

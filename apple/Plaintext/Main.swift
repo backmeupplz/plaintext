@@ -41,8 +41,6 @@ struct PlaintextMain: App {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
-    /// Asked from the banner, which may go away before the person answers.
-    @State private var reviewing: AppModel.UnsentRequest?
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
@@ -57,8 +55,8 @@ struct RootView: View {
             }
         }
         .overlay(alignment: .bottom) { ToastView() }
-        .overlay(alignment: .top) { BannerView(reviewing: $reviewing) }
-        .unsentDialog($reviewing)
+        .overlay(alignment: .top) { BannerView() }
+        .unsentDialog($model.reviewing)
         .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
             if phase == .active { Task { await model.syncAll() } }
         }
@@ -201,14 +199,13 @@ private struct UnsentDialog: ViewModifier {
         }
         if c.deleted > 0 { lines.append(c.deleted == 1 ? "1 item deleted" : "\(c.deleted) items deleted") }
         if c.renamed { lines.append("The vault's name or description changed") }
-        lines.append("Dropping them gets the vault again from the server. Copy out anything you want to keep first.")
+        lines.append("Dropping them downloads the vault again from the server. Copy out anything you want to keep first.")
         return lines.joined(separator: "\n")
     }
 }
 
 struct BannerView: View {
     @EnvironmentObject var model: AppModel
-    @Binding var reviewing: AppModel.UnsentRequest?
 
     var body: some View {
         if let text = model.banner {
@@ -217,7 +214,7 @@ struct BannerView: View {
                 Text(text).font(.subheadline).foregroundStyle(Palette.fg).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
                 if let u = model.bannerUnsent, u.text == text {
-                    Button("Review…") { Task { reviewing = await model.unsentRequest(account: u.account, vault: u.vault) } }
+                    Button("Review…") { Task { model.reviewing = await model.unsentRequest(account: u.account, vault: u.vault) } }
                         .font(.subheadline.weight(.semibold))
                         .buttonStyle(.plain)
                         .foregroundStyle(Palette.accent)

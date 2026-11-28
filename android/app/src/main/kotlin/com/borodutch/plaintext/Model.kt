@@ -364,6 +364,9 @@ class Model(val context: Context) {
         toast = null
         if (locked && accounts.isEmpty() && opening == 0 && !owner) return
         epoch++
+        reviewing = null
+        if (banner == bannerUnsent?.text) banner = null
+        bannerUnsent = null
         idleJob?.cancel()
         abandonSetup()
         // Without a stored session the next unlock signs in again, so end these.
@@ -467,6 +470,8 @@ class Model(val context: Context) {
 
     /** What the sync couldn't do; the client's text can end with a CLI hint, and the app has its own Verify screen. */
     private fun showProblems() {
+        // Sent after all (made a writer again) or dropped elsewhere: its banner goes.
+        bannerUnsent?.let { u -> if (u.text == banner && accounts.none { it.id == u.account && u.vault in it.problemUnsent }) banner = null }
         val all = accounts.flatMap { a -> a.problems.zip(a.problemUnsent) { p, v -> Triple(a.id, p, v) } }
         // The banner shows one at a time: one the person can act on comes first.
         val (account, p, vault) = all.firstOrNull { it.third != null } ?: all.firstOrNull() ?: return
@@ -480,10 +485,11 @@ class Model(val context: Context) {
 
     fun discard(r: UnsentRequest) {
         reviewing = null
+        // Its banner goes at once, so it can't be confirmed twice.
+        if (bannerUnsent.let { it != null && it.account == r.account && it.vault == r.vault && it.text == banner }) banner = null
         scope.launch {
             try {
                 val n = call { it.discardChanges(r.account, r.vault) }.toInt()
-                if (bannerUnsent.let { it != null && it.account == r.account && it.vault == r.vault && it.text == banner }) banner = null
                 reload()
                 if (banner == null) showProblems()
                 flash(if (n == 0) "Nothing was left to drop" else "Dropped $n unsent change${if (n == 1) "" else "s"}")

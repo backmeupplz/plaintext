@@ -274,8 +274,8 @@ async function reviewUnsent(banner, p) {
       'div',
       { class: 'row-text' },
       el('div', {}, `You can only read ${c.name} now, so these changes on this device can't be sent:`),
-      el('ul', {}, ...lines.map((l) => el('li', {}, l))),
-      el('div', { class: 'muted small-text' }, 'Dropping them gets the vault again from the server. Copy out anything you want to keep first.'),
+      lines.length ? el('ul', {}, ...lines.map((l) => el('li', {}, l))) : null,
+      el('div', { class: 'muted small-text' }, 'Dropping them downloads the vault again from the server. Copy out anything you want to keep first.'),
       el('div', { class: 'row-actions' }, el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(banner) }, 'Keep'), drop),
     ),
   )

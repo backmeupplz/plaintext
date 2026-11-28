@@ -251,6 +251,9 @@ fn vault_id(vault: &str) -> Result<Hex, Error> {
 /// before `discard_changes` drops them: `{name, changed: [title], deleted, renamed}`.
 pub fn unsent_changes<T: AsyncTransport>(s: &Session<T>, vault: &str) -> Result<Value, Error> {
     let v = s.vaults.get(&vault_id(vault)?).ok_or_else(|| Error::NotFound("that vault".into()))?;
+    if writable(s, v) {
+        return Err(Error::Refused("You can write to this vault again, so these changes go out with the next sync.".into()));
+    }
     Ok(json!({ "name": v.meta.name, "changed": v.changed().map(|(_, i)| &i.title).collect::<Vec<_>>(), "deleted": v.deleted(), "renamed": v.meta_changed() }))
 }
 

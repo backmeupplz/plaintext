@@ -128,7 +128,9 @@ final class AppModel: ObservableObject {
     @Published var banner: String?
     /// The vault whose unsent changes the banner's problem offers to drop, while that banner shows.
     @Published var bannerUnsent: (text: String, account: String, vault: String)?
-    /// Changes to drop, once the person confirms (`unsentDialog`).
+    /// Changes to drop, once the person confirms (`unsentDialog`). Held here, not
+    /// by the banner, which may go away first; a lock closes it.
+    @Published var reviewing: UnsentRequest?
     struct UnsentRequest {
         let account: String
         let vault: String
@@ -383,6 +385,9 @@ final class AppModel: ObservableObject {
             addAborted += 1
         }
         lockGen += 1
+        reviewing = nil
+        if banner == bannerUnsent?.text { banner = nil }
+        bannerUnsent = nil
         closeCore()
         EmergencyKit.dismissPrint()
         Clipboard.clear()
@@ -528,6 +533,10 @@ final class AppModel: ObservableObject {
 
     /// What the last sync or sign-in couldn't do (vaults that didn't verify, a damaged copy).
     private func showProblems() {
+        // Sent after all (made a writer again) or dropped elsewhere: its banner goes.
+        if let u = bannerUnsent, u.text == banner, !accounts.contains(where: { $0.id == u.account && $0.problemUnsent.contains(u.vault) }) {
+            banner = nil
+        }
         let all = accounts.flatMap { a in zip(a.problems, a.problemUnsent).map { (account: a.id, text: $0, unsent: $1) } }
         // The banner shows one at a time: one the person can act on comes first.
         guard banner == nil, let p = all.first(where: { $0.unsent != nil }) ?? all.first else { return }
@@ -549,9 +558,10 @@ final class AppModel: ObservableObject {
     }
 
     func discard(_ r: UnsentRequest) async {
+        // Its banner goes at once, so it can't be confirmed twice.
+        if let u = bannerUnsent, u.account == r.account, u.vault == r.vault, u.text == banner { banner = nil }
         do {
             let n = try await call { try $0.discardChanges(account: r.account, vault: r.vault) }
-            if let u = bannerUnsent, u.account == r.account, u.vault == r.vault, u.text == banner { banner = nil }
             reload()
             showProblems()
             flash(n == 0 ? "Nothing was left to drop" : "Dropped \(n) unsent change\(n == 1 ? "" : "s")")

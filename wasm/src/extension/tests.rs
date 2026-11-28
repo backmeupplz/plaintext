@@ -269,6 +269,8 @@ fn changes_a_reader_cant_send_are_shown_and_dropped() {
     let mut v = s.vaults.remove(&fam).unwrap();
     v.put(core::new_item_id(), Item { title: "Bank".into(), ..Default::default() });
     s.vaults.insert(fam, v);
+    // A writer's changes go out with the next sync: nothing to offer to drop.
+    assert_eq!(code(&unsent_changes(&s, &fam.to_string()).unwrap_err()), "refused");
     alice.share_vault(&fam, "hal", Role::Reader, None).unwrap();
     let problems = run(sync(&mut s)).unwrap();
     let p = problems.iter().find(|p| p["unsent"] == json!(fam.to_string())).unwrap_or_else(|| panic!("{problems:?}"));

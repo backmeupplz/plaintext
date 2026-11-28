@@ -1168,6 +1168,9 @@ impl PlaintextApp {
         let id = hex_id(&vault)?;
         self.peek(&account, |s| {
             let v = s.vaults.get(&id).ok_or_else(|| not_found("that vault"))?;
+            if writable(s, &id).is_ok() {
+                return Err(PlaintextError::Invalid { message: "You can write to this vault again, so these changes go out with the next sync.".into() });
+            }
             Ok(UnsentChanges { name: v.meta.name.clone(), changed: v.changed().map(|(_, i)| i.title.clone()).collect(), deleted: v.deleted() as u32, renamed: v.meta_changed() })
         })
     }

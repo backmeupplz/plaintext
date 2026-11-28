@@ -1249,8 +1249,11 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
     bob.t.1.set(false);
     assert_eq!(bob.vaults[&fam].changes(), 3);
+    // A problem reported after it (as the apps add their own) stays.
+    bob.problems.push("later".into());
     let warnings = bob.problems.len();
     assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert_eq!(bob.problems.last().map(String::as_str), Some("later"));
     // Its warning goes with the changes, so the apps stop showing it before the next sync.
     assert!(bob.unsendable.is_empty());
     assert_eq!(bob.problems.len(), warnings - 1, "{:?}", bob.problems);
