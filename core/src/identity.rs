@@ -29,6 +29,8 @@ pub struct Keyring {
     pub username: String,
     sign_sk: B64,
     enc_sk: B64,
+    /// The ML-KEM-768 seed (d ‖ z), independent of `enc_sk`.
+    kem_sk: B64,
     #[serde(default)]
     pub contacts: BTreeMap<String, Contact>,
     /// Secrets of invites this account sent and nobody has used yet.
@@ -55,6 +57,7 @@ impl Drop for Keyring {
         use zeroize::Zeroize;
         self.sign_sk.0.zeroize();
         self.enc_sk.0.zeroize();
+        self.kem_sk.0.zeroize();
     }
 }
 
@@ -108,6 +111,7 @@ impl Keyring {
             username: username.into(),
             sign_sk: B64(random::<32>().to_vec()),
             enc_sk: B64(random::<32>().to_vec()),
+            kem_sk: B64(random::<64>().to_vec()),
             contacts: BTreeMap::new(),
             invites: BTreeMap::new(),
             default_vault: None,
@@ -120,7 +124,8 @@ impl Keyring {
     pub fn me(&self) -> Me {
         let s: [u8; 32] = self.sign_sk.0.as_slice().try_into().expect("32-byte key");
         let e: [u8; 32] = self.enc_sk.0.as_slice().try_into().expect("32-byte key");
-        Me { username: self.username.clone(), sign: SigningKey::from_bytes(&s), enc: StaticSecret::from(e), kem: kem_key(&e) }
+        let k = zeroize::Zeroizing::<[u8; 64]>::new(self.kem_sk.0.as_slice().try_into().expect("64-byte seed"));
+        Me { username: self.username.clone(), sign: SigningKey::from_bytes(&s), enc: StaticSecret::from(e), kem: kem_key(&k) }
     }
 
     pub fn seal(&self, account: &crate::Account) -> Vec<u8> {

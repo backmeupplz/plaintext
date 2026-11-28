@@ -274,11 +274,10 @@ type KemPk = ml_kem::EncapsulationKey<ml_kem::MlKem768>;
 pub const KEM_PK_LEN: usize = 1184;
 const KEM_CT_LEN: usize = 1088;
 
-/// An account's ML-KEM-768 key, derived from the same random 32 bytes as its
-/// X25519 key, so the keyring holds one secret for both.
-pub fn kem_key(enc_sk: &[u8; 32]) -> KemKey {
-    let mut seed = Zeroizing::new([0u8; 64]);
-    Hkdf::<Sha256>::new(None, enc_sk).expand(b"plaintext/v1/ml-kem", &mut seed[..]).expect("valid length");
+/// An account's ML-KEM-768 key from its own random 64-byte FIPS 203 seed (d ‖ z).
+/// Never derive it from the X25519 secret: a quantum attacker who recovers that
+/// would then get this too.
+pub fn kem_key(seed: &[u8; 64]) -> KemKey {
     KemKey::from_seed((*seed).into())
 }
 

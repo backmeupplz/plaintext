@@ -35,7 +35,7 @@ identity enc key ◄──sealed to── Vault Key (random per vault and epoch)
 - **Secret Key.** Generated on the first device, never sent anywhere. Devices keep it in the OS keychain; the user keeps it in an Emergency Kit. The last two characters are a checksum.
 - **Agents** have a 256-bit `ptk_…` key instead of password + Secret Key: `HKDF(salt="plaintext/v1/agent", ikm=key)` gives the same three outputs, with no Argon2 because the key has full entropy.
 - **Nothing server-chosen feeds a key.** Salt and Argon2 parameters are fixed per protocol version; there is no prelogin call to lie in.
-- **Identity keys are random**, not derived from the password, so a password change keeps the identity, the pins others made of it, and every vault. The ML-KEM-768 key comes from the same random 32 bytes as the X25519 key (`HKDF-SHA256(enc_sk, info "plaintext/v1/ml-kem")` → FIPS 203 seed).
+- **Identity keys are random**, not derived from the password, so a password change keeps the identity, the pins others made of it, and every vault. The ML-KEM-768 key comes from its own random 64-byte FIPS 203 seed (d ‖ z) in the keyring, never from the X25519 secret: a quantum computer can recover that from the public key, and would then get the ML-KEM key too.
 - **Password change** re-seals the Account Key under the new AUK and replaces the login public key, signed by the old login key. Other sessions end.
 - **No recovery.** Lose the password, or the Secret Key along with every device, and the data is gone. Admin or family recovery would be key escrow, the attack class in the table below, so there is none.
 

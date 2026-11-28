@@ -2,8 +2,8 @@ use super::*;
 use crate::item::{Field, FileRef, Passkey, Section};
 use crate::vault::Vault;
 
-const KEM_PK_VECTOR: &str = "c75400441b34f059ac1417189b641cbc15d22f83e45a88c8ae8f6d6fadf306a0";
-const PQ_BLOB_VECTOR: &str = "4476bb72161076c2892710cf89e474ec02d170567a3a0dd60c73e53c7fa80a6b6a7af4afa2fcc5c7b6ab99312e51985e4f6db58fbe8c9d2209b303f265bfccd82f15fb4b62161c5d1dc670f6306572a2d69e1bf7e8a4ed7ef227f5c7d76af8c057eaa210255203fc506fc446ac35706f33e2243a744017a259a166cbefca61d47995d1ab6d0b357d95c5be4dcd656eb426eccef4b01613495d42e2d973976380a37d45159cf610d8c7a21603cd7d827fcdd2c9f20b866434c0dc13a77a09bd42020f52e1871a602fa264a52625310b1099e149aa348b7e32fb418069820673557c262457ee56adc37f3767558665e75aa87e66eed85aa2968f566664f938104529321c772fd17bedfa853d845b7a3f8528c9aaa1390382290ecab79ace3c279383777412083c02fbf5437a58812b7e1926426e4b8abf12b1cf1acaa2f36cb3083afc0d71f10ffc65668b75b91027c316715e650ec8de662bea6b0f5f4f6ea7202f57cfbd4a890ce9c1aedfc22bdc3d9b76e5637fb50c43da548559b56367fe7318f4b5feb4c8dd5672b088882b12a47a634c0cf002fa7927e5c892f170046598f0ec3ef76e0b5b8f40ffed06c18a8d9db072df14056b191d0749ff7b2b80e79f4d0d93653180b7025d784fd80d545e3ea6fee4efceeb7392228ba072f8d8f7151f6472e6a87c795ff866aa630ccf9d527c66af51645dcef2f9317087b2dcbfe713bf8eb427015b3db8abc4d822cf0ffcaa1c368578affc8bf48a4f90ba4f07acf7f44ce1964d734afd9969baf8b090de85d2f75b00a7b85cea657f551a6d81548c8f894d9f7c9473414546be046dc7092f85e269036ab96bf493e48c1ba1e08350bbc94e957248201cb704d419ac1a83d9d43124581a8cb197129de1d25da80fbcee8266239148f6f079371ed6821d119fcbc37d71ad1591bd6f80669da199be81a5bcd202439399bf03041149ce6cd745a04c40c87d37e3681ba2115dafee972f05f4a2cf69354802dd9bdf567c1e366f92f6e8f031552529bf3dd8748cce8d3b3ca11879afdddefc22d900913c2e7398c7e0aa7172b9046884af1e26f7c61b3fb353d09283eff25d21f54c220b544c5d400f8370a54a65606a81444482aed5216353b040b785a6ac2a00977df455746ca48594094d66b4864fca03bb422ec1f6cc63a4f23abc8522a9e5be11f69e7d16383a995db35654e063e6def95a4ce237461de4426e4a50e37e70e4f9b25da0bfcb3eab08337c1f5fbe58e2258081135df06425ce79d508d9cd549647d27eadc94403c160fb0da79afc91dc11fe65bd563147265f5e7fa1b430ddcc56ab40aa79555cfa01b6f574bbb4bb706da5c2d4079d255beccb72b17582466f9ec4bddffcc0deccc8db5e9a7901d9b7302024b8cb789b07572a28d468361099fdccb0560a13dfe69dd174944bbcb7226dc318c47afddaf4c44c0cad62ac9fc08381f12d23daa16b291bf60701ebdd9d6878033ad1e6689bffd4c80b2c0bb75f90941b79366040a9c51347dcc03942433f5ef3a067e40678a33a2b76381abb348a18492d0c7de0eeff20941a70ae53f3ca6ef244017c469aa8c92d7e968284a42dd05a3d3249eea80efcbc6919e73fe040431237110310d5479efd4d660cc83deb73a258ae37";
+const KEM_PK_VECTOR: &str = "c12e9e39db6758fc2ba63a638785b04f8efe3d7df23ba09803b4e39ba2fbc707";
+const PQ_BLOB_VECTOR: &str = "88fb761c8914cb26d3129530cc8f9e1cf16dfe15b698db7dd94acea313cb4c70e425306be681f0fb3d4d67528fffa49819319877c6fe84423f80ef683a4c690154dacf4915741aa21942647d3e403816a6d9c088c6f1324600dc97e2b2a3c38ce1a1f2ba3f411a935a699b834e78099e26e0827fffc271293a15bbc2c4991010414320f45fa401af34040ceb0b515b21154e36cbf545f18aa5b774dcf65f2fc303d7f68c6c8e4240e444ce03113ea241b89fb28595f62df08a26b37e3c650f5d0243fd6c2fd81217f3313dc1c3f28a4ea83789fcc995045830de093a6b3f2f8a66a4213b02ea8b2c342ae282c26c33ceda92ab6ca0b401595d0cb0db4d77e5e1fc75e33b76bb08e533c7ec9b37bd3db1468463eb9a82d40342531fe159238835d9e0f1e2373aeb7eb313900ca02bd66906bdee3c7284a07f650baadba77f0aefe32895e0d73dfeb2d7f911fe2719b2c4221729fe072675bb7c01ef103ac582ae742542a5d5d6a3a90aff2419576bcdb23a90377dd264c436c7a73c355237f87d5b97682c8c041184ada8f378a08bea7aae5ec79b3921973863a1d37e6b639fc7e5eb27e807806af058ad8a8cfd3fba6c8b2ca5dcc0650bcc59520ed3b1c2d510e59251b0582320cc41c8bb5d104e076dc6238241ab716a09c29a26c4ae4a990a29d80f393a758b869cfa48f699bfa44c11374a15bde5040964e251b9269194ae208e62d63f4026857f1cb3744a5fd012ddd8e46bb5554937f64a5652a434d04e520f907cc0344246b4e9fd458686041ec2a11f245488c28581b0c372ff1055547ca1da394352669408950ca3f6fdcd2850cb954f66c9219f5fa7a54c33ad75569485eeb9f27d962626dd5db19ed451e7b9010ec112bdf4bad22e9212ef460ae1bd67aa7bd8e247c7c36decc324b757958ff04be04b1a2f4aaa9fb61bba5cd9c28961e98d76280dfa14e3138ede15bf63c08bdab367870aed732002d49d82a1f349dbe3d1c6f2219737953ac291a59f82b21b45e99cc4d129fc09c9cb44f1de2c010174d2bc81efda9f0457e3ee2a13df58b67c38e2b949ead70aa549f1a0bd8714cac4081973e70d324b94386b70edc206f3a7dadeff317267c45c9e5a4e20b8f1126228e9b8ad54f9b1a685b66179a412abf5ab1508dc305ecffd19ade2a87f568d8dbfd83a72281fbbed1cfae226353133f112c48653db237bcb9e537d0d646465ce1e35bd9ced140d54d8d9143b0e2f57f3642f7bc6a529873d01dff581e45c79d3f9c8eca63bec97697260d37b92caffcd01fdba546623c4f91feb092a2f1359d8889e056d5c4b114ce1b0b0d275fdc5ab806742acbb6b8894ce0bf0b2244c524c1efd850533825f1ebf21d93a7e1ade35c2959642345b55f1f1f774b69a2a6bb1841dd30f1f2f511ead24430a1e6586ac552520762a2f807df3fd13b88437ff6cfcc3cc724717d4727eefce4916209e6c1c533840540b89827f3ffa5e149bf9f75f1040dc771147e07b2c9f621ea19d15b91b1a954a01fd276d77895efea2ce3e8b5c9999be1ac59a23afe42367f1f49c3326c6de3b611dc571e2e7ad5d018110e22786fb3c15501470c9f272ca5beb9c6847affe345e3b7628670775c44bf76765a402b29ed7c717b932d7ddbeb35d";
 const BLOB_VECTOR: &str = "01030303030303030303030303030303030303030303030303f46a2a721b55a38803873c9683da27fbe1fc928015e0d59931";
 
 #[test]
@@ -93,21 +93,34 @@ fn seal_to_roundtrip() {
     assert!(!valid_kem_pk(&[0xff; KEM_PK_LEN]));
 }
 
-/// The ML-KEM key comes from the keyring's X25519 secret. Pinned, since a change
-/// in derivation would lock every account out of its vault keys.
+/// The ML-KEM key comes from the keyring's own 64-byte seed. Pinned, since a
+/// change in derivation would lock every account out of its vault keys.
 #[test]
-fn kem_key_is_derived_from_the_enc_key() {
-    assert_eq!(hex::encode(sha256(&kem_pk(&kem_key(&[7u8; 32])))), KEM_PK_VECTOR);
-    assert_ne!(kem_pk(&kem_key(&[7u8; 32])), kem_pk(&kem_key(&[8u8; 32])));
+fn kem_key_comes_from_its_seed() {
+    assert_eq!(hex::encode(sha256(&kem_pk(&kem_key(&[7u8; 64])))), KEM_PK_VECTOR);
+    assert_ne!(kem_pk(&kem_key(&[7u8; 64])), kem_pk(&kem_key(&[8u8; 64])));
 }
 
-/// A blob sealed to the keys from [7; 32] keeps opening: the format is fixed
+/// The ML-KEM key is independent of the X25519 key: a quantum attacker who
+/// recovers the X25519 secret from its public key learns nothing about it.
+#[test]
+fn kem_key_is_independent_of_the_enc_key() {
+    let (a, b) = (Keyring::new("a"), Keyring::new("a"));
+    let mut mixed: serde_json::Value = serde_json::to_value(&a).unwrap();
+    mixed["kem_sk"] = serde_json::to_value(&b).unwrap()["kem_sk"].clone();
+    let mixed: Keyring = serde_json::from_value(mixed).unwrap();
+    assert_eq!(mixed.me().enc_pk(), a.me().enc_pk());
+    assert_eq!(mixed.me().kem_pk(), b.me().kem_pk());
+    assert_ne!(a.me().kem_pk(), b.me().kem_pk());
+}
+
+/// A blob sealed to the X25519 key from [7; 32] and the ML-KEM key from [7; 64] keeps opening: the format is fixed
 /// once a server stores one (combiner per X-Wing draft 11).
 #[test]
 fn sealed_blob_vector_opens() {
     let sk = x25519_dalek::StaticSecret::from([7u8; 32]);
     let blob = hex::decode(PQ_BLOB_VECTOR).unwrap();
-    assert_eq!(&open_from(&sk, &kem_key(&[7u8; 32]), b"vector", &blob).unwrap()[..], b"plaintext");
+    assert_eq!(&open_from(&sk, &kem_key(&[7u8; 64]), b"vector", &blob).unwrap()[..], b"plaintext");
 }
 
 fn account_response(s: &Signup) -> AccountResponse {
@@ -979,3 +992,4 @@ fn vault_keys_and_identities_carry_ml_kem() {
     assert_eq!(identity::check_identity(&bad).err(), Some(Error::BadSignature));
     assert!(Keyring::new("bob").pin_identity(&bad).is_err());
 }
+

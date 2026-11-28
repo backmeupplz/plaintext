@@ -1567,7 +1567,7 @@ fn server_hardening() {
     };
     let (_, mut agent) = plaintext_core::create_agent(&mut carol.keyring, "carol-bot").unwrap();
     let am = agent.keyring.me();
-    let id = serde_json::json!({ "username": "carol-bot", "kind": "agent", "owner": "carol", "sign_pk": am.sign_pk(), "enc_pk": am.enc_pk(), "pad": "A".repeat(4000) });
+    let id = serde_json::json!({ "username": "carol-bot", "kind": "agent", "owner": "carol", "sign_pk": am.sign_pk(), "enc_pk": am.enc_pk(), "kem_pk": am.kem_pk(), "pad": "A".repeat(6000) });
     agent.request.identity = am.sign_doc("identity", &id);
     assert_eq!(status(carol.call::<()>("POST", "/v1/agents", Some(&agent.request))), 400, "identity too large");
     // Rosters: no duplicates, at most 1000 members.
