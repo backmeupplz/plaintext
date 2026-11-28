@@ -467,11 +467,13 @@ impl<T: AsyncTransport> Session<T> {
         // Someone can make you an owner and leave, and the vault counts against you
         // from then on (DESIGN "Leaving"). Name every vault you pay for: one you aren't a
         // current member of always (your own without how to leave it), one you can open
-        // but didn't create only while storage is limited (or a vault you took over on
+        // but don't own as its creator only while storage is limited (or a vault you took over on
         // purpose would be named on every sync for nothing). One that failed is named above.
         for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
             let text = match self.vaults.get(id).filter(|v| v.roster.is_some()) {
-                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => continue,
+                Some(_) if self.is_own(id) || acct.quota.is_none() => continue,
+                // You made it but were signed down from owner: it still counts against you.
+                Some(v) if v.creator == self.username() => format!("vault {} counts against your storage, though you're no longer an owner of it (plaintext vault leave {id} to stop that)", v.meta.name),
                 Some(v) => format!("vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)", v.meta.name, v.creator),
                 None if self.is_own(id) => {
                     // The full id too: `vault leave` can't find a vault it doesn't list by name.

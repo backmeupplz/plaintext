@@ -1201,6 +1201,28 @@ fn nobody_is_stuck_paying_for_a_vault() {
     carol.leave_vault(&old).unwrap();
     assert_eq!(creator(&old).as_deref(), Some("bob"));
 
+    // A creator signed down to writer still pays for the vault she can open: her
+    // sync names it and how to leave it, and leaving hands it to the owner.
+    let (_, mut dave) = join(Http::new(&url), "dave", "dave pw", None, "t");
+    let down = dave.create_vault("Down").unwrap();
+    dave.share_vault(&down, "bob", Role::Owner, None).unwrap();
+    dave.sync().unwrap();
+    assert!(!dave.problems.iter().any(|p| p.contains(&down.to_string())), "{:?}", dave.problems);
+    bob.sync().unwrap();
+    bob.share_vault(&down, "dave", Role::Writer, None).unwrap();
+    assert_eq!(creator(&down).as_deref(), Some("dave"));
+    dave.sync().unwrap();
+    assert!(dave.vaults.contains_key(&down));
+    let named: Vec<_> = dave.problems.iter().filter(|p| p.contains(&down.to_string())).collect();
+    assert!(
+        named.len() == 1
+            && named[0].contains(&format!("vault Down counts against your storage, though you're no longer an owner of it (plaintext vault leave {down} "))
+            && named[0].leave == Some(down),
+        "{named:?}"
+    );
+    dave.leave_vault(&down).unwrap();
+    assert_eq!(creator(&down).as_deref(), Some("bob"));
+
     // Mallory makes bob an owner of a vault he can open and leaves: it counts against
     // him, and his sync names it and how to leave it (his own vaults it doesn't name).
     let big = mallory.create_vault("Big").unwrap();
