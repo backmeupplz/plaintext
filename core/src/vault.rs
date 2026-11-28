@@ -264,6 +264,16 @@ impl Vault {
         self.meta_dirty
     }
 
+    /// Drop everything but the rollback guard, pending changes included. The next
+    /// pull downloads the vault again from its latest manifest, which must not be
+    /// older than the one verified here (it isn't checked to link to it, as for a
+    /// device seeing the vault for the first time). Returns how many changes went.
+    pub fn forget(&mut self) -> usize {
+        let n = self.changes();
+        *self = Vault { counter: self.counter, last: self.last.clone(), ..Vault::new(self.id) };
+        n
+    }
+
     /// Whether both copies verified the same latest manifest.
     pub fn same_head(&self, other: &Vault) -> bool {
         self.counter == other.counter && self.last == other.last
@@ -378,11 +388,14 @@ impl Vault {
         //    could write under the roster version it names, in that version's epoch.
         //    A device with no state yet may start from any manifest (its first sync
         //    is trust on first use either way); after that, every link is checked.
+        //    A vault reset to its rollback guard (`forget`) starts afresh too, unless
+        //    the first manifest served is the very next one: that must link to it,
+        //    and a chain that passes the guard's counter must pass its manifest.
         let (mut counter, mut last) = (self.counter, self.last.clone());
         let mut latest: Option<(ManifestEnvelope, String)> = None;
         for s in &resp.manifests {
             let env: ManifestEnvelope = serde_json::from_slice(&s.body.0).map_err(|_| Error::BadJson)?;
-            let fresh = latest.is_none() && self.counter == 0;
+            let fresh = latest.is_none() && (self.counter == 0 || (self.roster.is_none() && env.counter != self.counter + 1));
             if env.vault_id != self.id || (!fresh && (env.counter != counter + 1 || env.prev != last)) {
                 return Err(Error::Rollback);
             }
@@ -394,10 +407,17 @@ impl Vault {
             verify_doc::<ManifestEnvelope>(s, "manifest", &pk)?;
             counter = env.counter;
             last = h(&s.body.0);
+            if self.roster.is_none() && counter == self.counter && last != self.last {
+                return Err(Error::Rollback);
+            }
             latest = Some((env, s.signer.clone()));
         }
         if resp.counter != counter {
             return Err(if resp.counter < self.counter { Error::Rollback } else { Error::ManifestMismatch });
+        }
+        // Started afresh from a kept guard: no older copy, nor a different one of the same version.
+        if self.roster.is_none() && (counter < self.counter || (counter == self.counter && last != self.last)) {
+            return Err(Error::Rollback);
         }
 
         // 4. The latest manifest decides the items. It must be under the current key
