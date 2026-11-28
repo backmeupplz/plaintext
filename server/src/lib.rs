@@ -961,6 +961,29 @@ fn within_quota<T>(tx: &Transaction, cfg: &Config, account: Option<&str>, write:
     Ok(out)
 }
 
+/// `within_quota` for a roster change into `vault` signed by `signer`, checked
+/// against whoever pays once it's stored: removing the creator moves the vault to
+/// the signer's account (its owner's, for an agent), which then mustn't end up over
+/// the quota with more than it had.
+fn roster_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], signer: &str, write: impl FnOnce() -> R<T>) -> R<T> {
+    let Some(quota) = cfg.quota else { return write() };
+    let signer: Option<String> =
+        tx.query_row("SELECT COALESCE(owner, username) FROM accounts WHERE username = ?", [signer], |r| r.get(0)).map_err(db_err)?;
+    let mut before = Vec::new();
+    for a in [creator(tx, vault)?, signer] {
+        let u = usage(tx, a.as_deref())?;
+        before.push((a, u));
+    }
+    let out = write()?;
+    let payer = creator(tx, vault)?;
+    let after = usage(tx, payer.as_deref())?;
+    let before = before.iter().find(|(a, _)| *a == payer).map_or(0, |(_, u)| *u);
+    if after > quota && after > before {
+        return Err(FULL);
+    }
+    Ok(out)
+}
+
 /// Runs a push (or a key rotation's re-seal) into `vault` and keeps it if the
 /// account it counts against stays within the quota or, over it, if the vault's
 /// items take no more room and its sealed manifest is no larger than the one
@@ -1421,7 +1444,7 @@ async fn update_roster(
             store_keys(&tx, &vault, &u.keys)
         };
         if r.members.iter().any(|m| !had(&m.username)) {
-            within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), store)?;
+            roster_within_quota(&tx, &cfg, &vault, &c.username, store)?;
         } else {
             store()?;
         }

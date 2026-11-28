@@ -527,6 +527,20 @@ fn storage_quota() {
     assert_eq!(stage(&bob, &mine, st, 100_000), 200);
     assert_eq!(stage(&bob, &mine, st, 200_000), 507);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
+    // Removing the creator and adding someone in one roster change: the signer
+    // pays from then on, so the signer needs the room.
+    let _ = join(Http::new(&url), "carol", "carol pw", None, "t");
+    bob.share_vault(&mine, "alice", Role::Owner, None).unwrap();
+    alice.sync().unwrap();
+    let carol = alice.pin_user("carol").unwrap();
+    let take_over = |s: &mut Session<Http>| {
+        let u = s.vaults[&mine].revoke(&s.me(), &["bob"], now()).unwrap();
+        let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
+        r.members.push(Member { username: "carol".into(), sign_pk: carol.sign_pk.clone(), enc_pk: carol.enc_pk.clone(), role: Role::Reader, expires: None });
+        let u = RosterUpdate { roster: s.me().sign_doc("roster", &r), ..u };
+        status(s.call::<()>("POST", &format!("/v1/vaults/{mine}/roster"), Some(&u)))
+    };
+    assert_eq!(take_over(&mut alice), 507);
     // Over the quota, a roster change (here an unchanged role) may keep its unknown
     // fields but not grow them.
     assert_eq!(padded(&mut alice, Role::Writer, 2000), 507);
@@ -552,6 +566,10 @@ fn storage_quota() {
     assert!(acct.usage < 20_000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
     alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.sync().unwrap();
+    assert_eq!(take_over(&mut alice), 200, "an owner with room");
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&mine), "alice pays for it now");
     // Under the quota, a change that adds nobody still may not grow past it.
     assert_eq!(padded(&mut alice, Role::Reader, 200_000), 507);
     assert_eq!(padded(&mut alice, Role::Reader, 10_000), 200);

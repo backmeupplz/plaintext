@@ -604,9 +604,11 @@ impl<T: Transport> Session<T> {
     /// the session token alone can't delete an account. Refused while this
     /// account is the only owner of a vault others use.
     pub fn delete_account(&mut self, d: &Derived) -> Result<()> {
+        // A full account (507) or a too-big change (413) can't be sent, so it goes
+        // with the account; a 409 is worth a retry first.
         match self.sync() {
-            Err(e) if !e.held_back() => return Err(e),
-            _ => {}
+            Ok(()) | Err(Error::Server(413 | 507, _)) => {}
+            Err(e) => return Err(e),
         }
         let mut blocking = Vec::new();
         for (id, v) in &self.vaults {
