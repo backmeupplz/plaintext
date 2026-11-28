@@ -1176,6 +1176,13 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     // Offline as a known reader, he's told so, not that his edit is waiting.
     bob.t.1.set(true);
     assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Refused", "r"))));
+    assert!(read_only(bob.writable(&fam)));
+    // An offline writer may go ahead (import saves for the next sync).
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    bob.t.1.set(true);
+    bob.writable(&fam).unwrap();
     bob.t.1.set(false);
 }
 

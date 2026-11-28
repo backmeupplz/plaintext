@@ -340,9 +340,25 @@ impl<T: Transport> Session<T> {
 
     /// Pull a vault and refuse if we may only read it. A reader's sync never
     /// pushes, so a change made anyway would stay on this device without a word.
+    /// Offline it passes, so the change waits for the next sync, unless the
+    /// roster we already have says we only read.
     pub fn writable(&mut self, id: &Hex) -> Result<()> {
-        self.pull(id)?;
-        self.may_write(id)
+        self.check(id).map(drop)
+    }
+
+    /// `writable`, keeping an offline pull's error (Ok(Err)) for the caller.
+    fn check(&mut self, id: &Hex) -> Result<Result<()>> {
+        let pulled = self.pull(id);
+        if let Err(e) = &pulled
+            && !matches!(e, Error::Network(_) | Error::Server(500..=599, _))
+        {
+            return pulled.map(Ok);
+        }
+        // A vault never pulled has no roster yet: the pull's error says more.
+        if let Err(e) = self.may_write(id) {
+            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
+        }
+        Ok(pulled)
     }
 
     fn may_write(&self, id: &Hex) -> Result<()> {
@@ -353,18 +369,10 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Make a change and push it, refusing first if we may only read the vault.
-    /// Offline, the change still goes in and waits for the next sync, unless the
-    /// roster we already have says we only read.
+    /// Make a change and push it, refusing first if we may only read the vault
+    /// (see `writable`).
     fn change(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
-        let pulled = self.pull(id);
-        if matches!(pulled, Err(ref e) if !matches!(e, Error::Network(_) | Error::Server(500..=599, _))) {
-            return pulled;
-        }
-        // A vault never pulled has no roster yet: the pull's error says more.
-        if let Err(e) = self.may_write(id) {
-            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
-        }
+        let pulled = self.check(id)?;
         f(self.vaults.get_mut(id).expect("checked above"));
         pulled?;
         self.push(id)
