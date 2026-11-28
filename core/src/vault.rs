@@ -591,6 +591,7 @@ impl Vault {
     /// manifest's): a partial push lists it so. One the server dropped (deleted
     /// elsewhere) gets an empty `base`: a partial push leaves it out, and if it
     /// comes back it's a change (rebased, with a conflict copy if its content differs).
+    /// Only `base` moves: `base_content` and `base_files` change with a blob, in `apply`.
     fn base_from(&mut self, items: &BTreeMap<Hex, B64>) {
         for id in self.dirty.iter().chain(&self.deleted) {
             match items.get(id) {

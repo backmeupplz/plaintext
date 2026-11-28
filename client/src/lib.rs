@@ -552,8 +552,9 @@ impl<T: AsyncTransport> Session<T> {
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
         self.gone.insert(*id, resp.gone);
         // An older app's snapshot with changes pending, and no manifest pulled to
-        // fix its `base`s: fetch the latest one. Best effort: without it, the push
-        // sends everything at once, as that app did.
+        // fix its `base`s: fetch the latest one. If that fails, the push sends
+        // everything at once, as that app did; a manifest other than the one
+        // verified here is a rollback.
         if let Some(q) = v.exact_base_query()
             && let Ok(resp) = self.call_async::<VaultResponse>("GET", &format!("/v1/vaults/{id}?{q}"), NONE).await
         {

@@ -1276,9 +1276,13 @@ fn older_snapshots_take_their_bases_from_the_latest_manifest() {
     v.put(new_item_id(), login("z", "z"));
     let mut json = serde_json::to_value(&v).unwrap();
     json.as_object_mut().unwrap().remove("exact_base");
+    // An older app kept the `base` of an item deleted here though a pull showed it gone.
+    let stale = json["base"][x.to_string()].clone();
+    json["base"][y.to_string()] = stale;
     let mut old: Vault = serde_json::from_value(json).unwrap();
     assert!(old.exact_base_query().is_some());
-    assert_eq!(old.push_part(&me, 0, 0).unwrap().upserts.len(), 2);
+    let p0 = old.push_part(&me, 0, 0).unwrap();
+    assert_eq!((p0.upserts.len(), p0.deletes.len()), (2, 1));
     let latest = |m: &Signed, counter| VaultResponse { counter, manifests: vec![m.clone()], sealed: None, ..Default::default() };
 
     // The server moved on meanwhile: the next pull brings that manifest.
@@ -1289,6 +1293,6 @@ fn older_snapshots_take_their_bases_from_the_latest_manifest() {
     assert_eq!(old.exact_base_from(&latest(&p.manifest, 2)), Ok(true));
     assert!(old.exact_base_query().is_none());
     let p = old.push_part(&me, 0, 0).unwrap();
-    assert_eq!((p.upserts.len(), p.deletes.len()), (0, 0), "no delete of an item the server never had");
+    assert_eq!((p.upserts.len(), p.deletes.len()), (0, 0), "no delete of an item the server doesn't have");
     assert_eq!(old.push_part(&me, 0, 1).unwrap().upserts.len(), 1);
 }
