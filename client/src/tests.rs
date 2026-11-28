@@ -2156,6 +2156,37 @@ fn deletes_go_out_past_a_refused_addition() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A push that reached the server though its answer didn't: the next pull
+/// takes the server's copy as the item's starting point, so a deletes-only push
+/// lists it and other devices still read the vault.
+#[test]
+fn deletes_alone_after_a_lost_answer() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    roomy.sync().unwrap();
+    let v = roomy.default_vault().unwrap();
+    let big = plaintext_core::new_item_id();
+    roomy.put_item(&v, big, Item { notes: "x".repeat(5000), ..item("Big", "b") }).unwrap();
+    let (me, lost) = (roomy.me(), plaintext_core::new_item_id());
+    let vault = roomy.vaults.get_mut(&v).unwrap();
+    vault.put(lost, item("Lost", "l"));
+    let put = vault.push(&me, now()).unwrap();
+    roomy.call::<()>("PUT", &format!("/v1/vaults/{v}"), Some(&put)).unwrap();
+    // Over the quota, on top of that: a delete and an addition that doesn't fit.
+    let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut alice = login(&full, "alice pw", &ask);
+    alice.vaults.insert(v, Vault::restore(&roomy.account, v, &roomy.vaults[&v].snapshot(&roomy.account)).unwrap());
+    alice.vaults.get_mut(&v).unwrap().delete(big);
+    alice.vaults.get_mut(&v).unwrap().put(plaintext_core::new_item_id(), item("New", "n"));
+    assert_eq!(status(alice.sync()), 507);
+    assert_eq!(alice.vaults[&v].deleted(), 0, "the delete went out");
+    let mut other = login(&full, "alice pw", &ask);
+    other.sync().unwrap();
+    assert!(other.problems.is_empty(), "{:?}", other.problems);
+    assert_eq!(other.vaults[&v].items().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Lost"]);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Without a quota, a member may stage the vault's item bytes plus a slack, no more.
 #[test]
 fn staging_is_capped_without_a_quota() {

@@ -492,7 +492,9 @@ impl Vault {
         let rebase: Vec<(Hex, B64, B64, Vec<Hex>)> = m
             .items
             .iter()
-            .filter(|(id, hash)| pending(id) && blob_changed(id, hash))
+            // Or one the server has though this device never heard so: a push whose
+            // answer was lost. Without a `base`, a deletes-only push would leave it out.
+            .filter(|(id, hash)| pending(id) && (blob_changed(id, hash) || !self.base.contains_key(id)))
             .filter_map(|(id, hash)| received.get(id).map(|e| (*id, hash.clone(), content_hash(&e.item), e.item.file_ids().collect())))
             .collect();
 
@@ -532,7 +534,8 @@ impl Vault {
             }
         }
         // An item edited here that the server no longer has: a deletes-only push
-        // mustn't list it, and if it comes back it's a change (a conflict copy).
+        // mustn't list it, and if it comes back it's a change (rebased, with a
+        // conflict copy if its content differs).
         for id in &self.dirty {
             if !m.items.contains_key(id)
                 && let Some(b) = self.base.get_mut(id)
