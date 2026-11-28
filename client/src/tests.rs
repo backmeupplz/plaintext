@@ -1285,7 +1285,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     let carol_keys = bob.pin_user("carol").unwrap();
     let u = bob.vaults[&alices].revoke(&bob.me(), &["alice"], now()).unwrap();
     let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
-    r.members.push(Member { username: "carol".into(), sign_pk: carol_keys.sign_pk.clone(), enc_pk: carol_keys.enc_pk.clone(), role: Role::Reader, expires: None });
+    r.members.push(Member { username: "carol".into(), sign_pk: carol_keys.sign_pk.clone(), enc_pk: carol_keys.enc_pk.clone(), kem_pk: carol_keys.kem_pk.clone(), role: Role::Reader, expires: None });
     let u = RosterUpdate { roster: bob.me().sign_doc("roster", &r), ..u };
     assert_eq!(status(bob.call::<()>("POST", &format!("/v1/vaults/{alices}/roster"), Some(&u))), 507);
     assert_eq!(creator(&alices).as_deref(), Some("alice"));
