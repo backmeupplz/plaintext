@@ -185,25 +185,7 @@ impl Transport for Http {
 /// `docs/s/` on their own domain and use that instead.
 pub const LINK_PAGE: &str = "https://getplaintext.org/s/";
 
-/// Whether talking to `url` would expose sign-ins and session tokens to the
-/// network: anything but `https://`, except plain `http://` to this machine, a
-/// private or Tailscale network, `.local` names, or a single-label name (a LAN or
-/// Docker host). Someone on the path could replay a sign-in sent in the clear.
-pub fn insecure_url(url: &str) -> bool {
-    let Some(rest) = url.trim().strip_prefix("http://") else { return !url.trim().starts_with("https://") };
-    let host = plaintext_core::crypto::server_host(rest);
-    let host = match host.rsplit_once(':') {
-        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(':') => h,
-        _ => host.as_str(),
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let local = match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-        Err(_) => !host.contains('.') || [".local", ".localhost", ".ts.net", ".internal", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s)),
-    };
-    !local
-}
+pub use plaintext_core::crypto::insecure_url;
 
 /// What the server allows before anyone signs in (open signup, setup code).
 pub fn server_info<T: Transport>(t: &T) -> Result<ServerInfo> {

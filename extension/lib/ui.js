@@ -72,37 +72,89 @@ export async function copy(text, say) {
 }
 
 /** A sign-in waiting for the account's security key (DESIGN "Signing in with a
- *  security key"): open the server's approval page, touch the key there, then
- *  continue here; or type a recovery code. `done(result)` runs once signed in. */
+ *  security key"). The extension asks the key itself, through WebAuthn for the
+ *  server's own RP ID, so a look-alike site can't get its answer. Browsers that
+ *  won't let it fall back to the server's approval page: touch the key there,
+ *  then continue here. Or type a recovery code. `done(result)` runs once signed in. */
 export function keyStep(w, done) {
   const host = new URL(w.server).host
   const who = w.key.startsWith('new@') ? `Your account on ${host}` : `${w.key.split('@')[0]} on ${host}`
   const code = el('input', { type: 'text', id: 'recovery', class: 'mono', autocomplete: 'off', spellcheck: 'false', placeholder: 'xxxxx-xxxxx-xxxxx-xxxxx' })
   const err = el('p', { class: 'error', role: 'alert' })
-  const go = el('button', { class: 'primary', type: 'submit' }, 'Continue')
-  return el(
-    'form',
+  const go = el('button', { type: 'submit' }, 'Continue')
+  const finish = async (data, btn) => {
+    btn.disabled = true
+    err.textContent = ''
+    try {
+      done(await ask('finishKey', { key: w.key, ...data }))
+    } catch (x) {
+      err.textContent = explain(x)
+    } finally {
+      btn.disabled = false
+    }
+  }
+  const page = el(
+    'div',
+    { hidden: true },
+    el('button', { type: 'button', onclick: () => chrome.tabs.create({ url: w.page }) }, 'Approve on my server’s page instead'),
+    el('p', { class: 'muted small-text' }, 'That page asks your key on your server’s own site. Touch the key there, then come back here and continue.'),
+  )
+  const fallBack = (why) => {
+    page.hidden = false
+    err.textContent = why
+  }
+  const touch = el(
+    'button',
     {
-      class: 'key-step',
-      onsubmit: async (e) => {
-        e.preventDefault()
-        go.disabled = true
-        err.textContent = ''
-        try {
-          done(await ask('finishKey', { key: w.key, recovery: code.value.trim() }))
-        } catch (x) {
-          err.textContent = explain(x)
-        } finally {
-          go.disabled = false
+      class: 'primary',
+      type: 'button',
+      onclick: async () => {
+        // A popup closes when the browser's security key prompt takes the focus: ask from a tab.
+        if (location.pathname.endsWith('/popup.html')) {
+          chrome.tabs.create({ url: chrome.runtime.getURL(`setup.html#signin=${encodeURIComponent(w.key)}`) })
+          return window.close()
         }
+        let assertion
+        try {
+          assertion = await touchKey(w.request)
+        } catch (x) {
+          return fallBack(x?.name === 'NotAllowedError' ? 'Your security key didn’t answer. Try again, or approve on your server’s page.' : 'This browser won’t ask your security key for this server here.')
+        }
+        await finish({ assertion }, touch)
       },
     },
-    el('p', {}, `${who} needs your security key to sign in on this browser.`),
-    el('button', { type: 'button', onclick: () => chrome.tabs.create({ url: w.page }) }, icon('key-round'), 'Approve with my security key'),
-    el('p', { class: 'muted small-text' }, "That opens a page on your server that asks your key. Touch the key there, then come back here and continue. This browser won't ask again."),
+    icon('key-round'),
+    'Use my security key',
+  )
+  const usable = w.request?.allow?.length > 0
+  if (!usable) page.hidden = false
+  return el(
+    'form',
+    { class: 'key-step', onsubmit: (e) => (e.preventDefault(), finish({ recovery: code.value.trim() }, go)) },
+    el('p', {}, `${who} needs your security key to sign in on this browser. It won’t ask again.`),
+    usable && touch,
+    page,
     el('label', { for: 'recovery' }, 'Or use a recovery code'),
     code,
     err,
     go,
   )
+}
+
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+const bytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
+
+/** The key's answer to a sign-in's `request` ({rpId, challenge, allow}), as the server takes it. */
+async function touchKey(req) {
+  const cred = await navigator.credentials.get({
+    publicKey: {
+      rpId: req.rpId,
+      challenge: bytes(req.challenge),
+      allowCredentials: req.allow.map((id) => ({ type: 'public-key', id: bytes(id) })),
+      userVerification: 'discouraged',
+      timeout: 120_000,
+    },
+  })
+  const r = cred.response
+  return { id: b64(cred.rawId), client_data: b64(r.clientDataJSON), auth_data: b64(r.authenticatorData), signature: b64(r.signature) }
 }

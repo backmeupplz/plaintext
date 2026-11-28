@@ -40,6 +40,15 @@ pub async fn unlock<T: AsyncTransport>(t: T, password: &str, sealed_secret_key: 
     Session::sign_in_async(t, &crypto::derive(password, &sk), device, trust).await
 }
 
+/// What the extension asks the security key itself, through WebAuthn: the RP ID
+/// (this server's host as typed, never the server's word), the challenge, and
+/// only the credentials made for that RP ID, ids in base64.
+pub fn key_request<T: AsyncTransport>(p: &Pending<T>) -> Value {
+    let rp = p.rp_id();
+    let allow: Vec<_> = p.needed.keys.iter().filter(|k| k.rp_id == rp).map(|k| &k.id).collect();
+    json!({ "rpId": rp, "challenge": p.needed.challenge, "allow": allow })
+}
+
 /// What `storage.session` holds while unlocked, so the background can pick the
 /// session up again after the browser suspends it. Never written to disk.
 pub fn session_state<T: AsyncTransport>(s: &Session<T>) -> Value {
@@ -535,16 +544,25 @@ impl PendingSignIn {
         Ok(PendingSignIn::new(p, &server))
     }
 
-    /// The approval page's address.
+    /// What to ask the security key for with `navigator.credentials.get`
+    /// (`key_request`), as JSON.
+    pub fn request(&self) -> Result<String, JsValue> {
+        Ok(key_request(self.p.borrow().as_ref().ok_or_else(busy)?).to_string())
+    }
+
+    /// The approval page's address, for browsers that won't let the extension
+    /// ask the key for this server.
     pub fn page(&self) -> Result<String, JsValue> {
         Ok(format!("{}{}", self.base, self.p.borrow().as_ref().ok_or_else(busy)?.page()))
     }
 
-    /// Sign in once the approval page has the key's answer (until then this
-    /// fails with `not_approved`), or with a recovery code.
-    pub async fn finish(&self, recovery: Option<String>) -> Result<Account, JsValue> {
+    /// Sign in with the key's answer (`assertion`, JSON `{id, client_data,
+    /// auth_data, signature}` in base64), a recovery code, or neither once the
+    /// approval page has the key's answer (until then this fails with `not_approved`).
+    pub async fn finish(&self, recovery: Option<String>, assertion: Option<String>) -> Result<Account, JsValue> {
+        let assertion = assertion.map(|a| serde_json::from_str(&a)).transpose().map_err(|_| js_err(core::Error::Tampered.into()))?;
         let mut p = self.p.borrow_mut().take().ok_or_else(busy)?;
-        let r = p.finish_async(None, recovery.as_deref().filter(|c| !c.trim().is_empty())).await;
+        let r = p.finish_async(assertion, recovery.as_deref().filter(|c| !c.trim().is_empty())).await;
         *self.p.borrow_mut() = Some(p);
         let (s, trust) = r.map_err(|e| {
             let (name, text) = match &e {

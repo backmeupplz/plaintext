@@ -138,10 +138,12 @@ CREATE TABLE IF NOT EXISTS recovery_codes(
   PRIMARY KEY(account_id, code_hash));
 
 -- Devices that signed in with a key or a recovery code once; only the hash of their token.
+-- sessions.trust names the token each session came with: ending that session revokes it.
 CREATE TABLE IF NOT EXISTS trusted_devices(
   token_hash BLOB PRIMARY KEY,
   account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  created INTEGER NOT NULL);
+  created INTEGER NOT NULL,
+  used INTEGER NOT NULL);              -- last sign-in; unused for 90 days, it lapses
 CREATE INDEX IF NOT EXISTS trusted_account ON trusted_devices(account_id);
 
 -- Signed logins waiting for a security key, for a few minutes.

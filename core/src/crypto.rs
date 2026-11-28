@@ -357,6 +357,26 @@ pub fn server_host(url: &str) -> String {
     host.strip_suffix(":443").or_else(|| host.strip_suffix(":80")).map(String::from).unwrap_or(host)
 }
 
+/// Whether talking to `url` would expose sign-ins and session tokens to the
+/// network: anything but `https://`, except plain `http://` to this machine, a
+/// private or Tailscale network, `.local` names, or a single-label name (a LAN or
+/// Docker host). Someone on the path could replay a sign-in sent in the clear.
+pub fn insecure_url(url: &str) -> bool {
+    let Some(rest) = url.trim().strip_prefix("http://") else { return !url.trim().starts_with("https://") };
+    let host = server_host(rest);
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(':') => h,
+        _ => host.as_str(),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+        Err(_) => !host.contains('.') || [".local", ".localhost", ".ts.net", ".internal", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s)),
+    };
+    !local
+}
+
 /// Signed at login. The host binds the signature to the server the client meant
 /// to reach, so a look-alike server can't relay it to the real one for a session.
 pub fn login_message(account_id: &Id, ts: u64, host: &str) -> Vec<u8> {

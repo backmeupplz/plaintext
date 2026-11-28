@@ -62,3 +62,4 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px
 .key-step { display: flex; flex-direction: column; gap: 4px; }
 .key-step p { margin: 0 0 8px; }
 .key-step button { margin: 4px 0 12px; align-self: flex-start; }
+.key-step [hidden] { display: none; }

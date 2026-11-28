@@ -17,7 +17,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use plaintext_core::api::*;
 use plaintext_core::crypto::{
-    account_delete_message, login_message, password_change_message, rp_id, server_host, sha256, signin_key_add_challenge, signin_keys_message, verify,
+    account_delete_message, insecure_url, login_message, password_change_message, rp_id, server_host, sha256, signin_key_add_challenge, signin_keys_message, verify,
 };
 use plaintext_core::identity::valid_username;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -98,6 +98,10 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
              COMMIT;"
         ))?;
     }
+    // The trusted-device token a session came with (DESIGN "Signing in with a security key").
+    if !has_col(&c, "sessions", "trust")? {
+        c.execute_batch("ALTER TABLE sessions ADD COLUMN trust BLOB;")?;
+    }
     // Messages count against their sender's quota.
     if !has_col(&c, "messages", "sender")? {
         c.execute_batch(
@@ -126,6 +130,7 @@ fn cleanup(db: &Connection) -> rusqlite::Result<()> {
     db.execute("DELETE FROM sessions WHERE expires <= ?", [t])?;
     db.execute("DELETE FROM staged WHERE created <= ?", [t - STAGE_TTL])?;
     db.execute("DELETE FROM pending_logins WHERE expires <= ?", [t])?;
+    db.execute("DELETE FROM trusted_devices WHERE used <= ?", [t.saturating_sub(TRUST_TTL)])?;
     Ok(())
 }
 
@@ -618,14 +623,19 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
     let id = &req.account_id.0[..];
     let ttl = req.ttl.unwrap_or(SESSION_TTL).min(SESSION_TTL);
     let keys = key_creds(&db, id)?;
-    let trusted = || -> R<bool> {
-        let Some(t) = &req.trust else { return Ok(false) };
-        db.query_row("SELECT COUNT(*) FROM trusted_devices WHERE token_hash = ? AND account_id = ?", params![&sha256(t.as_bytes())[..], id], |r| r.get::<_, i64>(0))
-            .map(|n| n > 0)
-            .map_err(db_err)
+    // A trusted device's token, which this login renews (it lapses unused for TRUST_TTL).
+    let trusted = match &req.trust {
+        Some(t) if !keys.is_empty() => {
+            let th = sha256(t.as_bytes());
+            let n = db
+                .execute("UPDATE trusted_devices SET used = ?1 WHERE token_hash = ?2 AND account_id = ?3 AND used > ?1 - ?4", params![now(), &th[..], id, TRUST_TTL])
+                .map_err(db_err)?;
+            (n > 0).then_some(th)
+        }
+        _ => None,
     };
-    if keys.is_empty() || trusted()? {
-        return Ok(Json(LoginResponse { token: new_session(&db, id, &req.device, ttl)?, key: None, trust: None }));
+    if keys.is_empty() || trusted.is_some() {
+        return Ok(Json(LoginResponse { token: new_session(&db, id, &req.device, ttl, trusted.as_ref())?, key: None, trust: None }));
     }
     if !req.keys {
         return Err((StatusCode::FORBIDDEN, "this account needs a security key to sign in, which this version of Plaintext can't do: update it"));
@@ -642,6 +652,8 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
 
 /// How long a signed login waits for its security key, in seconds.
 const PENDING_TTL: u64 = 300;
+/// A trusted device that hasn't signed in for this long needs the key again, in seconds.
+const TRUST_TTL: u64 = 90 * 24 * 3600;
 
 fn random<const N: usize>() -> R<[u8; N]> {
     let mut b = [0u8; N];
@@ -649,11 +661,13 @@ fn random<const N: usize>() -> R<[u8; N]> {
     Ok(b)
 }
 
-fn new_session(db: &Connection, account: &[u8], device: &str, ttl: u64) -> R<String> {
+/// `trust`: the hash of the trusted-device token the session came with, which
+/// ending the session revokes (DESIGN "Signing in with a security key").
+fn new_session(db: &Connection, account: &[u8], device: &str, ttl: u64, trust: Option<&[u8; 32]>) -> R<String> {
     let token = hex::encode(random::<32>()?);
     db.execute(
-        "INSERT INTO sessions(token_hash, account_id, device, created, expires) VALUES(?,?,?,?,?)",
-        params![&sha256(token.as_bytes())[..], account, device, now(), now() + ttl],
+        "INSERT INTO sessions(token_hash, account_id, device, created, expires, trust) VALUES(?,?,?,?,?,?)",
+        params![&sha256(token.as_bytes())[..], account, device, now(), now() + ttl, trust.map(|t| &t[..])],
     )
     .map_err(db_err)?;
     Ok(token)
@@ -679,10 +693,21 @@ fn check_key(db: &Connection, account: &[u8], a: &Assertion, challenge: &[u8], h
         .optional()
         .map_err(db_err)?
         .ok_or(denied)?;
-    let origin_ok = |o: &str| hosts.iter().any(|h| *h == server_host(o));
-    let n = webauthn::check(a, &cose, &rp, challenge, origin_ok, count).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    let n = webauthn::check(a, &cose, &rp, challenge, |o| origin_ok(hosts, o), count).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
     db.execute("UPDATE signin_keys SET sign_count = ? WHERE account_id = ? AND cred_id = ?", params![n, account, a.id.0]).map_err(db_err)?;
     Ok(())
+}
+
+/// Where a security key's answer may come from: one of the server's own hosts
+/// over https, or over http where clients allow it (this machine, a private
+/// network: `insecure_url`), or a browser extension, which the browser lets name
+/// this RP ID only if it may reach the host (DESIGN "Signing in with a security key").
+fn origin_ok(hosts: &[String], origin: &str) -> bool {
+    if origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://") {
+        return true;
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
+    (scheme == "https" || (scheme == "http" && !insecure_url(origin))) && hosts.iter().any(|h| *h == server_host(rest))
 }
 
 /// Recovery codes are shown as `xxxxx-xxxxx-xxxxx-xxxxx`; typed in any case, with or without the dashes.
@@ -721,12 +746,19 @@ async fn finish_login(State(db): State<Db>, axum::Extension(cfg): axum::Extensio
         _ => return Err((BAD, "a security key or a recovery code, not both")),
     }
     tx.execute("DELETE FROM pending_logins WHERE pending_hash = ?", [&ph[..]]).map_err(db_err)?;
-    let token = new_session(&tx, &account, &device, ttl)?;
-    let trust = hex::encode(random::<32>()?);
-    tx.execute("INSERT INTO trusted_devices(token_hash, account_id, created) VALUES(?,?,?)", params![&sha256(trust.as_bytes())[..], account, now()])
-        .map_err(db_err)?;
+    let (trust, th) = new_trust(&tx, &account)?;
+    let token = new_session(&tx, &account, &device, ttl, Some(&th))?;
     tx.commit().map_err(db_err)?;
     Ok(Json(LoginResponse { token, key: None, trust: Some(trust) }))
+}
+
+/// A trusted-device token for `account`, and its hash.
+fn new_trust(db: &Connection, account: &[u8]) -> R<(String, [u8; 32])> {
+    let t = hex::encode(random::<32>()?);
+    let th = sha256(t.as_bytes());
+    db.execute("INSERT INTO trusted_devices(token_hash, account_id, created, used) VALUES(?1,?2,?3,?3)", params![&th[..], account, now()])
+        .map_err(db_err)?;
+    Ok((t, th))
 }
 
 /// The pending login the approval page names by its challenge.
@@ -830,8 +862,7 @@ async fn change_signin_keys(
             if proof.id.0 != cred {
                 return Err((BAD, "the proof is by another security key"));
             }
-            let origin_ok = |o: &str| hosts.iter().any(|h| *h == server_host(o));
-            let count = webauthn::check(&proof, &cose, &rp, &signin_key_add_challenge(&id, req.ts), origin_ok, 0).map_err(|e| (BAD, e))?;
+            let count = webauthn::check(&proof, &cose, &rp, &signin_key_add_challenge(&id, req.ts), |o| origin_ok(&hosts, o), 0).map_err(|e| (BAD, e))?;
             let n = tx
                 .execute(
                     "INSERT OR IGNORE INTO signin_keys(account_id, cred_id, name, rp_id, public_key, sign_count, added) VALUES(?,?,?,?,?,?,?)",
@@ -842,9 +873,8 @@ async fn change_signin_keys(
                 return Err((StatusCode::CONFLICT, "that security key is already added"));
             }
             // The password and the key just proved themselves here, as a sign-in with the key would.
-            let t = hex::encode(random::<32>()?);
-            tx.execute("INSERT INTO trusted_devices(token_hash, account_id, created) VALUES(?,?,?)", params![&sha256(t.as_bytes())[..], c.id, now()])
-                .map_err(db_err)?;
+            let (t, th) = new_trust(&tx, &c.id)?;
+            tx.execute("UPDATE sessions SET trust = ? WHERE token_hash = ?", params![&th[..], c.token_hash]).map_err(db_err)?;
             trust = Some(t);
             had == 0
         }
@@ -1104,6 +1134,13 @@ async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
     if prefix.len() != 8 {
         return Err((BAD, "bad id"));
     }
+    // Ending a device's session also stops trusting it, so a stolen device needs the key again.
+    // (Not logging out: the CLI and the extension log out on every lock.)
+    db.execute(
+        "DELETE FROM trusted_devices WHERE account_id = ?1 AND token_hash IN (SELECT trust FROM sessions WHERE account_id = ?1 AND substr(token_hash, 1, 8) = ?2)",
+        params![c.id, prefix],
+    )
+    .map_err(db_err)?;
     db.execute("DELETE FROM sessions WHERE account_id = ? AND substr(token_hash, 1, 8) = ?", params![c.id, prefix]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2051,6 +2088,19 @@ mod tests {
         let not = ["localhost.evil.example", "localhost:x@evil.example", "127.0.0.1@evil.example", "127.0.0.1:1@evil.example"];
         for h in not.into_iter().chain(["[::1]@evil.example", "[::1]:80x", "localhost:", "[::ffff:127.0.0.1]", "evil.example", "[::1"]) {
             assert!(!super::loopback(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn key_answer_origins() {
+        let hosts = ["vault.example.com".to_string(), "192.168.1.5:8080".to_string()];
+        let ok = ["https://vault.example.com", "https://vault.example.com:443", "http://192.168.1.5:8080", "chrome-extension://abc", "moz-extension://1-2"];
+        for o in ok {
+            assert!(super::origin_ok(&hosts, o), "{o}");
+        }
+        let not = ["http://vault.example.com", "ftp://vault.example.com", "https://192.168.1.5:8081", "https://evil.example", "vault.example.com", "wss://vault.example.com"];
+        for o in not {
+            assert!(!super::origin_ok(&hosts, o), "{o}");
         }
     }
 

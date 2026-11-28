@@ -436,10 +436,9 @@ async function add({ server, secretKey, password }) {
   }
   let added
   try {
-    // Adding again an account this browser has keeps its security-key trust. Which
-    // account the Secret Key names isn't known yet; the server takes only its own token.
-    const trust = (await accounts()).find((x) => x.server === base && x.trust)?.trust
-    added = await Account.add(send, base, password, secretKey, DEVICE, trust)
+    // No trust token: which account the Secret Key names isn't known yet, and another
+    // account's token mustn't reach the server (it would say they share this browser).
+    added = await Account.add(send, base, password, secretKey, DEVICE)
   } catch (e) {
     // The account is found by the Secret Key alone, so a wrong password comes back as a 401.
     if (e.name === 'tampered' || e.name === 'signed_out') throw fail('tampered', "That password and Secret Key don't match an account on this server. Check both, then try again.")
@@ -467,31 +466,33 @@ async function addAccount(acct, base, sealed, trust) {
 // ---------- Signing in with a security key (DESIGN "Signing in with a security key") ----------
 
 /** Keep a sign-in waiting for the account's security key in memory-only storage
- *  (the browser may stop this background while the approval page is open), and
- *  tell the page to open the approval page. */
+ *  (the browser may stop this background meanwhile), and tell the page to ask the
+ *  key (`request`, for WebAuthn), or failing that to open the approval page. */
 async function awaitKey(key, server, pending, extra = {}) {
   const page = pending.page()
-  await chrome.storage.session.set({ [`signin:${key}`]: { server, state: pending.state(), page, at: Date.now(), ...extra } })
+  const request = JSON.parse(pending.request())
+  await chrome.storage.session.set({ [`signin:${key}`]: { server, state: pending.state(), page, request, at: Date.now(), ...extra } })
   pending.free()
   // It holds the Account Unlock Key: gone once the server has forgotten it too.
   chrome.alarms.create('signin-expire', { delayInMinutes: SIGNIN_FOR_MS / 60_000 + 0.1 })
-  return { key, server, ok: false, error: 'key_needed', page, message: 'This account needs your security key to sign in on this browser.' }
+  return { key, server, ok: false, error: 'key_needed', page, request, message: 'This account needs your security key to sign in on this browser.' }
 }
 
-/** Sign-ins still waiting for a security key: [{key, page}]. */
+/** Sign-ins still waiting for a security key: [{key, page, request, server}]. */
 async function awaitingKey() {
   const all = await chrome.storage.session.get(null)
   const out = []
   for (const [k, v] of Object.entries(all)) {
     if (!k.startsWith('signin:')) continue
     if (Date.now() - v.at > SIGNIN_FOR_MS) await chrome.storage.session.remove(k)
-    else out.push({ key: k.slice(7), page: v.page, server: v.server })
+    else out.push({ key: k.slice(7), page: v.page, request: v.request, server: v.server })
   }
   return out
 }
 
-/** Finish once the approval page has the key's answer, or with a recovery code. */
-async function finishKey({ key, recovery }) {
+/** Finish with the key's answer (`assertion`), a recovery code, or neither once
+ *  the approval page has the key's answer. */
+async function finishKey({ key, recovery, assertion }) {
   await ready
   const k = `signin:${key}`
   const p = (await chrome.storage.session.get(k))[k]
@@ -502,7 +503,7 @@ async function finishKey({ key, recovery }) {
   const pending = PendingSignIn.restore(send, p.server, p.state)
   let acct, trust
   try {
-    acct = await pending.finish(recovery || undefined)
+    acct = await pending.finish(recovery || undefined, assertion ? JSON.stringify(assertion) : undefined)
     trust = pending.trust()
   } catch (e) {
     if (e.name === 'expired') await chrome.storage.session.remove(k)

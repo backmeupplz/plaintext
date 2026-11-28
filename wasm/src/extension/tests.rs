@@ -337,4 +337,13 @@ fn security_key_sign_in() {
     assert_eq!(s.username(), "alice");
     assert!(matches!(run(super::unlock(Later(Http::new(&url)), "pw", &sealed, "Chrome", Some(&trust))).unwrap(), SignIn::Done(_)));
     assert!(matches!(run(super::unlock(Later(Http::new(&url)), "pw", &sealed, "Chrome", None)).unwrap(), SignIn::Key(_)));
+
+    // Asked by the extension itself (WebAuthn from its own origin), for this server's RP ID only.
+    let SignIn::Key(mut p) = run(super::unlock(Later(Http::new(&url)), "pw", &sealed, "Firefox", None)).unwrap() else { panic!("trusted") };
+    let req = super::key_request(&p);
+    assert_eq!((req["rpId"].as_str(), req["allow"].as_array().map(Vec::len)), (Some(rp.as_str()), Some(1)));
+    let challenge = STANDARD.decode(req["challenge"].as_str().unwrap()).unwrap();
+    let a = serde_json::to_string(&key.assert(&rp, &challenge, "moz-extension://4e1d")).unwrap();
+    let (s, _) = run(p.finish_async(Some(serde_json::from_str(&a).unwrap()), None)).unwrap();
+    assert_eq!(s.username(), "alice");
 }

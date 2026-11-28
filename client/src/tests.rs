@@ -2099,6 +2099,19 @@ fn security_key_for_sign_in() {
     // The device that used the key isn't asked again; another one is.
     assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap(), SignIn::Done(_)));
     assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some("made-up")).unwrap(), SignIn::Key(_)));
+    // Ending that device's session (a stolen laptop) stops trusting it, even with its token.
+    let SignIn::Done(again) = Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() else { panic!("trusted") };
+    let id = again.sessions().unwrap().into_iter().find(|x| x.current).unwrap().id;
+    alice.end_session(&id).unwrap();
+    let SignIn::Key(mut p) = Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() else { panic!("still trusted after its session ended") };
+    let (_, trust) = p.finish(Some(key.assert(&rp, &p.needed.challenge.0, &url)), None).unwrap();
+    // Trust lapses 90 days after the device last signed in.
+    let db = plaintext_server::open_db(path.to_str().unwrap()).unwrap();
+    db.execute_batch("UPDATE trusted_devices SET used = used - 89 * 86400").unwrap();
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap(), SignIn::Done(_)), "renewed by that sign-in");
+    db.execute_batch("UPDATE trusted_devices SET used = used - 90 * 86400").unwrap();
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap(), SignIn::Key(_)), "lapsed");
+    drop(db);
 
     // The approval page takes the key's answer, then the app finishes.
     let t = Http::new(&url);

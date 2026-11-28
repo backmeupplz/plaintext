@@ -1057,7 +1057,7 @@ impl PlaintextApp {
         let sk = SecretKey::parse(&secret_key)?;
         let password = Zeroizing::new(password);
         let d = derive(&password, &sk);
-        let trust = std::fs::read_to_string(self.trust_file(&d.account_id)).ok();
+        let trust = std::fs::read_to_string(self.trust_file(&server, &d.account_id)).ok();
         match Session::sign_in(Http::new(&server), &d, &self.device, trust.as_deref()).map_err(password_error)? {
             SignIn::Done(s) => self.logged_in(s, server),
             SignIn::Key(p) => {
@@ -1082,7 +1082,7 @@ impl PlaintextApp {
         match p.finish(None, code.as_deref()) {
             Ok((s, trust)) => {
                 // Best effort: without it, the next sign-in here asks for the key again.
-                let f = self.trust_file(&s.account.id);
+                let f = self.trust_file(&server, &s.account.id);
                 let _ = std::fs::create_dir_all(f.parent().expect("in a folder")).and_then(|_| std::fs::write(&f, trust));
                 self.logged_in(s, server)
             }
@@ -1171,8 +1171,8 @@ impl PlaintextApp {
     /// reachable) and delete this device's copies. A locked account's session is
     /// ended with what the keychain kept for it (`stored`), when there is any.
     pub fn sign_out(&self, account: String, server: String, stored: Option<UnlockData>) {
-        if account.len() == 32 && hex::decode(&account).is_ok() {
-            let _ = std::fs::remove_file(self.dir.join("trust").join(&account[..16]));
+        if let Ok(id) = hex::decode(&account) {
+            let _ = std::fs::remove_file(self.trust_file(&server, &id));
         }
         let Ok(a) = self.acct(&account) else {
             if let Some(u) = stored
@@ -1803,8 +1803,10 @@ impl PlaintextApp {
 
     /// The token that spares this device an account's security key at sign-in
     /// (DESIGN "Signing in with a security key"), in the app's private folder.
-    fn trust_file(&self, id: &core::crypto::Id) -> PathBuf {
-        self.dir.join("trust").join(hex::encode(&id[..8]))
+    /// Named by server and account, so a look-alike address never gets the real server's.
+    fn trust_file(&self, server: &str, id: &[u8]) -> PathBuf {
+        let host = core::crypto::server_host(server);
+        self.dir.join("trust").join(hex::encode(&core::crypto::sha256(&[host.as_bytes(), b"\0", id].concat())[..16]))
     }
 
     fn acct(&self, id: &str) -> Res<Arc<Acct>> {

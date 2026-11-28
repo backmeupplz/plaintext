@@ -62,6 +62,27 @@ $('add').addEventListener('submit', (e) => {
     .finally(() => (btn.disabled = false))
 })
 
+// The popup hands a sign-in waiting for the security key to this tab, since the
+// browser's prompt for the key would close the popup.
+const handed = new URLSearchParams(location.hash.slice(1)).get('signin')
+if (handed) {
+  const step = $('signin-step')
+  $('signin').hidden = false
+  ask('awaitingKey')
+    .then((waits) => {
+      const w = waits.find((x) => x.key === handed)
+      if (!w) return step.replaceChildren(el('p', { class: 'error' }, 'This sign-in took too long. Unlock Plaintext again to start over.'))
+      step.replaceChildren(
+        keyStep(w, (r) => {
+          const notes = r.problems.map((p) => problemText(p.text)).join(' ')
+          step.replaceChildren(el('p', {}, `Signed in as ${r.username}. You can close this tab.${notes ? ` ${notes}` : ''}`))
+          refresh()
+        }),
+      )
+    })
+    .catch((x) => step.replaceChildren(el('p', { class: 'error' }, explain(x))))
+}
+
 $('lock').addEventListener('change', () => ask('settings', { lockMinutes: $('lock').value }))
 
 chrome.commands.getAll().then((cmds) => {

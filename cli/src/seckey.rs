@@ -58,8 +58,9 @@ impl Keys {
 /// alone gets nothing useful from them; `add` refuses keys that give the same
 /// one (CTAP 2.0).
 pub trait Authenticator {
-    /// Whether the plugged-in key has a PIN (and can do hmac-secret at all).
-    fn has_pin(&mut self) -> Res<bool>;
+    /// Whether the plugged-in key has a PIN. `unlock`: it must also do
+    /// hmac-secret, which only unlocking needs (signing in doesn't).
+    fn has_pin(&mut self, unlock: bool) -> Res<bool>;
     /// A new credential with hmac-secret, not stored on the key (a touch).
     fn create(&mut self, exclude: &[Vec<u8>], pin: &str) -> Res<Vec<u8>>;
     /// Which of `creds` the plugged-in key holds, without a touch.
@@ -139,7 +140,7 @@ pub fn add(cfg: &Config, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> 
     if keys.salt.is_empty() {
         keys.salt = hex::encode(random::<32>());
     }
-    if !auth.has_pin()? {
+    if !auth.has_pin(true)? {
         return Err("this security key has no PIN. Set one first (for a YubiKey: ykman fido access change-pin; or fido2-token -S), so that a touch alone can't unlock".into());
     }
     let d = password(cfg, ask)?;
@@ -284,7 +285,7 @@ pub fn sign_in(cfg: &Config, d: &Derived, device: &str, auth: &mut dyn Authentic
 pub fn add_for_sign_in(cfg: &Config, s: &S, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> Res<Vec<String>> {
     let d = password(cfg, ask)?;
     let rp = rp_id(&server_host(&cfg.server));
-    let pin = if auth.has_pin()? { Some(ask("Security key PIN: ")?) } else { None };
+    let pin = if auth.has_pin(false)? { Some(ask("Security key PIN: ")?) } else { None };
     eprintln!("Touch your security key to add it.");
     let registration = auth.register(&rp, &client_data("webauthn.create", &random::<32>(), &origin(cfg)), pin.as_deref().map(|p| p.as_str()))?;
     let ts = now_ms();
@@ -321,7 +322,7 @@ pub struct Hid(#[cfg(fido)] Option<ctap_hid_fido2::FidoKeyHid>);
 
 #[cfg(not(fido))]
 impl Authenticator for Hid {
-    fn has_pin(&mut self) -> Res<bool> {
+    fn has_pin(&mut self, _: bool) -> Res<bool> {
         Err(UNSUPPORTED.into())
     }
     fn create(&mut self, _: &[Vec<u8>], _: &str) -> Res<Vec<u8>> {
@@ -421,9 +422,9 @@ mod hid {
     }
 
     impl Authenticator for Hid {
-        fn has_pin(&mut self) -> Res<bool> {
+        fn has_pin(&mut self, unlock: bool) -> Res<bool> {
             let d = self.one()?;
-            if !d.get_info().map_err(ctap)?.extensions.iter().any(|e| e == "hmac-secret") {
+            if unlock && !d.get_info().map_err(ctap)?.extensions.iter().any(|e| e == "hmac-secret") {
                 return Err("this security key can't do hmac-secret, which unlocking needs (any FIDO2 key, such as a YubiKey 5, can)".into());
             }
             Ok(d.enable_info_option(&InfoOption::ClientPin).map_err(ctap)? == Some(true))
@@ -563,7 +564,7 @@ pub mod tests {
     }
 
     impl Authenticator for Soft {
-        fn has_pin(&mut self) -> Res<bool> {
+        fn has_pin(&mut self, _: bool) -> Res<bool> {
             Ok(self.pin.is_some())
         }
         fn create(&mut self, exclude: &[Vec<u8>], pin: &str) -> Res<Vec<u8>> {
