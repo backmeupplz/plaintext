@@ -228,6 +228,9 @@ pub struct Session<T: AsyncTransport> {
     /// verify (kept as last verified, or left out if never verified) and invite
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
+    /// Vaults whose changes the last `sync` couldn't send because we may only
+    /// read them now; `discard_changes` drops them.
+    pub unsendable: Vec<Hex>,
 }
 
 /// The logic, written once. Browsers call these through an `AsyncTransport`;
@@ -251,6 +254,7 @@ impl<T: AsyncTransport> Session<T> {
             hidden: BTreeMap::new(),
             gone: BTreeMap::new(),
             problems: Vec::new(),
+            unsendable: Vec::new(),
         })
     }
 
@@ -259,7 +263,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     /// Pick up a stored session with no network: the token and Account Key plus
@@ -268,7 +272,7 @@ impl<T: AsyncTransport> Session<T> {
     pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
         let keyring = Keyring::open(&account, keyring_blob)?;
         // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
-        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -297,6 +301,7 @@ impl<T: AsyncTransport> Session<T> {
             self.hidden.insert(id, v);
         }
         self.problems.clear();
+        self.unsendable.clear();
         // A vault whose account is out of storage keeps its unpushed changes and
         // reports the error at the end, without holding up the other vaults. So does
         // a member removal another device raced, or one too big to send; the next sync retries.
@@ -321,11 +326,12 @@ impl<T: AsyncTransport> Session<T> {
                         self.vaults.remove(id);
                     }
                     let name = known.unwrap_or_else(|| id.to_string());
-                    // Only pending changes make a reader's push fail: say how to drop them.
-                    // By id: anyone who may write can name a vault anything.
-                    let hint = match e {
-                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", &id.to_string()[..8]),
-                        _ => String::new(),
+                    // Only pending changes make a reader's push fail.
+                    let hint = if matches!(e, Error::Core(plaintext_core::Error::ReadOnly)) {
+                        self.unsendable.push(*id);
+                        ", so this device's changes to it can't be sent"
+                    } else {
+                        ""
                     };
                     self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
                 }
@@ -445,6 +451,7 @@ impl<T: AsyncTransport> Session<T> {
         self.keyring = keyring;
         self.keyring_dirty |= changed;
         self.vaults.insert(*id, fresh);
+        self.unsendable.retain(|v| v != id);
         Ok(n)
     }
 
@@ -591,6 +598,10 @@ impl<T: AsyncTransport> Session<T> {
     /// Find a vault by id prefix or name (case-insensitive).
     pub fn vault(&self, name: &str) -> Result<Hex> {
         let n = name.to_lowercase();
+        // A full id wins over a vault someone named like it.
+        if let Some(id) = self.vaults.keys().find(|id| id.to_string() == n) {
+            return Ok(*id);
+        }
         let hits: Vec<Hex> = self
             .vaults
             .iter()
@@ -729,7 +740,7 @@ impl<T: Transport> Session<T> {
     pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
         let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
         let keyring = Keyring::open(&account, &blob)?;
-        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() };
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() };
         s.load_vaults(dir);
         Ok(s)
     }

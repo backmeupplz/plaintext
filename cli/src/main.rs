@@ -340,8 +340,13 @@ enum VaultCmd {
     Revoke { vault: String, user: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
-    /// Drop this device's changes to a vault that haven't reached the server
-    Reset { vault: String },
+    /// Show this device's changes to a vault that haven't reached the server;
+    /// with --yes, drop them and download the vault again
+    Reset {
+        vault: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -969,17 +974,31 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
                 say!("{date} {:02}:{:02} UTC  {:<20} {}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60, e.username, e.action);
             }
         }
-        VaultCmd::Reset { vault } => {
+        VaultCmd::Reset { vault, yes } => {
             let id = s.vault(&vault)?;
-            // They may exist nowhere else: say which, so they can be saved elsewhere.
-            let titles: Vec<String> = s.vaults[&id].changed().map(|(_, i)| i.title.clone()).collect();
-            match s.discard_changes(&id)? {
-                0 => say!("{vault} has no unsent changes on this device."),
-                1 => say!("Dropped 1 unsent change to {vault}."),
-                n => say!("Dropped {n} unsent changes to {vault}."),
-            }
-            if !titles.is_empty() {
-                say!("Items whose unsent versions were dropped: {}", titles.join(", "));
+            let v = &s.vaults[&id];
+            if v.changes() == 0 {
+                say!("{vault} has no unsent changes on this device.");
+            } else if yes {
+                match s.discard_changes(&id)? {
+                    1 => say!("Dropped 1 unsent change to {vault}."),
+                    n => say!("Dropped {n} unsent changes to {vault}."),
+                }
+            } else {
+                // They may exist nowhere else: show them before anything is dropped.
+                say!("Unsent changes to {vault} on this device:");
+                for (_, i) in v.changed() {
+                    say!("  added or edited: {}", i.title);
+                }
+                match v.deleted() {
+                    0 => {}
+                    1 => say!("  1 item deleted"),
+                    n => say!("  {n} items deleted"),
+                }
+                if v.meta_changed() {
+                    say!("  the vault's name or description changed");
+                }
+                say!("Copy out anything you want to keep (`plaintext get ITEM`), then run again with --yes to drop these changes.");
             }
         }
     }

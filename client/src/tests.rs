@@ -1224,7 +1224,14 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(false);
     alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
     bob.sync().unwrap();
-    assert!(bob.problems.iter().any(|p| p.ends_with(&format!("vault reset {}", &fam.to_string()[..8]))), "{:?}", bob.problems);
+    // The apps show problems as they are: no CLI command in them, the id goes in a list.
+    assert!(bob.problems.iter().any(|p| p.ends_with("this device's changes to it can't be sent")), "{:?}", bob.problems);
+    assert_eq!(bob.unsendable, [fam]);
+    // What `vault reset` lists before dropping anything.
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.changed().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Keep"]);
+    assert_eq!((v.deleted(), v.meta_changed()), (1, true));
+    assert_eq!(bob.vault(&fam.to_string()).unwrap(), fam);
     // The fresh download must be the version his device verified, not an older one.
     let from_scratch = format!("/v1/vaults/{fam}?since=0&latest=true");
     let old = bob.t.0.send("GET", &from_scratch, Some(&bob.token), None).unwrap().1;
@@ -1240,6 +1247,7 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(false);
     assert_eq!(bob.vaults[&fam].changes(), 3);
     assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert!(bob.unsendable.is_empty());
     assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
     let v = &bob.vaults[&fam];
     assert_eq!(v.get(&keep).unwrap().password, "k");
