@@ -35,6 +35,17 @@ fn secret_key_sealed_for_the_browser() {
 }
 
 #[test]
+fn session_sealed_for_a_security_key() {
+    let (out, id, key) = ([7u8; 32], [1u8; 16], random_key());
+    let blob = seal_for_security_key(&out, &id, b"cred", &key, "token");
+    let (k, t) = open_for_security_key(&out, &id, b"cred", &blob).unwrap();
+    assert_eq!((*k, t.as_str()), (*key, "token"));
+    for (o, i, c) in [([8u8; 32], id, &b"cred"[..]), (out, [2u8; 16], b"cred"), (out, id, b"other")] {
+        assert_eq!(open_for_security_key(&o, &i, c, &blob).err(), Some(Error::Tampered), "another key, account or credential");
+    }
+}
+
+#[test]
 fn agent_key_roundtrip() {
     let k = AgentKey::generate();
     assert_eq!(AgentKey::parse(&k.encode()).unwrap().0, k.0);

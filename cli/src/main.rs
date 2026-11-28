@@ -1,6 +1,7 @@
 //! `plaintext`: the command line for people and agents, and an MCP server.
 
 mod mcp;
+mod seckey;
 mod state;
 
 use std::io::{Read, Write};
@@ -116,8 +117,13 @@ enum Cmd {
         #[arg(long)]
         username: Option<String>,
     },
+    /// Unlock this terminal: a security key you added here (its PIN and a touch), else the password
+    Unlock,
     /// Forget the unlocked session (the Secret Key stays in the keychain)
     Lock,
+    /// Security keys (FIDO2, such as a YubiKey) that unlock this computer instead of the password
+    #[command(subcommand)]
+    Key(KeyCmd),
     /// Who you're signed in as, and your fingerprint
     Whoami,
     /// List items, optionally matching a search
@@ -305,6 +311,25 @@ struct Fields {
     /// A hidden field: its label (you're asked for the value), or label=value
     #[arg(long)]
     concealed: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Add the security key plugged in (asks for the password once; the key needs a PIN)
+    Add {
+        /// What to call it, e.g. "blue yubikey"
+        name: String,
+    },
+    /// The security keys added on this computer
+    Ls,
+    /// Stop a security key unlocking this computer
+    Remove {
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Every key, even if the list of them is damaged
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -546,7 +571,7 @@ fn run(cli: Cli) -> Res<()> {
                      (if it keeps failing, the server's PLAINTEXT_URL may not match the address you use)"
                 )
             })?;
-            state::remember(&cfg, &s)?;
+            state::remember(&cfg, &s, false)?;
             say!("Welcome, {username}.{}", if s.admin { " You're this server's admin." } else { "" });
             say!("Your Secret Key is saved on this computer.\nYour fingerprint: {}", s.me().fingerprint());
             // Checked after the account exists, so a mismatch never costs the Secret Key.
@@ -566,8 +591,13 @@ fn run(cli: Cli) -> Res<()> {
             state::save_config(&cfg)?;
             say!("Signed in as {} until you run `plaintext lock` (or 12 hours pass).", s.username());
         }
+        Cmd::Unlock => {
+            let s = state::open()?;
+            say!("Unlocked as {} in this terminal until you run `plaintext lock` (or 12 hours pass).", s.username());
+        }
+        Cmd::Key(k) => key_cmd(k)?,
         Cmd::Lock => {
-            state::forget(&state::load_config()?);
+            state::forget(&state::load_config()?, false);
             say!("Locked.");
         }
         Cmd::Whoami => {
@@ -869,7 +899,11 @@ fn run(cli: Cli) -> Res<()> {
             let old = Zeroizing::new(rpassword::prompt_password("Current password: ")?);
             let new = password_twice()?;
             s.change_password(&plaintext_client::plaintext_core::crypto::derive(&old, &sk), &sk, &new)?;
-            state::forget(&cfg);
+            // Security keys keep working, after the new password once.
+            for k in seckey::load(&cfg).map(|k| k.keys).unwrap_or_default() {
+                let _ = s.end_session(&k.session);
+            }
+            state::forget(&cfg, true);
             say!("Password changed. Other devices need to sign in again.");
         }
         Cmd::Sessions { end } => {
@@ -890,6 +924,63 @@ fn run(cli: Cli) -> Res<()> {
             show(&item, "a share link");
         }
         Cmd::Mcp => mcp::serve()?,
+    }
+    Ok(())
+}
+
+fn key_cmd(k: KeyCmd) -> Res<()> {
+    let cfg = state::load_config()?;
+    match k {
+        KeyCmd::Add { name } => {
+            let ask = &mut |m: &str| Ok(Zeroizing::new(rpassword::prompt_password(m)?));
+            seckey::add(&cfg, &mut seckey::Hid::default(), &name, ask)?;
+            say!("Added {name}. In a new terminal, `plaintext unlock` (or any command) now asks for its PIN and a touch instead of your password.");
+            say!("Your password still works without it, and a new device still needs your password and Secret Key.");
+        }
+        KeyCmd::Ls => {
+            let keys = seckey::load(&cfg)?.keys;
+            if keys.is_empty() {
+                say!("No security keys on this computer for {}. `plaintext key add` adds the one plugged in.", cfg.name());
+            }
+            for k in keys {
+                say!("{}", k.name);
+            }
+        }
+        KeyCmd::Remove { name, all } => {
+            let ended: Vec<String> = match name {
+                Some(name) => {
+                    let k = seckey::remove(&cfg, &name)?;
+                    say!("Removed {name} from this computer.");
+                    vec![k.session]
+                }
+                None => {
+                    let ids = match seckey::load(&cfg) {
+                        Ok(k) => k.keys.into_iter().map(|k| k.session).collect(),
+                        Err(_) => {
+                            note!("Their sessions can't be told apart; end the \"(security key: …)\" ones with `plaintext sessions --end ID`.");
+                            vec![]
+                        }
+                    };
+                    seckey::clear(&cfg)?;
+                    say!("Removed every security key from this computer.");
+                    ids
+                }
+            };
+            // End their server sessions too (unlocking first if nothing here can);
+            // the copies that held them are gone either way.
+            if !state::end_sessions(&cfg, ended.clone()) && !(state::open().is_ok() && state::end_sessions(&cfg, ended)) {
+                note!("Couldn't end their sessions on the server; they end on their own within 30 days, or with `plaintext sessions --end ID`.");
+                if !all && seckey::load(&cfg).is_ok_and(|k| k.keys.is_empty()) {
+                    // A keyed session left here can only be the removed key's: let `lock` end it.
+                    state::unkey(&cfg);
+                }
+            }
+            if all {
+                // Whatever this terminal runs on may be a key's that's gone now (or unknown, if the list was damaged).
+                state::forget(&cfg, true);
+                say!("This terminal is locked.");
+            }
+        }
     }
     Ok(())
 }
@@ -928,7 +1019,8 @@ fn account_cmd(a: AccountCmd) -> Res<()> {
             }
             s.delete_account(&plaintext_client::plaintext_core::crypto::derive(&pw, &sk))?;
             let _ = std::fs::remove_dir_all(state::snapshot_dir(&s));
-            state::remove_account(&cfg)?;
+            let _ = seckey::clear(&cfg); // remove_account retries and reports it; the server ended their sessions with the account
+            state::remove_account(&cfg).map_err(|e| format!("deleted {} on the server, but couldn't forget it on this computer ({e}); run `plaintext account remove {}`", cfg.name(), cfg.name()))?;
             println!("Deleted {} and forgot it on this computer.", cfg.name());
         }
     }
