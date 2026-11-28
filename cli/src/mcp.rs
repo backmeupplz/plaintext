@@ -93,7 +93,11 @@ fn spellings(secret: &str, username: &str) -> Vec<String> {
 }
 
 fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
-    s.sync()?;
+    // A change held back (a full account, a race) waits, as in the CLI; the rest still work.
+    match s.sync() {
+        Err(e) if e.held_back() => {}
+        r => r?,
+    }
     let vault = arg(a, "vault").map(|v| s.vault(v)).transpose()?;
     Ok(match name {
         "list_vaults" => {
@@ -103,7 +107,11 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
                 .values()
                 .map(|v| json!({"name": v.meta.name, "role": v.role(&me, now()), "items": v.items().count()}))
                 .collect();
-            serde_json::to_string_pretty(&v)?
+            let mut out = serde_json::to_string_pretty(&v)?;
+            for p in &s.problems {
+                out.push_str(&format!("\nwarning: {}", crate::clean(p)));
+            }
+            out
         }
         "search_items" => {
             let hits: Vec<Value> = match arg(a, "query") {
@@ -177,7 +185,16 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
                 ..Default::default()
             };
             let reference = format!("pt://{}/{}/password", s.vaults[&vid].meta.name, item.title);
-            s.put_item(&vid, new_id(), item)?;
+            let iid = new_id();
+            if let Err(e) = s.put_item(&vid, iid, item) {
+                // Take a refused item back out, or a retry would queue it twice (as the app does).
+                if let Some(v) = s.vaults.get_mut(&vid)
+                    && v.get(&iid).is_some()
+                {
+                    v.delete(iid);
+                }
+                return Err(e.into());
+            }
             state::save(s)?;
             format!("Saved. The password is available as {reference}")
         }

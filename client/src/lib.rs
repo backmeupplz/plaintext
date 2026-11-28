@@ -43,6 +43,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The server didn't take a vault's change this time: another device changed
+    /// it first (409), it was too big (413: for one request, or for every member's
+    /// next pull, `api::MAX_PUSH`) or the account is full (507).
+    /// The change waits on the device for the next sync.
+    pub fn held_back(&self) -> bool {
+        matches!(self, Error::Server(409 | 413 | 507, _))
+    }
+}
 impl From<plaintext_core::Error> for Error {
     fn from(e: plaintext_core::Error) -> Self {
         Error::Core(e)
@@ -50,6 +60,21 @@ impl From<plaintext_core::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What `Session::import` saved. Its items are on this device even when an error is set.
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub items: usize,
+    /// Attachments left out ("item title: file name") after `upload_error`.
+    pub skipped: Vec<String>,
+    pub upload_error: Option<Error>,
+    /// The first push that failed; the items go out with the next sync.
+    pub sync_error: Option<Error>,
+}
+
+/// Past this many bytes of items (and manifest), a push or key rotation stages its
+/// items in parts of about this size, well under the server's 32 MiB request limit.
+const STAGE_PAST: usize = 16 << 20;
 
 /// An inbox message as opened, or why it couldn't be.
 pub type Received = std::result::Result<(Message, Content), plaintext_core::Error>;
@@ -142,7 +167,11 @@ impl Transport for Http {
         let req = req.body(body.unwrap_or_default()).map_err(|e| Error::Network(e.to_string()))?;
         let mut resp = self.agent.run(req).map_err(|e| Error::Network(e.to_string()))?;
         let status = resp.status().as_u16();
-        let bytes = resp.body_mut().with_config().limit(128 << 20).read_to_vec().map_err(|e| Error::Network(e.to_string()))?;
+        let bytes = resp.body_mut().with_config().limit(128 << 20).read_to_vec().map_err(|e| match e {
+            // Like a vault too big to pull: that vault waits, the others still sync.
+            ureq::Error::BodyExceedsLimit(_) => Error::Server(413, "the server's answer is bigger than this app takes in one go".into()),
+            e => Error::Network(e.to_string()),
+        })?;
         Ok((status, bytes))
     }
 
@@ -320,41 +349,63 @@ impl<T: AsyncTransport> Session<T> {
         }
         self.problems.clear();
         self.unsendable.clear();
-        // A vault whose account is out of storage keeps its unpushed changes and
+        // A vault whose account is out of storage (507) keeps its unpushed changes and
         // reports the error at the end, without holding up the other vaults. So does
-        // a member removal another device raced, or one too big to send; the next sync retries.
+        // a member removal another device raced, or one too big to send (413); the next sync retries.
         let mut full = None;
+        let mut failed = vec![];
         for id in &acct.vaults {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
             match self.sync_and_tidy(id).await {
                 // Best effort: an older server or a role that changed mid-run just means next time.
                 Ok(()) => drop(self.collect_files_async(id, 0).await),
-                // Every 409 and 413 comes after a pull, so collecting is still safe, and
-                // over quota it's what makes room for the refused change.
-                Err(e @ Error::Server(409 | 413, _)) => {
+                // Every held-back change comes after a pull, so collecting is still safe, and
+                // over quota it's what makes room for the refused change (though another
+                // device may collect that change's own uploads meanwhile; DESIGN "Attachments").
+                Err(e) if e.held_back() => {
                     drop(self.collect_files_async(id, 0).await);
-                    full = Some(e);
+                    // A 409 is worth retrying soon, so it's the one reported.
+                    if !matches!(full, Some(Error::Server(409, _))) {
+                        full = Some(e);
+                    }
                 }
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
-                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
-                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
+                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
+                    // A vault opened before keeps its name, though it may never open again.
+                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| (v.meta.name.clone(), v.creator.clone()));
+                    let read_only = matches!(e, Error::Core(plaintext_core::Error::ReadOnly));
                     // One reset while unlisted keeps its guard for the next try.
                     if known.is_none()
                         && let Some(v) = self.vaults.remove(id).filter(|v| v.counter > 0)
                     {
                         self.hidden.insert(*id, v);
                     }
-                    let name = known.unwrap_or_else(|| id.to_string());
-                    // Only pending changes make a reader's push fail.
-                    let hint = if matches!(e, Error::Core(plaintext_core::Error::ReadOnly)) {
-                        self.unsendable.push(*id);
-                        ", so this device's changes to it can't be sent"
-                    } else {
-                        ""
-                    };
-                    self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
+                    match known {
+                        // Your own vault: a server serving an old copy mustn't talk you into deleting it.
+                        // Nor does a change you can't send (you only read the vault) need you to
+                        // leave; the vault itself synced, so it's named below if you pay for it.
+                        Some((name, creator)) if creator == self.keyring.username || read_only => {
+                            // Only pending changes make a reader's push fail.
+                            let hint = if read_only {
+                                self.unsendable.push(*id);
+                                ", so this device's changes to it can't be sent"
+                            } else {
+                                ""
+                            };
+                            self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"))
+                        }
+                        k => {
+                            let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
+                            let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
+                            // The app drops a trailing " (plaintext …" hint.
+                            self.problems.push(format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"));
+                        }
+                    }
+                    if !read_only {
+                        failed.push(*id);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -363,6 +414,27 @@ impl<T: AsyncTransport> Session<T> {
             let name = if v.meta.name.is_empty() { id.to_string() } else { v.meta.name.clone() };
             self.problems.push(format!("vault {name} isn't listed for you any more, so this device's changes to it can't be sent unless it's shared with you again"));
             self.unsendable.push(*id);
+        }
+        // Someone can make you an owner and leave, and the vault counts against you
+        // from then on (DESIGN "Leaving"). Name every vault you pay for: one you aren't a
+        // current member of always, one you can open but didn't create only while storage
+        // is limited (or a vault you took over on purpose would be named on every sync for
+        // nothing). One that failed is named above.
+        for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
+            match self.vaults.get(id).filter(|v| v.roster.is_some()) {
+                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
+                Some(v) => self.problems.push(format!(
+                    "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
+                    v.meta.name, v.creator
+                )),
+                None => {
+                    // The name this device last saw, if it kept the vault (`hidden`).
+                    let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
+                    self.problems.push(format!(
+                        "vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
+                    ))
+                }
+            }
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
@@ -381,7 +453,11 @@ impl<T: AsyncTransport> Session<T> {
 
     async fn pull_async(&mut self, id: &Hex) -> Result<()> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE).await?;
+        let resp: VaultResponse = match self.call_async("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE).await {
+            // Waiting won't make it smaller: report this vault, sync the others.
+            Err(Error::Server(413, m)) => return Err(Error::Refused(format!("too big to pull ({m})"))),
+            r => r?,
+        };
         let v = self.vaults.get_mut(id).expect("checked above");
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
         self.gone.insert(*id, resp.gone);
@@ -501,7 +577,9 @@ impl<T: AsyncTransport> Session<T> {
                 return Ok(());
             }
             let put = v.push(&me, now())?;
-            match raw_async(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))).await {
+            let wire = self.staged_async(id, &put).await?;
+            let body = serde_json::to_vec(wire.as_ref().unwrap_or(&put)).expect("serializable");
+            match raw_async(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(body)).await {
                 Ok(_) => {
                     self.vaults.get_mut(id).expect("exists").pushed(&put);
                     return Ok(());
@@ -511,6 +589,48 @@ impl<T: AsyncTransport> Session<T> {
             }
         }
         Err(Error::Server(409, "the vault kept changing; try again".into()))
+    }
+
+    /// `put` as it goes on the wire. Items too big for one request go to the
+    /// server's staging area first, in parts, and the returned push commits them.
+    async fn staged_async(&self, vault: &Hex, put: &VaultPut) -> Result<Option<VaultPut>> {
+        let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
+        if items > MAX_PUSH {
+            // The server would refuse it after every part was sent (as if it had said so).
+            return Err(Error::Server(413, "not sent: more items than a device can pull in one go; push fewer at a time".into()));
+        }
+        if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
+            return Ok(None);
+        }
+        let stage = plaintext_core::new_item_id();
+        let (mut part, mut bytes) = (Vec::new(), 0);
+        for (i, u) in put.upserts.iter().enumerate() {
+            part.push(u.clone());
+            bytes += u.blob.0.len();
+            let next = put.upserts.get(i + 1).map_or(usize::MAX, |n| n.blob.0.len());
+            if bytes.saturating_add(next) > STAGE_PAST {
+                let req = StageRequest { stage, upserts: std::mem::take(&mut part) };
+                self.call_async::<()>("POST", &format!("/v1/vaults/{vault}/stage"), Some(&req)).await?;
+                bytes = 0;
+            }
+        }
+        Ok(Some(VaultPut {
+            expected_counter: put.expected_counter,
+            manifest: put.manifest.clone(),
+            upserts: vec![],
+            deletes: put.deletes.clone(),
+            staged: Some(Staged { id: stage, count: put.upserts.len() as u64 }),
+        }))
+    }
+
+    /// Sends a roster change, staging a key rotation's items if they're too big.
+    async fn post_roster_async(&self, id: &Hex, mut update: RosterUpdate) -> Result<()> {
+        if let Some(r) = &update.rotation
+            && let Some(wire) = self.staged_async(id, r).await?
+        {
+            update.rotation = Some(wire);
+        }
+        self.call_async("POST", &format!("/v1/vaults/{id}/roster"), Some(&update)).await
     }
 
     /// Removes `who` (if given) with a new vault key. Members whose access expired,
@@ -536,7 +656,7 @@ impl<T: AsyncTransport> Session<T> {
             return Ok(());
         }
         let update = v.revoke(&self.me(), &out, now())?;
-        self.call_async::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update)).await?;
+        self.post_roster_async(id, update).await?;
         self.pull_async(id).await
     }
 
@@ -846,6 +966,10 @@ impl<T: Transport> Session<T> {
         block_on(self.remove_members_async(id, who))
     }
 
+    fn post_roster(&self, id: &Hex, update: RosterUpdate) -> Result<()> {
+        block_on(self.post_roster_async(id, update))
+    }
+
     /// Fold in this device's own copy of the keyring (saved after the last run):
     /// pins it holds can't be erased by a server serving an older keyring.
     pub fn merge_local_keyring(&mut self, local_blob: &[u8]) -> Result<()> {
@@ -937,36 +1061,21 @@ impl<T: Transport> Session<T> {
     /// the session token alone can't delete an account. Refused while this
     /// account is the only owner of a vault others use.
     pub fn delete_account(&mut self, d: &Derived) -> Result<()> {
+        // A full account (507) or a too-big change (413) can't be sent, so it goes
+        // with the account; a 409 is worth a retry first.
         match self.sync() {
-            Ok(()) | Err(Error::Server(413, _)) => {}
+            Ok(()) | Err(Error::Server(413 | 507, _)) => {}
             Err(e) => return Err(e),
         }
-        let me = self.username().to_string();
         let mut blocking = Vec::new();
-        for v in self.vaults.values() {
-            let Some(r) = &v.roster else { continue };
-            if v.role(&me, now()) != Some(Role::Owner) {
-                continue;
-            }
-            // Who keeps the vault, as the server counts them: current members other
-            // than us, our agents, and disabled or deleted accounts.
-            let gone = self.gone.get(&v.id).map(Vec::as_slice).unwrap_or_default();
-            let mut keepers = Vec::new();
-            for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
-                match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
-                    Err(Error::Server(404, _)) => {}
-                    Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
-                    Ok(_) => keepers.push(m.role),
-                    Err(e) => return Err(e),
-                }
-            }
-            if !keepers.is_empty() && !keepers.contains(&Role::Owner) {
+        for (id, v) in &self.vaults {
+            if self.leaves_ownerless(id)? {
                 blocking.push(v.meta.name.clone());
             }
         }
         if !blocking.is_empty() {
             return Err(Error::Refused(format!(
-                "you're the only owner of {}, which others use: make one of them an owner, or remove them, first",
+                "you're the only owner of {}, which others use: make one of them an owner, remove them, or leave it, first",
                 blocking.join(", ")
             )));
         }
@@ -996,11 +1105,23 @@ impl<T: Transport> Session<T> {
         if !self.keyring.contacts.contains_key(username) {
             self.pin_user(username)?;
         }
-        self.sync_vault(id)?;
+        // A change the server holds back (the account is full) waits; promoting
+        // someone doesn't need it sent first.
+        match self.sync_vault(id) {
+            Err(e) if !e.held_back() => return Err(e),
+            _ => {}
+        }
         self.remove_members(id, None)?;
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        // Members who left have to go first, with a new key, which waits for the unsent changes.
+        if let Some(who) = self.gone.get(id).and_then(|g| g.first()).filter(|_| v.has_changes()) {
+            return Err(Error::Refused(format!(
+                "{who} left {} (or was deleted); its key has to change first, which needs your unsent changes to it sent (make room) or deleted",
+                v.meta.name
+            )));
+        }
         let update = v.grant(&self.me(), &self.keyring, username, role, expires, now())?;
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
+        self.post_roster(id, update)?;
         self.pull(id)?;
         // Record the new roster in the keyring now, so this account's other
         // devices (and new ones) can't be shown the vault from before it.
@@ -1013,6 +1134,44 @@ impl<T: Transport> Session<T> {
         self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         self.remove_members(id, Some(username))?;
         self.save_keyring()
+    }
+
+    /// Whether we're the only owner of vault `id` and others would keep using it
+    /// without us, as the server counts them: current members other than us, our
+    /// agents, and disabled or deleted accounts.
+    pub fn leaves_ownerless(&self, id: &Hex) -> Result<bool> {
+        let me = self.username().to_string();
+        let Some(v) = self.vaults.get(id) else { return Ok(false) };
+        let Some(r) = &v.roster else { return Ok(false) };
+        if v.role(&me, now()) != Some(Role::Owner) {
+            return Ok(false);
+        }
+        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut keepers = Vec::new();
+        for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
+            match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
+                Err(Error::Server(404, _)) => {}
+                Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
+                Ok(_) => keepers.push(m.role),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(!keepers.is_empty() && !keepers.contains(&Role::Owner))
+    }
+
+    /// Stop using a vault, along with your agents. Its owners' devices replace the
+    /// key. The vault is deleted if nobody else uses it; as its only owner, you
+    /// leave the others a vault whose members and key can't change any more.
+    pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
+        let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
+        self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
+        // Kept as a vault this device knows nothing about: unsent changes are
+        // gone, and if someone adds us again it starts afresh.
+        if self.vaults.remove(id).is_some() || self.hidden.contains_key(id) {
+            self.hidden.insert(*id, Vault::new(*id));
+        }
+        self.unsendable.retain(|u| u != id);
+        Ok(())
     }
 
     pub fn audit(&self, id: &Hex) -> Result<Vec<AuditEntry>> {
@@ -1033,44 +1192,91 @@ impl<T: Transport> Session<T> {
 
     /// Save imported items: each source vault goes to our own vault of that name
     /// (made if needed; "Personal" and unnamed ones to the default vault), or all
-    /// to `into`. Attachments are uploaded. Returns how many items were saved.
-    /// Refused before anything changes if we may only read an existing target
-    /// (see `writable`).
+    /// to `into`. Refused before anything is saved if a vault would hold more than
+    /// one pull brings (`api::MAX_PUSH`). Every item goes into this device's copy
+    /// before anything is pushed, so a failed push loses nothing: the report
+    /// carries that error, and the items go out with the next sync. Once an upload
+    /// fails, the remaining attachments are left out and listed. Refused before
+    /// anything changes if we may only read an existing target (see `writable`).
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<usize> {
-        let target = |s: &Self, v: &import::Imported| match into {
-            Some(id) => Ok(Some(id)),
-            None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => s.default_vault().map(Some),
-            None => Ok(s.own_vault(&v.name)),
-        };
-        // Kept, so a pull here that renames a vault can't send items to an unchecked one.
+    pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<ImportReport> {
+        // Where each part goes: a vault we have, or (Err) one to make. Kept, so a
+        // pull here that renames a vault can't send items to an unchecked one.
         let mut targets = Vec::new();
-        for v in &imported {
-            let to = target(self, v)?;
-            if let Some(id) = to
-                && !targets.contains(&to)
+        let mut checked = Vec::new();
+        for v in imported {
+            let to = match into {
+                Some(id) => Ok(id),
+                None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => Ok(self.default_vault()?),
+                None => self.own_vault(&v.name).ok_or(v.name),
+            };
+            if let Ok(id) = to
+                && !checked.contains(&id)
             {
                 self.writable(&id)?;
+                checked.push(id);
             }
-            targets.push(to);
+            targets.push((to, v.items));
         }
-        let mut n = 0;
-        for (v, to) in imported.into_iter().zip(targets) {
-            // A name not found above may be a vault made earlier in this import.
-            let vid = match to.or_else(|| self.own_vault(&v.name)) {
-                Some(id) => id,
-                None => self.create_vault(&v.name)?,
+        // Sealed, an item is padded to 256 bytes plus 41, and each attachment adds
+        // a reference of less than its name plus 256.
+        let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
+        let mut size = BTreeMap::<_, usize>::new();
+        for (to, items) in &targets {
+            let have = || to.as_ref().ok().and_then(|id| self.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
+            let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
+            *size.entry(to.clone().map_err(|n| n.to_ascii_lowercase())).or_insert_with(have) += adds;
+        }
+        if let Some((to, _)) = size.iter().find(|(_, n)| **n > MAX_PUSH) {
+            let name = match to {
+                Ok(id) => self.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
+                Err(name) => name.clone(),
             };
-            for (mut it, files) in v.items {
+            return Err(Error::Refused(format!(
+                "that's more than one vault can hold (64 MiB of items, for {name}): split the file, make a vault for each part and import each part into its own vault"
+            )));
+        }
+        // The vaults first: if one can't be made, nothing is imported yet.
+        let mut made = Vec::new();
+        for (to, items) in targets {
+            let vid = match to {
+                Ok(id) => id,
+                Err(name) => match self.own_vault(&name) {
+                    Some(id) => id,
+                    None => self.create_vault(&name)?,
+                },
+            };
+            made.push((vid, items));
+        }
+        let mut r = ImportReport::default();
+        let mut vids = Vec::new();
+        for (vid, items) in made {
+            for (mut it, files) in items {
                 for (name, bytes) in files {
-                    it.files.push(self.upload_file(&vid, &name, &bytes)?);
+                    if r.upload_error.is_none() {
+                        match self.upload_file(&vid, &name, &bytes) {
+                            Ok(f) => {
+                                it.files.push(f);
+                                continue;
+                            }
+                            Err(e) => r.upload_error = Some(e),
+                        }
+                    }
+                    r.skipped.push(format!("{}: {name}", it.title));
                 }
                 self.vaults.get_mut(&vid).ok_or(Error::NotFound("vault".into()))?.put(plaintext_core::new_item_id(), it);
-                n += 1;
+                r.items += 1;
             }
-            self.sync_vault(&vid)?;
+            if !vids.contains(&vid) {
+                vids.push(vid);
+            }
         }
-        Ok(n)
+        for vid in &vids {
+            if let Err(e) = self.sync_vault(vid) {
+                r.sync_error.get_or_insert(e);
+            }
+        }
+        Ok(r)
     }
 
     // ---------- Files ----------

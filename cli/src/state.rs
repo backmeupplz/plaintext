@@ -283,12 +283,18 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
 /// device got there first) instead of failing every command over it.
 fn sync(s: &mut S) -> Result<(), Error> {
     match s.sync() {
-        Err(e @ Error::Server(409 | 413, _)) => {
-            eprintln!("warning: {e}");
-            Ok(())
-        }
-        r => r,
+        Err(e) if e.held_back() => eprintln!("warning: {e}"),
+        r => r?,
     }
+    for p in &s.problems {
+        eprintln!("plaintext: warning: {}", crate::clean(p));
+    }
+    // By id: anyone who may write can name a vault anything.
+    for id in &s.unsendable {
+        let name = s.vaults.get(id).or(s.hidden.get(id)).map_or("", |v| &v.meta.name);
+        eprintln!("plaintext: warning: to see or drop the unsent changes to vault {}, run plaintext vault reset {id}", crate::clean(name));
+    }
+    Ok(())
 }
 
 /// An unlocked, synced session: an agent from `PLAINTEXT_AGENT_KEY`, or the
@@ -315,14 +321,6 @@ pub fn open() -> Res<S> {
             sync(&mut s)?;
         }
         r => r?,
-    }
-    for p in &s.problems {
-        eprintln!("plaintext: warning: {}", crate::clean(p));
-    }
-    // By id: anyone who may write can name a vault anything.
-    for id in &s.unsendable {
-        let name = s.vaults.get(id).or(s.hidden.get(id)).map_or("", |v| &v.meta.name);
-        eprintln!("plaintext: warning: to see or drop the unsent changes to vault {}, run plaintext vault reset {id}", crate::clean(name));
     }
     save(&s)?;
     Ok(s)

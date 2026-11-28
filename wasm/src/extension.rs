@@ -233,7 +233,8 @@ pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<String>, 
     let mut problems = s.problems.clone();
     match r {
         Ok(()) => {}
-        Err(Error::Server(413, msg)) => problems.push(format!("A change is kept on this device until there's room: {msg}")),
+        Err(Error::Server(507, msg)) => problems.push(format!("A change is kept on this device until there's room: {msg}")),
+        Err(Error::Server(413, msg)) => problems.push(format!("A change is kept on this device, but it's too big to send: {msg}")),
         Err(Error::Server(409, msg)) => problems.push(format!("A change is kept on this device and sent at the next sync: {msg}")),
         Err(e) => return Err(e),
     }

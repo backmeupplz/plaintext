@@ -338,6 +338,8 @@ enum VaultCmd {
     },
     /// Remove someone and replace the vault key
     Revoke { vault: String, user: String },
+    /// Stop using a vault (your agents leave it too), even one this device can't open (give its full id); deletes it if nobody else uses it
+    Leave { vault: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
     /// Show this device's changes to a vault that haven't reached the server;
@@ -805,7 +807,7 @@ fn run(cli: Cli) -> Res<()> {
                 // The server refused the item, so nothing lists the file: don't leave
                 // it behind. After a network error or a proxy's 5xx the push may have
                 // landed; a later sync collects the file if it didn't.
-                if matches!(e, plaintext_client::Error::Server(400..=499, _)) {
+                if matches!(e, plaintext_client::Error::Server(400..=499 | 507, _)) {
                     let _ = s.delete_file(&vid, &fid);
                 }
                 return Err(e.into());
@@ -823,6 +825,10 @@ fn run(cli: Cli) -> Res<()> {
             say!("Saved {out}.");
         }
         Cmd::Import { format, file, vault } => {
+            // Agents keep nothing on the device, so a refused push would lose the import.
+            if std::env::var("PLAINTEXT_AGENT_KEY").is_ok() {
+                return Err("agents can't import; import as yourself and share the vault with the agent".into());
+            }
             let mut s = state::open()?;
             let data = std::fs::read(&file)?;
             let imported = match format.as_str() {
@@ -831,9 +837,24 @@ fn run(cli: Cli) -> Res<()> {
                 _ => import::csv(&String::from_utf8_lossy(&data))?,
             };
             let into = vault.as_deref().map(|v| s.vault(v)).transpose()?;
-            let n = s.import(imported, into)?;
+            let r = s.import(imported, into)?;
+            let n = r.items;
             state::save(&s)?;
-            say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
+            if let Some(e) = r.upload_error {
+                eprintln!("warning: {e}");
+                say!("These attachments weren't uploaded; add them with `plaintext attach ITEM FILE`:");
+                for f in &r.skipped {
+                    say!("  {f}");
+                }
+            }
+            if let Some(e) = r.sync_error {
+                return Err(format!("{e}\nThe {n} items are saved on this device and go to the server with the next sync; don't import {file} again.").into());
+            }
+            if r.skipped.is_empty() {
+                say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
+            } else {
+                say!("Imported {n} items. Delete {file} once the attachments above are in: it holds your passwords unencrypted.");
+            }
         }
         Cmd::Export { vault } => {
             let s = state::open()?;
@@ -965,6 +986,31 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             let id = s.vault(&vault)?;
             s.revoke(&id, &user)?;
             say!("Removed {user} and replaced the vault key.");
+        }
+        VaultCmd::Leave { vault } => {
+            // Also a vault this device can't open (sync names it by its full id),
+            // or one only an agent of yours is in.
+            let (id, known) = match s.vault(&vault) {
+                Ok(id) => (id, s.vaults[&id].roster.is_some()),
+                Err(e) => (vault.parse::<Hex>().map_err(|_| e)?, false),
+            };
+            let (what, name) = if known { ("name", s.vaults[&id].meta.name.clone()) } else { ("full id", id.to_string()) };
+            println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
+            if s.leaves_ownerless(&id)? {
+                println!("You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.");
+            }
+            if s.vaults.get(&id).or(s.hidden.get(&id)).is_some_and(|v| v.has_changes()) {
+                println!("Changes to it that haven't reached the server yet are lost.");
+            }
+            print!("Type the vault's {what} ({name}) to confirm: ");
+            std::io::stdout().flush()?;
+            let mut typed = String::new();
+            std::io::stdin().read_line(&mut typed)?;
+            if typed.trim() != name {
+                return Err(format!("that's not the vault's {what}; you're still in it").into());
+            }
+            s.leave_vault(&id)?;
+            say!("Left {vault}.");
         }
         VaultCmd::Audit { vault } => {
             let id = s.vault(&vault)?;

@@ -388,8 +388,10 @@ fun ImportScreen() {
         model.act {
             try {
                 val bytes = withContext(Dispatchers.IO) { context.contentResolver.openInputStream(uri)?.use { it.readBytes() } } ?: throw UserError("Couldn't read that file.")
-                done = model.call { it.importItems(a, f, bytes, null) }.toInt()
+                val r = model.call { it.importItems(a, f, bytes, null) }
                 bytes.fill(0)
+                done = r.items.toInt()
+                error = r.warning
                 model.reload()
             } catch (e: Exception) { error = errorText(e) } finally { busy = false }
         }

@@ -417,7 +417,9 @@ struct ImportView: View {
         Task {
             defer { busy = false }
             do {
-                done = try await model.call { try $0.importItems(account: a, format: f, data: data, vault: v) }
+                let r = try await model.call { try $0.importItems(account: a, format: f, data: data, vault: v) }
+                done = r.items
+                error = r.warning
                 model.reload()
             } catch { self.error = errorText(error) }
         }
