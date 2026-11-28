@@ -31,8 +31,9 @@ jobs:
           mkdir -p "$ci" && cd "$ci"
           rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
           [ -d src/.git ] || git init -q src
-          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
-          git -C src checkout -q -f FETCH_HEAD
+          git -C src cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null ||
+            git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f "$GITHUB_SHA"
           git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
           export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
           [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy

@@ -30,8 +30,9 @@ jobs:
           mkdir -p "$ci" && cd "$ci"
           rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
           [ -d src/.git ] || git init -q src
-          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
-          git -C src checkout -q -f FETCH_HEAD
+          git -C src cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null ||
+            git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f "$GITHUB_SHA"
           git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
           export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
           [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
@@ -60,8 +61,9 @@ jobs:
           mkdir -p "$ci" && cd "$ci"
           rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
           [ -d src/.git ] || git init -q src
-          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
-          git -C src checkout -q -f FETCH_HEAD
+          git -C src cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null ||
+            git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f "$GITHUB_SHA"
           git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
           export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
           [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
@@ -75,13 +77,34 @@ jobs:
           wasm/build.sh
           git status --porcelain docs/s
           test -z "$(git status --porcelain docs/s)" || { echo "Run wasm/build.sh and commit docs/s/"; exit 1; }
+
+  extension:
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Sources and Rust
+        run: |
+          ci="${PWD%%/work/*}/ci/plaintext"
+          mkdir -p "$ci" && cd "$ci"
+          rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
+          [ -d src/.git ] || git init -q src
+          git -C src cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null ||
+            git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f "$GITHUB_SHA"
+          git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
+          export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update >/dev/null
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nSRC=%s\n' "$CARGO_HOME" "$RUSTUP_HOME" "$ci/src" >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       # The extension's core, driven under Node through the extension's own
       # fetch glue against a real server; then both packages, linted as AMO does.
       - name: Extension
         working-directory: ${{ env.SRC }}
         run: |
           wasm/build.sh extension
-          PLAINTEXT_REQUIRE_PKG=1 cargo test --locked -p plaintext-wasm --test extension
+          PLAINTEXT_REQUIRE_PKG=1 cargo test --locked --test extension # the workspace's features: reuses what check built
           python3 extension/package.py
           npx --yes web-ext@10.8.0 lint --source-dir extension/dist/firefox --self-hosted
 
