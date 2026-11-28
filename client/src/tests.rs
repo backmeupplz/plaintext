@@ -2366,18 +2366,19 @@ fn over_the_quota_a_big_push_goes_whole() {
 }
 
 /// Over the quota a push must remove items, so a delete that removes nothing is
-/// refused: one the server already has (another device deleted the same item)
-/// is dropped on the pull, and an addition deleted before it went out leaves
-/// nothing to send. Neither holds up the owner taking access away.
+/// refused. A pull drops one the server has done already (another device deleted
+/// the same item, or one this device was editing), and one of an addition the
+/// server refused. Neither holds up the owner taking access away.
 #[test]
 fn over_the_quota_deletes_the_server_has_done_are_dropped() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
     let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
     roomy.sync().unwrap();
     let v = roomy.default_vault().unwrap();
-    let a = plaintext_core::new_item_id();
+    let (a, b) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
     roomy.put_item(&v, a, item("A", "a")).unwrap();
-    roomy.put_item(&v, plaintext_core::new_item_id(), item("B", "b")).unwrap();
+    roomy.put_item(&v, b, item("B", "b")).unwrap();
+    roomy.put_item(&v, plaintext_core::new_item_id(), item("C", "c")).unwrap();
     let _ = join(Http::new(&url), "bob", "bob pw", None, "t");
     roomy.share_vault(&v, "bob", Role::Writer, None).unwrap();
     let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
@@ -2385,13 +2386,18 @@ fn over_the_quota_deletes_the_server_has_done_are_dropped() {
     let mut d2 = login(&full, "alice pw", &ask);
     d1.sync().unwrap();
     d2.sync().unwrap();
+    // Offline, d2 deletes a and edits b; d1 deletes both.
     d2.vaults.get_mut(&v).unwrap().delete(a);
+    d2.vaults.get_mut(&v).unwrap().put(b, item("B", "b2"));
     d1.delete_item(&v, a).unwrap();
-    d2.sync().unwrap();
+    d1.delete_item(&v, b).unwrap();
+    // b's edit brings it back, which needs room; deleting it too is done.
+    assert!(d2.sync().is_err());
+    d2.delete_item(&v, b).unwrap();
     assert!(!d2.vaults[&v].has_changes());
     let x = plaintext_core::new_item_id();
-    d2.vaults.get_mut(&v).unwrap().put(x, item("X", "x"));
-    d2.vaults.get_mut(&v).unwrap().delete(x);
+    assert!(d2.put_item(&v, x, item("X", "x")).is_err());
+    d2.delete_item(&v, x).unwrap();
     assert!(!d2.vaults[&v].has_changes());
     d2.revoke(&v, "bob").unwrap();
     let _ = std::fs::remove_file(&path);

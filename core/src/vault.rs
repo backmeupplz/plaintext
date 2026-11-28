@@ -193,8 +193,13 @@ impl Vault {
     fn mark_base(&mut self, id: Hex) {
         // Nothing pending: the local copies are the server's as of the last
         // manifest, so the `base`s set from here on are exact (even in a snapshot
-        // from an older app).
-        self.exact_base |= self.dirty.is_empty() && self.deleted.is_empty();
+        // from an older app, whose leftover ones go).
+        if self.dirty.is_empty() && self.deleted.is_empty() {
+            self.exact_base = true;
+            self.base.clear();
+            self.base_content.clear();
+            self.base_files.clear();
+        }
         if let Some(e) = self.entries.get(&id)
             && !self.dirty.contains(&id)
             && !self.deleted.contains(&id)
@@ -214,15 +219,9 @@ impl Vault {
 
     pub fn delete(&mut self, id: Hex) {
         self.mark_base(id);
-        // An addition never sent (no server copy, never sealed for a push) has
-        // nothing to delete on the server: over the quota such a delete would
-        // remove nothing and be refused.
-        let unsent = self.dirty.contains(&id) && !self.base.contains_key(&id) && self.entries.get(&id).is_some_and(|e| e.blob.is_empty());
         self.entries.remove(&id);
         self.dirty.remove(&id);
-        if !unsent {
-            self.deleted.insert(id);
-        }
+        self.deleted.insert(id);
     }
 
     /// Of the files the server lists for this vault, the ones to delete: no item
@@ -468,6 +467,7 @@ impl Vault {
             self.versions = versions;
             self.creator = creator;
             self.owner_signed = owner_signed;
+            self.drop_done_deletes();
             return Ok(kr_changed);
         };
         // Demotion and removal replace the key, so anything under the current
@@ -566,16 +566,6 @@ impl Vault {
                 self.base_files.remove(&id);
             }
         }
-        // A delete the server already has (another device deleted it too, or our
-        // own push whose answer was lost) is done: sent again it would remove
-        // nothing, which over the quota is refused.
-        let done: Vec<Hex> = self.deleted.iter().filter(|id| !m.items.contains_key(id)).copied().collect();
-        for id in done {
-            self.deleted.remove(&id);
-            self.base.remove(&id);
-            self.base_content.remove(&id);
-            self.base_files.remove(&id);
-        }
         // Every pending change now starts from the server's copy: a partial push
         // lists it so. One the server dropped (deleted elsewhere) gets an empty
         // `base`: a partial push leaves it out, and if it comes back it's a change
@@ -591,6 +581,7 @@ impl Vault {
             }
         }
         self.exact_base = true;
+        self.drop_done_deletes();
         for (id, mut item) in conflicts {
             // The server serves this version under `id` until our edit is pushed.
             self.base_files.entry(id).or_default().extend(item.file_ids());
@@ -609,6 +600,25 @@ impl Vault {
         self.counter = counter;
         self.last = last;
         Ok(kr_changed)
+    }
+
+    /// Right after a pull: a pending delete of an item the server doesn't have
+    /// (another device deleted it too, or it was added here and never stored)
+    /// would remove nothing, which over the quota is refused, so it's done. With
+    /// exact `base`s that's one with no `base` or an empty one. A push whose answer
+    /// was lost moved the server's counter on, so that pull brought its manifest
+    /// and gave its items a `base`.
+    fn drop_done_deletes(&mut self) {
+        if !self.exact_base {
+            return;
+        }
+        let done: Vec<Hex> = self.deleted.iter().filter(|id| self.base.get(id).is_none_or(|b| b.0.is_empty())).copied().collect();
+        for id in done {
+            self.deleted.remove(&id);
+            self.base.remove(&id);
+            self.base_content.remove(&id);
+            self.base_files.remove(&id);
+        }
     }
 
     /// The next manifest: its signed envelope and its sealed part.

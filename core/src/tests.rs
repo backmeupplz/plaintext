@@ -1047,18 +1047,20 @@ fn partial_push_leaves_out_an_item_deleted_elsewhere() {
     assert_eq!(titles(&vb), ["x=px2"]);
 }
 
-/// A delete that would remove nothing isn't sent (over the quota it's refused):
-/// one the server already has is done once pulled, and an addition deleted
-/// before it went out was never there. One sealed for a push whose answer was
-/// lost may be there, so it still goes out.
+/// A pending delete of an item the server doesn't have would remove nothing
+/// (over the quota it's refused), so a pull drops it: one another device deleted
+/// too, one of an edit to an item deleted elsewhere, and one of an addition never
+/// stored (even one sealed for a push the server refused). One whose push may
+/// have been stored (its answer lost) still goes out.
 #[test]
 fn deletes_of_items_the_server_lacks_are_dropped() {
     let (mut a, _) = pair();
     let me = a.me();
     let (mut va, nv) = Vault::create(&me, "Shared").unwrap();
     let mut log = Log::new(&nv);
-    let x = new_item_id();
+    let (x, y) = (new_item_id(), new_item_id());
     va.put(x, login("x", "px"));
+    va.put(y, login("y", "py"));
     let p = va.push(&me, 0).unwrap();
     va.pushed(&p);
     log.put(&p);
@@ -1066,19 +1068,29 @@ fn deletes_of_items_the_server_lacks_are_dropped() {
     vb.apply(&log.full("alice"), &mut a, 0).unwrap();
     va.delete(x);
     vb.delete(x);
+    va.put(y, login("y", "py2"));
+    vb.delete(y);
     let pb = vb.push(&me, 0).unwrap();
     vb.pushed(&pb);
     log.put(&pb);
     va.apply(&delta(&log, &pb), &mut a, 0).unwrap();
-    assert!(!va.has_changes());
-    let y = new_item_id();
-    va.put(y, login("y", "py"));
+    assert_eq!(va.changes(), 1, "x's delete is done; y's edit stays");
     va.delete(y);
+    let w = new_item_id();
+    va.put(w, login("w", "pw"));
+    let _refused = va.push(&me, 0).unwrap();
+    va.delete(w);
+    assert_eq!(va.changes(), 2);
+    let idle = VaultResponse { counter: log.manifests.len() as u64, ..Default::default() };
+    va.apply(&idle, &mut a, 0).unwrap();
     assert!(!va.has_changes());
     let z = new_item_id();
     va.put(z, login("z", "pz"));
-    let _lost = va.push(&me, 0).unwrap();
+    let lost = va.push(&me, 0).unwrap();
+    log.put(&lost);
+    va.put(z, login("z", "pz2"));
     va.delete(z);
+    va.apply(&delta(&log, &lost), &mut a, 0).unwrap();
     assert_eq!(va.push(&me, 0).unwrap().deletes, [z]);
 }
 
