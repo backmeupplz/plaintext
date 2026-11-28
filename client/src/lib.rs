@@ -428,7 +428,7 @@ impl<T: AsyncTransport> Session<T> {
                     v.meta.name, v.creator
                 )),
                 None => {
-                    // The name this device last saw, if it still keeps the vault's changes.
+                    // The name this device last saw, if it kept the vault (`hidden`).
                     let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
                     self.problems.push(format!(
                         "vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
