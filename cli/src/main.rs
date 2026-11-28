@@ -989,10 +989,15 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
         }
         VaultCmd::Reset { vault } => {
             let id = s.vault(&vault)?;
+            // They may exist nowhere else: say which, so they can be saved elsewhere.
+            let titles: Vec<String> = s.vaults[&id].changed().map(|(_, i)| i.title.clone()).collect();
             match s.discard_changes(&id)? {
                 0 => say!("{vault} has no unsent changes on this device."),
                 1 => say!("Dropped 1 unsent change to {vault}."),
                 n => say!("Dropped {n} unsent changes to {vault}."),
+            }
+            if !titles.is_empty() {
+                say!("Items whose unsent versions were dropped: {}", titles.join(", "));
             }
         }
     }

@@ -1126,7 +1126,7 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     let (url, _) = server();
     let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
     let code = alice.invite().unwrap();
-    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default()), "bob", "bob pw", Some(&code), "phone");
+    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default(), Default::default()), "bob", "bob pw", Some(&code), "phone");
     alice.sync().unwrap();
     let fam = alice.create_vault("Family").unwrap();
     let nid = plaintext_core::new_item_id();
@@ -1193,7 +1193,16 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(false);
     alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
     bob.sync().unwrap();
-    assert!(bob.problems.iter().any(|p| p.ends_with("vault reset \"Renamed offline\"")), "{:?}", bob.problems);
+    assert!(bob.problems.iter().any(|p| p.ends_with(&format!("vault reset {}", &fam.to_string()[..8]))), "{:?}", bob.problems);
+    // The fresh download must be the version his device verified, not an older one.
+    let from_scratch = format!("/v1/vaults/{fam}?since=0&latest=true");
+    let old = bob.t.0.send("GET", &from_scratch, Some(&bob.token), None).unwrap().1;
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Newer", "n")).unwrap();
+    *bob.t.2.borrow_mut() = Some((from_scratch, old));
+    let rollback = bob.discard_changes(&fam);
+    assert!(matches!(rollback, Err(Error::Core(plaintext_core::Error::Rollback))), "{rollback:?}");
+    *bob.t.2.borrow_mut() = None;
+    assert_eq!(bob.vaults[&fam].changes(), 3);
     // A download that fails drops nothing.
     bob.t.1.set(true);
     assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
@@ -1219,13 +1228,19 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(v.items().any(|(_, i)| i.title == "Later"));
 }
 
-/// A transport whose network can be switched off.
-struct Flaky(Http, std::cell::Cell<bool>);
+/// A transport whose network can be switched off, or a GET answered with an old reply.
+struct Flaky(Http, std::cell::Cell<bool>, std::cell::RefCell<Option<(String, Vec<u8>)>>);
 
 impl Transport for Flaky {
     fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
         if self.1.get() {
             return Err(Error::Network("offline".into()));
+        }
+        if let Some((p, bytes)) = &*self.2.borrow()
+            && method == "GET"
+            && path == p
+        {
+            return Ok((200, bytes.clone()));
         }
         self.0.send(method, path, token, body)
     }

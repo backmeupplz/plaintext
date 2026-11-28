@@ -249,6 +249,11 @@ impl Vault {
         self.dirty.len() + self.deleted.len() + usize::from(self.meta_dirty)
     }
 
+    /// Items added or edited here and not pushed yet.
+    pub fn changed(&self) -> impl Iterator<Item = (&Hex, &Item)> {
+        self.dirty.iter().filter_map(|id| Some((id, self.get(id)?)))
+    }
+
     /// Whether both copies verified the same latest manifest.
     pub fn same_head(&self, other: &Vault) -> bool {
         self.counter == other.counter && self.last == other.last

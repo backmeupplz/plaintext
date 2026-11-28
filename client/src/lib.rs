@@ -305,8 +305,9 @@ impl<T: Transport> Session<T> {
                     }
                     let name = known.unwrap_or_else(|| id.to_string());
                     // Only pending changes make a reader's push fail: say how to drop them.
+                    // By id: anyone who may write can name a vault anything.
                     let hint = match e {
-                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", if name.contains(char::is_whitespace) { format!("\"{name}\"") } else { name.clone() }),
+                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", &id.to_string()[..8]),
                         _ => String::new(),
                     };
                     self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
@@ -393,12 +394,14 @@ impl<T: Transport> Session<T> {
         let changed = fresh.apply(&resp, &mut keyring, now())?;
         let old = &self.vaults[id];
         if !fresh.same_head(old) {
-            return Err(if fresh.counter < old.counter { plaintext_core::Error::Rollback.into() } else { Error::Refused("the vault changed meanwhile; try again".into()) });
+            // Newer: another device pushed in between. Older, or a different copy
+            // of the same version: the server is lying.
+            return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
         }
+        // The next sync uploads the keyring, as after any pull.
         self.keyring = keyring;
         self.keyring_dirty |= changed;
         self.vaults.insert(*id, fresh);
-        self.save_keyring()?;
         Ok(n)
     }
 
