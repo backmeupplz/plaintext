@@ -1173,6 +1173,10 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
     bob.sync().unwrap();
     assert!(bob.problems.iter().any(|p| p.contains("only read")), "{:?}", bob.problems);
+    // Offline as a known reader, he's told so, not that his edit is waiting.
+    bob.t.1.set(true);
+    assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Refused", "r"))));
+    bob.t.1.set(false);
 }
 
 /// A transport whose network can be switched off.

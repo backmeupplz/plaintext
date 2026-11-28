@@ -361,8 +361,9 @@ impl<T: Transport> Session<T> {
         if matches!(pulled, Err(ref e) if !matches!(e, Error::Network(_) | Error::Server(500..=599, _))) {
             return pulled;
         }
+        // A vault never pulled has no roster yet: the pull's error says more.
         if let Err(e) = self.may_write(id) {
-            return pulled.and(Err(e));
+            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
         }
         f(self.vaults.get_mut(id).expect("checked above"));
         pulled?;
