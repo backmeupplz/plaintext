@@ -1,0 +1,8 @@
+<resources>
+    <color name="bg">#FBFBF8</color>
+    <color name="accent">#1F7A4D</color>
+    <style name="Theme.Plaintext" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+</resources>
