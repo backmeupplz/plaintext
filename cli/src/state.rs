@@ -49,6 +49,10 @@ struct Stored {
     /// The terminal it was unlocked in (see `terminal`).
     #[serde(default)]
     terminal: Option<String>,
+    /// The token belongs to a security key's sealed copy (see `seckey`):
+    /// locking forgets it here but doesn't end it, or the key would stop working.
+    #[serde(default)]
+    keyed: bool,
 }
 
 /// The terminal this process runs in: the terminal device on stdin, stdout or
@@ -82,44 +86,57 @@ pub fn home() -> PathBuf {
 
 /// The OS keychain, or with `PLAINTEXT_KEYCHAIN=file` a 0600 file under
 /// PLAINTEXT_HOME (for CI and headless machines without a keychain; weaker).
-enum Store {
+pub(crate) enum Store {
     Os(keyring::Entry),
     File(PathBuf),
 }
 
 impl Store {
-    fn get(&self) -> Res<String> {
+    pub(crate) fn get(&self) -> Res<String> {
         Ok(match self {
             Store::Os(e) => e.get_password()?,
             Store::File(p) => std::fs::read_to_string(p)?,
         })
     }
-    fn set(&self, v: &str) -> Res<()> {
+    /// None only when nothing is stored; any other failure is an error.
+    pub(crate) fn find(&self) -> Res<Option<String>> {
+        match self {
+            Store::Os(e) => match e.get_password() {
+                Err(keyring::Error::NoEntry) => Ok(None),
+                r => Ok(Some(r?)),
+            },
+            Store::File(p) => match std::fs::read_to_string(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                r => Ok(Some(r?)),
+            },
+        }
+    }
+    pub(crate) fn set(&self, v: &str) -> Res<()> {
         match self {
             Store::Os(e) => e.set_password(v)?,
             Store::File(p) => {
-                use std::io::Write;
-                #[cfg(unix)]
-                use std::os::unix::fs::OpenOptionsExt;
                 std::fs::create_dir_all(p.parent().unwrap_or(&home()))?;
-                let mut o = std::fs::OpenOptions::new();
-                o.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                o.mode(0o600);
-                o.open(p)?.write_all(v.as_bytes())?;
+                crate::write_private(p, v.as_bytes())?;
             }
         }
         Ok(())
     }
-    fn delete(&self) {
+    /// Deleting what isn't there succeeds.
+    pub(crate) fn delete(&self) -> Res<()> {
         match self {
-            Store::Os(e) => drop(e.delete_credential()),
-            Store::File(p) => drop(std::fs::remove_file(p)),
+            Store::Os(e) => match e.delete_credential() {
+                Err(keyring::Error::NoEntry) => Ok(()),
+                r => Ok(r?),
+            },
+            Store::File(p) => match std::fs::remove_file(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => Ok(r?),
+            },
         }
     }
 }
 
-fn entry(cfg: &Config, what: &str) -> Res<Store> {
+pub(crate) fn entry(cfg: &Config, what: &str) -> Res<Store> {
     if std::env::var("PLAINTEXT_KEYCHAIN").is_ok_and(|v| v == "file") {
         let name: String = cfg.name().chars().map(|c| if c.is_ascii_alphanumeric() || "@.-_".contains(c) { c } else { '_' }).collect();
         return Ok(Store::File(home().join("secrets").join(format!("{name} {what}"))));
@@ -178,8 +195,14 @@ pub fn save_config(cfg: &Config) -> Res<()> {
 /// Sign this computer out of an account and forget its Secret Key here.
 pub fn remove_account(cfg: &Config) -> Res<()> {
     let mut a = load_accounts()?;
-    forget(cfg);
-    entry(cfg, "secret-key")?.delete();
+    // The security keys' sessions end too, if this computer has a session to do it with.
+    let ids: Res<Vec<String>> = crate::seckey::load(cfg).map(|k| k.keys.into_iter().map(|k| k.session).collect());
+    if !ids.is_ok_and(|ids| end_sessions(cfg, ids)) {
+        eprintln!("plaintext: the sessions of this computer's security keys couldn't be ended; they end on their own within 30 days, or end them from another device with `plaintext sessions --end`.");
+    }
+    crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e}), so it's still signed in; try again"))?;
+    forget(cfg, true);
+    let _ = entry(cfg, "secret-key")?.delete();
     let cur = a.accounts.get(a.current).map(Config::name);
     a.accounts.retain(|c| c.name() != cfg.name());
     a.current = a.accounts.iter().position(|c| Some(c.name()) == cur).unwrap_or(0);
@@ -202,15 +225,17 @@ pub fn secret_key(cfg: &Config) -> Res<SecretKey> {
 }
 
 /// Keep the unlocked session for this terminal, ending the one it replaces
-/// (unlocked in another terminal, say) so no older token stays live.
-pub fn remember(cfg: &Config, s: &S) -> Res<()> {
-    forget(cfg);
+/// (unlocked in another terminal, say) so no older token stays live. `keyed`:
+/// the token is a security key's (see `Stored::keyed`).
+pub fn remember(cfg: &Config, s: &S, keyed: bool) -> Res<()> {
+    forget(cfg, false);
     let stored = Stored {
         token: s.token.clone(),
         account_id: hex::encode(s.account.id),
         account_key: hex::encode(&s.account.account_key[..]),
         until: now() + UNLOCKED_FOR,
         terminal: terminal(),
+        keyed,
     };
     entry(cfg, "session")?.set(&serde_json::to_string(&stored)?)?;
     Ok(())
@@ -218,16 +243,54 @@ pub fn remember(cfg: &Config, s: &S) -> Res<()> {
 
 /// Forget the unlocked session on this computer and end it on the server, so the
 /// token stops working even if a copy of it survives somewhere.
-pub fn forget(cfg: &Config) {
+/// A security key's session is only forgotten here, since its key still holds
+/// it, unless `end_keyed` (signing out, a password change).
+pub fn forget(cfg: &Config, end_keyed: bool) {
     let Ok(e) = entry(cfg, "session") else { return };
-    if let Ok(raw) = e.get().map(Zeroizing::new)
-        && let Ok(st) = serde_json::from_str::<Stored>(&raw)
+    if let Some(st) = stored(cfg).filter(|st| end_keyed || !st.keyed)
         && let Ok(h) = http(&cfg.server)
     {
         // Best effort: an unreachable server still gets the local copy removed.
         let _ = h.send("POST", "/v1/logout", Some(&st.token), None);
     }
-    e.delete();
+    let _ = e.delete();
+}
+
+/// Let `lock` end this terminal's security key session after all (its key is gone).
+pub fn unkey(cfg: &Config) {
+    if let (Some(mut st), Ok(e)) = (stored(cfg).filter(|st| st.keyed), entry(cfg, "session")) {
+        st.keyed = false;
+        if let Ok(j) = serde_json::to_string(&st) {
+            let _ = e.set(&j);
+        }
+    }
+}
+
+/// End these sessions (security keys') with the session this computer has
+/// stored, ending that one last, and forget it here if it was one of them.
+/// False if any couldn't be ended.
+pub fn end_sessions(cfg: &Config, mut ids: Vec<String>) -> bool {
+    if ids.is_empty() {
+        return true;
+    }
+    let (Some(st), Ok(h)) = (stored(cfg), http(&cfg.server)) else { return false };
+    let own = h.send("GET", "/v1/sessions", Some(&st.token), None).ok().and_then(|(_, r)| {
+        serde_json::from_slice::<Vec<plaintext_client::plaintext_core::api::DeviceSession>>(&r).ok()?.into_iter().find(|x| x.current).map(|x| x.id)
+    });
+    ids.sort_by_key(|id| Some(id) == own.as_ref());
+    // Every one is tried, even after one fails.
+    let ok = ids.iter().filter(|id| !h.send("DELETE", &format!("/v1/sessions/{id}"), Some(&st.token), None).is_ok_and(|(code, _)| code < 300)).count() == 0;
+    if own.is_some_and(|o| ids.contains(&o))
+        && let Ok(e) = entry(cfg, "session")
+    {
+        let _ = e.delete();
+    }
+    ok
+}
+
+fn stored(cfg: &Config) -> Option<Stored> {
+    let raw = Zeroizing::new(entry(cfg, "session").ok()?.get().ok()?);
+    serde_json::from_str(&raw).ok()
 }
 
 /// A connection to an account's server, refusing plain http:// across the internet.
@@ -239,11 +302,10 @@ pub fn http(server: &str) -> Res<Http> {
 }
 
 fn resume(cfg: &Config) -> Option<S> {
-    let raw = Zeroizing::new(entry(cfg, "session").ok()?.get().ok()?);
-    let st: Stored = serde_json::from_str(&raw).ok()?;
+    let st = stored(cfg)?;
     if st.until <= now() {
         // Expired: don't leave the Account Key and a live token lying around.
-        forget(cfg);
+        forget(cfg, false);
         return None;
     }
     // Unlocked in another terminal (or this process has none): ask again here.
@@ -275,8 +337,21 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
     let sk = secret_key(cfg)?;
     let pw = prompt(&format!("Password for {}: ", cfg.username))?;
     let s = Session::login(http(&cfg.server)?, &derive(&pw, &sk), &device())?;
-    remember(cfg, &s)?;
+    remember(cfg, &s, false)?;
     Ok(s)
+}
+
+/// Unlock this terminal: with a security key when one is added here, else (or
+/// if that fails) the password. Never without a terminal: a touch asked for by
+/// a command nobody is watching, an AI tool's say, must not open the vaults.
+pub fn unlock(cfg: &Config) -> Res<S> {
+    if terminal().is_some() && !crate::seckey::load(cfg).map(|k| k.keys).unwrap_or_default().is_empty() {
+        match crate::seckey::unlock(cfg, &mut crate::seckey::Hid::default(), &mut |m: &str| prompt(m)) {
+            Ok(s) => return Ok(s),
+            Err(e) => eprintln!("plaintext: {}; unlocking with your password instead", crate::clean(&e.to_string())),
+        }
+    }
+    sign_in(cfg)
 }
 
 /// Syncs, warning about a vault that couldn't push (out of storage, or another
@@ -310,13 +385,13 @@ pub fn open() -> Res<S> {
     let cfg = load_config()?;
     let mut s = match resume(&cfg) {
         Some(s) => s,
-        None => sign_in(&cfg)?,
+        None => unlock(&cfg)?,
     };
     load_snapshots(&mut s);
     match sync(&mut s) {
         Err(Error::Server(401, _)) => {
-            forget(&cfg);
-            s = sign_in(&cfg)?;
+            forget(&cfg, false);
+            s = unlock(&cfg)?;
             load_snapshots(&mut s);
             sync(&mut s)?;
         }
