@@ -1,10 +1,15 @@
 //! Plaintext core for browsers (wasm-bindgen, `--target web`). Each export is a
-//! thin wrapper over a plain function, so the logic builds and tests natively;
-//! later exports (sessions, sync over fetch) follow the same pattern.
+//! thin wrapper over a plain function, so the logic builds and tests natively.
+//! The browser extension's exports (accounts, sync over fetch) are in
+//! `extension`, behind the default `extension` feature; the share-link viewer
+//! builds without it.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use plaintext_core::api::Hex;
 use wasm_bindgen::prelude::*;
+
+#[cfg(feature = "extension")]
+pub mod extension;
 
 /// Decrypt a share link. `blob_b64` is the string `GET /v1/links/{id}` returned.
 /// Gives the item as JSON, or the error code `bad_link` (malformed id),

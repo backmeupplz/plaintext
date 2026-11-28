@@ -1223,6 +1223,55 @@ impl Transport for Flaky {
     }
 }
 
+#[test]
+fn restored_session_catches_up_with_the_keyring() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, a) = join(Http::new(&url), "alice", "pw", None, "a");
+    let old = a.keyring_snapshot();
+    // Another device changes the keyring meanwhile.
+    login(&url, "pw", &sk).invite().unwrap();
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &old).unwrap();
+    assert!(r.keyring.invites.is_empty(), "opened from this device's copy, offline");
+    r.sync().unwrap();
+    assert_eq!(r.keyring.invites.len(), 1);
+    let bad = Account { id: a.account.id, account_key: zeroize::Zeroizing::new([7; 32]) };
+    assert!(Session::restore(Http::new(&url), a.token.clone(), bad, &old).is_err());
+}
+
+#[test]
+fn restored_session_pushes_pins_it_never_sent() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, a) = join(Http::new(&url), "alice", "pw", None, "a");
+    // This device pulled its vault and made a pin, and neither reached the server: its keyring counter is still 0.
+    let id = a.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().vaults[0];
+    let mut a = a;
+    a.vaults.insert(id, Vault::new(id));
+    block_on(a.pull_async(&id)).unwrap();
+    a.keyring.new_invite();
+    assert_eq!(a.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().keyring_counter, 0);
+    // Picked up again as the browser extension does: the keyring and the vault from this device.
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &a.keyring_snapshot()).unwrap();
+    r.vaults.insert(id, Vault::restore(&r.account, id, &a.vaults[&id].snapshot(&a.account)).unwrap());
+    r.sync().unwrap();
+    assert_eq!(login(&url, "pw", &sk).keyring.invites.len(), 1, "the restored pin reached the server");
+}
+
+#[test]
+fn restored_session_saves_its_keyring_before_any_sync() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, mut a) = join(Http::new(&url), "alice", "pw", None, "a");
+    // A pin this device never sent, and another device's pin the restored copy doesn't have.
+    a.keyring.new_invite();
+    login(&url, "pw", &sk).invite().unwrap();
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &a.keyring_snapshot()).unwrap();
+    r.invite().unwrap();
+    assert_eq!(r.keyring.invites.len(), 3);
+    assert_eq!(login(&url, "pw", &sk).keyring.invites.len(), 3, "all three pins are on the server");
+}
+
 /// What an app keeps on the device: snapshots that survive a restart (with the
 /// rollback guard), an offline open that queues edits, and imports.
 #[test]

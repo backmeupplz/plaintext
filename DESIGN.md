@@ -186,7 +186,9 @@ Request bodies are limited to 64 KiB, except: the keyring, inbox messages and sh
 | Crate | What |
 |---|---|
 | `core/` | crypto, keys, rosters, sync rules, items, generator, TOTP, Watchtower. Sans-IO. Known-answer vectors cross-checked by `tools/kat.py` (Python + libsodium). |
-| `client/` | sync orchestration over a `Transport` (ureq by default), importers. Used by the CLI and the app bindings. End-to-end test over real HTTP. |
+| `client/` | sync orchestration over a `Transport` (ureq by default), importers. Used by the CLI, the app bindings and the extension. End-to-end test over real HTTP. |
+| `wasm/` | core and client for browsers: the share-link viewer (`docs/s/`) and, with the `extension` feature, the browser extension's bridge. |
+| `extension/` | the Chrome and Firefox extension (MV3, plain JavaScript); see "The browser extension". |
 | `server/` | axum + SQLite, one binary, the same stack as Tugport. |
 | `cli/` | the `plaintext` command and MCP server. |
 
@@ -202,6 +204,29 @@ Request bodies are limited to 64 KiB, except: the keyring, inbox messages and sh
 | Safari | Safari Web Extension inside the Apple app, sharing its keychain group | same as the app |
 
 Quick unlock always means the Account Key sits in the OS keychain behind biometrics; the master password is never stored. Clients never fetch icons or anything else by an item's URL (Bitwarden's BW06 leak). UI rules for every app are in [UI.md](UI.md).
+
+### The browser extension
+
+The extension runs `plaintext-client` itself, compiled to WebAssembly, so it verifies, merges and guards against rollback exactly as the CLI does. JavaScript only moves bytes and draws the UI.
+
+**Sync without blocking.** `Session`'s logic (sign-in, sync, the 409 retries, expired-member removal, the keyring's compare-and-swap merge, `problems`, hidden vaults) is written once, as `async` methods over `AsyncTransport`. Every blocking `Transport` is an `AsyncTransport` whose requests finish inside the call, and the blocking methods the CLI and app bindings use (`sync`, `login`, `put_item`, …) poll that future once. In the browser, `wasm/` implements `AsyncTransport` with one JavaScript function around `fetch` (redirects refused, no cookies, a timeout and a 128 MiB cap). Three alternatives were rejected:
+- A thin async layer in `wasm/` over `plaintext-core` would copy the orchestration above, which lives in `client`, and the copies would drift.
+- Blocking requests from the browser (synchronous XHR in a worker) can't run in Chrome's MV3 service worker, which has neither, and XHR can't refuse redirects.
+- A step API that returns "pending" and reruns the operation once JavaScript has the response is unsound: each run re-seals with fresh nonces (a removal even makes a new vault key), so local state would record a push the server never received.
+
+**What it keeps.**
+- **`storage.local`:** each account's server, username and Secret Key, sealed under the password (`crypto::seal_secret_key`: Argon2id with a random salt). It also holds the account's vault snapshots and keyring, sealed with the Account Key, as the CLI keeps them, so rollback guards and pins survive restarts.
+- **`storage.session`:** the session token and Account Key while unlocked. This storage lives in memory only and is gone when the browser quits.
+- **The trade-off.** A browser profile has no OS keychain, so someone who copies the profile can guess the password offline at Argon2 speed. That's the same position as holding the server's database together with the Secret Key.
+- **Reopening.** When the browser suspends the extension, it picks the session up again from these two with no network. The next sync checks the token.
+- **Locking** happens after the chosen idle time (10 minutes by default) and when the browser closes. Locking from the extension ends the server session too. Closing the browser can't, so that token lapses on the server's schedule, but no copy of it survives on the device.
+
+**Filling.**
+- **Matching.** Logins are offered by `site::matches`: the same registrable domain (eTLD+1, from a bundled Public Suffix List), or the exact host when the item asks for it. An https login is never offered to a plain http page.
+- **Where fills happen.** A fill goes only into the tab's top frame. The extension takes the page's address from the browser, never from the page, and a form that posts to another site gets nothing unless the login is saved for that site too.
+- **When fills happen.** Secrets reach a page only when the user picks a login in the extension's popup or presses the fill shortcut. The small mark in login fields just opens the popup, so a page can't restyle or cover the thing that fills.
+- **Saving.** After a login form is submitted, the toolbar button shows a badge and the popup asks whether to save the login or update its password. The page sees nothing either way, so it can't learn what's saved or trick a click. New logins go to the account's default vault.
+- **Form destinations.** The form's destination is checked as the browser resolves it: the form's action and every submit button's `formaction`, with `<base>` applied.
 
 ## Lessons from Vaultwarden and Bitwarden
 
