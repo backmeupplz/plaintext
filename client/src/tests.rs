@@ -1157,7 +1157,8 @@ fn exec(path: &std::path::Path, sql: &str) {
 
 /// Whoever a vault ends up counting against can always leave it: even if their
 /// device can't open it, as its only owner, once their membership expired, or
-/// when only an agent of theirs is in it.
+/// when only an agent of theirs is in it; and a creator someone else removed stops
+/// paying even if an agent of theirs stays.
 #[test]
 fn nobody_is_stuck_paying_for_a_vault() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, quota: Some(4 << 20), ..Default::default() });
@@ -1266,25 +1267,65 @@ fn nobody_is_stuck_paying_for_a_vault() {
     bob.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift), None);
 
-    // Bob is taken out of a vault he made while his agent stays in, with a change
-    // his device hadn't sent: it's named by its name, and leaving drops the change.
-    // His device never verified the removal, so to it the vault is still his own: it's
-    // named with its full id but no hint to leave it (DESIGN "Leaving").
+    // Mallory takes bob out of a vault he made while his agent stays in, with a change
+    // his device hadn't sent: it stops counting against him (mallory pays), the
+    // change is named by the vault's name, and leaving (which takes bob-bot out) drops it.
     let kept = bob.create_vault("Kept").unwrap();
     bob.share_vault(&kept, "mallory", Role::Owner, None).unwrap();
     bob.share_vault(&kept, "bob-bot", Role::Writer, None).unwrap();
     bob.vaults.get_mut(&kept).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
     mallory.sync().unwrap();
     mallory.revoke(&kept, "bob").unwrap();
-    assert_eq!(creator(&kept).as_deref(), Some("bob"));
+    assert_eq!(creator(&kept).as_deref(), Some("mallory"));
     bob.sync().unwrap();
     assert!(bob.unsendable.contains(&kept));
-    assert!(bob.problems.iter().any(|p| p.starts_with(&format!("vault Kept ({kept}) counts against your storage"))), "{:?}", bob.problems);
-    assert!(!bob.problems.iter().any(|p| p.contains(&format!("vault leave {kept}"))), "{:?}", bob.problems);
+    assert!(bob.problems.iter().any(|p| p.starts_with("vault Kept isn't listed for you any more")), "{:?}", bob.problems);
+    let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
+    assert!(!acct.paid.contains(&kept), "{acct:?}");
+    assert!(!bob.problems.iter().any(|p| p.contains(&kept.to_string())), "{:?}", bob.problems);
     bob.leave_vault(&kept).unwrap();
     assert!(bob.unsendable.is_empty() && !bob.hidden[&kept].has_changes());
     bob.sync().unwrap();
     assert!(!bob.problems.iter().any(|p| p.contains("Kept") || p.contains(&kept.to_string())), "{:?}", bob.problems);
+
+    // Bob removes the creator of a vault but keeps her agent: her device can't see
+    // the vault any more, so it counts against bob from then on, not her.
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.create_agent("alice-bot").unwrap();
+    let alices = alice.create_vault("Kept").unwrap();
+    alice.share_vault(&alices, "alice-bot", Role::Writer, None).unwrap();
+    alice.share_vault(&alices, "bob", Role::Owner, None).unwrap();
+    bob.sync().unwrap();
+    // Taking it on needs room in bob's account when he adds someone in the same
+    // change; removing her alone works even when he's full.
+    exec(&path, "INSERT INTO links(id, creator, blob, expires, views_left) VALUES(x'00', 'bob', zeroblob(5 << 20), 9999999999, 1)");
+    let carol_keys = bob.pin_user("carol").unwrap();
+    let u = bob.vaults[&alices].revoke(&bob.me(), &["alice"], now()).unwrap();
+    let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
+    r.members.push(Member { username: "carol".into(), sign_pk: carol_keys.sign_pk.clone(), enc_pk: carol_keys.enc_pk.clone(), role: Role::Reader, expires: None });
+    let u = RosterUpdate { roster: bob.me().sign_doc("roster", &r), ..u };
+    assert_eq!(status(bob.call::<()>("POST", &format!("/v1/vaults/{alices}/roster"), Some(&u))), 507);
+    assert_eq!(creator(&alices).as_deref(), Some("alice"));
+    bob.revoke(&alices, "alice").unwrap();
+    assert_eq!(creator(&alices).as_deref(), Some("bob"));
+    exec(&path, "DELETE FROM links WHERE id = x'00'");
+    let members: String = plaintext_server::open_db(path.to_str().unwrap())
+        .unwrap()
+        .query_row(&format!("SELECT group_concat(username, ' ' ORDER BY username) FROM members WHERE vault_id = x'{alices}'"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(members, "alice-bot bob");
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert!(!acct.paid.contains(&alices) && !acct.vaults.contains(&alices), "{acct:?}");
+    alice.sync().unwrap();
+    assert!(!alice.problems.iter().any(|p| p.contains(&alices.to_string())), "{:?}", alice.problems);
+
+    // A vault bob pays for only through his agent (as when it was handed to bob-bot)
+    // stays his when another owner changes its roster without removing him.
+    let through = carol.create_vault("Through").unwrap();
+    carol.share_vault(&through, "bob-bot", Role::Owner, None).unwrap();
+    exec(&path, &format!("UPDATE vaults SET creator = 'bob' WHERE id = x'{through}'"));
+    carol.share_vault(&through, "mallory2", Role::Reader, None).unwrap();
+    assert_eq!(creator(&through).as_deref(), Some("bob"));
     let _ = std::fs::remove_file(&path);
 
     // Without a quota, an openable vault someone handed you costs nothing and isn't

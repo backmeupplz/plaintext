@@ -1092,6 +1092,12 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
     }
     tx.execute("INSERT INTO rosters(vault_id, version, signed, counted) VALUES(?,?,?,1)", params![vault, r.version, json(s)])
         .map_err(|_| (StatusCode::CONFLICT, "roster changed, pull first"))?;
+    // Whether this change takes the creator's own account out (below).
+    let payer = creator(tx, vault)?;
+    let listed: bool = tx
+        .query_row("SELECT COUNT(*) FROM members WHERE vault_id = ? AND username = ?", params![vault, payer], |r| r.get(0))
+        .map_err(db_err)?;
+    let removed = listed && !r.members.iter().any(|m| Some(&m.username) == payer.as_ref());
     tx.execute("DELETE FROM members WHERE vault_id = ?", [vault]).map_err(db_err)?;
     for m in &r.members {
         let role = serde_json::to_value(m.role).expect("serializable");
@@ -1113,13 +1119,16 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
         params![r.version, &sha256(&s.body.0)[..], r.epoch, vault],
     )
     .map_err(db_err)?;
-    // A creator who was removed (with any agents of theirs) stops paying for the
-    // vault: the owner who removed them does (an agent's owner, if an agent signed).
+    // A creator this change removes stops paying for the vault, even if an agent of
+    // theirs stays (their device can't see the vault any more): the owner who
+    // removed them does (an agent's owner, if an agent signed). A creator who pays
+    // only through an agent of theirs (handed the vault that way) keeps paying until
+    // none is left.
     tx.execute(
         "UPDATE vaults SET creator = (SELECT COALESCE(owner, username) FROM accounts WHERE username = ?1)
-         WHERE id = ?2 AND creator NOT IN (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
-                                           WHERE m.vault_id = ?2)",
-        params![s.signer, vault],
+         WHERE id = ?2 AND (?3 OR creator NOT IN (SELECT COALESCE(a.owner, m.username) FROM members m JOIN accounts a ON a.username = m.username
+                                                  WHERE m.vault_id = ?2))",
+        params![s.signer, vault, removed],
     )
     .map_err(db_err)?;
     Ok(())
