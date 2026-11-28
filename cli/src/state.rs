@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use plaintext_client::plaintext_core::Account;
-use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent, server_host};
+use plaintext_client::plaintext_core::crypto::{AgentKey, SecretKey, derive, derive_agent, server_host, sha256};
 use plaintext_client::{Error, Http, Session, Transport, now};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -60,7 +60,7 @@ struct Stored {
 /// sudo's per-terminal tickets), so processes with no terminal, such as an MCP
 /// server's commands, background jobs or anything an AI agent runs through
 /// pipes, can't use it to reach this person's vaults; they need an agent key.
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 fn terminal() -> Option<String> {
     use std::os::fd::AsRawFd;
     let fds = [std::io::stdin().as_raw_fd(), std::io::stdout().as_raw_fd(), std::io::stderr().as_raw_fd()];
@@ -73,9 +73,15 @@ fn terminal() -> Option<String> {
 }
 
 // ponytail: no per-terminal binding on Windows yet; the session is per user there.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn terminal() -> Option<String> {
     Some("console".into())
+}
+
+// Tests run without a terminal, but as one.
+#[cfg(test)]
+fn terminal() -> Option<String> {
+    Some("test".into())
 }
 
 pub fn home() -> PathBuf {
@@ -195,14 +201,17 @@ pub fn save_config(cfg: &Config) -> Res<()> {
 /// Sign this computer out of an account and forget its Secret Key here.
 pub fn remove_account(cfg: &Config) -> Res<()> {
     let mut a = load_accounts()?;
-    // The security keys' sessions end too, if this computer has a session to do it with.
-    let ids: Res<Vec<String>> = crate::seckey::load(cfg).map(|k| k.keys.into_iter().map(|k| k.session).collect());
-    if !ids.is_ok_and(|ids| end_sessions(cfg, ids)) {
+    // The security keys' sessions end too, if this terminal has a session to do it with.
+    let ended = match crate::seckey::load(cfg) {
+        Ok(k) => end_sessions(cfg, k.keys.into_iter().map(|k| k.session).collect())?,
+        Err(_) => false,
+    };
+    if !ended {
         eprintln!("plaintext: the sessions of this computer's security keys couldn't be ended; they end on their own within 30 days, or end them from another device with `plaintext sessions --end`.");
     }
     crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e}), so it's still signed in; try again"))?;
-    forget(cfg, true);
-    let _ = entry(cfg, "secret-key")?.delete();
+    forget(cfg, true)?;
+    entry(cfg, "secret-key")?.delete()?;
     let cur = a.accounts.get(a.current).map(Config::name);
     a.accounts.retain(|c| c.name() != cfg.name());
     a.current = a.accounts.iter().position(|c| Some(c.name()) == cur).unwrap_or(0);
@@ -228,7 +237,7 @@ pub fn secret_key(cfg: &Config) -> Res<SecretKey> {
 /// (unlocked in another terminal, say) so no older token stays live. `keyed`:
 /// the token is a security key's (see `Stored::keyed`).
 pub fn remember(cfg: &Config, s: &S, keyed: bool) -> Res<()> {
-    forget(cfg, false);
+    let _ = forget(cfg, false); // the `set` below overwrites it, or says why it can't
     let stored = Stored {
         token: s.token.clone(),
         account_id: hex::encode(s.account.id),
@@ -244,16 +253,17 @@ pub fn remember(cfg: &Config, s: &S, keyed: bool) -> Res<()> {
 /// Forget the unlocked session on this computer and end it on the server, so the
 /// token stops working even if a copy of it survives somewhere.
 /// A security key's session is only forgotten here, since its key still holds
-/// it, unless `end_keyed` (signing out, a password change).
-pub fn forget(cfg: &Config, end_keyed: bool) {
-    let Ok(e) = entry(cfg, "session") else { return };
+/// it, unless `end_keyed` (signing out, a password change). An error only if
+/// the local copy (with its Account Key) couldn't be deleted.
+pub fn forget(cfg: &Config, end_keyed: bool) -> Res<()> {
+    let e = entry(cfg, "session")?;
     if let Some(st) = stored(cfg).filter(|st| end_keyed || !st.keyed)
         && let Ok(h) = http(&cfg.server)
     {
         // Best effort: an unreachable server still gets the local copy removed.
         let _ = h.send("POST", "/v1/logout", Some(&st.token), None);
     }
-    let _ = e.delete();
+    e.delete()
 }
 
 /// Let `lock` end this terminal's security key session after all (its key is gone).
@@ -266,26 +276,40 @@ pub fn unkey(cfg: &Config) {
     }
 }
 
-/// End these sessions (security keys') with the session this computer has
-/// stored, ending that one last, and forget it here if it was one of them.
-/// False if any couldn't be ended.
-pub fn end_sessions(cfg: &Config, mut ids: Vec<String>) -> bool {
+/// End these sessions (security keys') with this terminal's unlocked session,
+/// ending that one last, and forget it here if it was one of them and ended.
+/// False if any couldn't be ended (or there's no session here to do it with);
+/// an error only if that ended session couldn't be deleted here.
+pub fn end_sessions(cfg: &Config, mut ids: Vec<String>) -> Res<bool> {
     if ids.is_empty() {
-        return true;
+        return Ok(true);
     }
-    let (Some(st), Ok(h)) = (stored(cfg), http(&cfg.server)) else { return false };
-    let own = h.send("GET", "/v1/sessions", Some(&st.token), None).ok().and_then(|(_, r)| {
-        serde_json::from_slice::<Vec<plaintext_client::plaintext_core::api::DeviceSession>>(&r).ok()?.into_iter().find(|x| x.current).map(|x| x.id)
-    });
-    ids.sort_by_key(|id| Some(id) == own.as_ref());
+    // Only what `resume` would use: unexpired, and unlocked in this terminal.
+    let (Some(st), Ok(h)) = (stored(cfg).filter(|st| st.until > now() && here(st)), http(&cfg.server)) else { return Ok(false) };
+    let own = session_id(&st.token);
+    ids.sort_by_key(|id| *id == own);
     // Every one is tried, even after one fails.
-    let ok = ids.iter().filter(|id| !h.send("DELETE", &format!("/v1/sessions/{id}"), Some(&st.token), None).is_ok_and(|(code, _)| code < 300)).count() == 0;
-    if own.is_some_and(|o| ids.contains(&o))
-        && let Ok(e) = entry(cfg, "session")
-    {
-        let _ = e.delete();
+    let ended: Vec<bool> = ids.iter().map(|id| h.send("DELETE", &format!("/v1/sessions/{id}"), Some(&st.token), None).is_ok_and(|(code, _)| code < 300)).collect();
+    // Kept while its end isn't confirmed: `unkey` and `lock` still need its token.
+    if ids.last() == Some(&own) && ended.last() == Some(&true) {
+        entry(cfg, "session")?.delete()?;
     }
-    ok
+    Ok(ended.into_iter().all(|e| e))
+}
+
+/// A session's id in `plaintext sessions`: the start of its token's hash, as the server works it out.
+fn session_id(token: &str) -> String {
+    hex::encode(&sha256(token.as_bytes())[..8])
+}
+
+/// The id of the session stored for the account on this computer.
+pub fn stored_session(cfg: &Config) -> Option<String> {
+    stored(cfg).map(|st| session_id(&st.token))
+}
+
+/// Unlocked in this terminal (not another one, and this process has one).
+fn here(st: &Stored) -> bool {
+    st.terminal.is_some() && st.terminal == terminal()
 }
 
 fn stored(cfg: &Config) -> Option<Stored> {
@@ -305,11 +329,11 @@ fn resume(cfg: &Config) -> Option<S> {
     let st = stored(cfg)?;
     if st.until <= now() {
         // Expired: don't leave the Account Key and a live token lying around.
-        forget(cfg, false);
+        let _ = forget(cfg, false);
         return None;
     }
     // Unlocked in another terminal (or this process has none): ask again here.
-    if st.terminal.is_none() || st.terminal != terminal() {
+    if !here(&st) {
         return None;
     }
     let mut id = [0u8; 16];
@@ -390,7 +414,7 @@ pub fn open() -> Res<S> {
     load_snapshots(&mut s);
     match sync(&mut s) {
         Err(Error::Server(401, _)) => {
-            forget(&cfg, false);
+            let _ = forget(&cfg, false); // unlocking replaces it
             s = unlock(&cfg)?;
             load_snapshots(&mut s);
             sync(&mut s)?;

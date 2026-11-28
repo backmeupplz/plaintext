@@ -597,7 +597,7 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Key(k) => key_cmd(k)?,
         Cmd::Lock => {
-            state::forget(&state::load_config()?, false);
+            state::forget(&state::load_config()?, false)?;
             say!("Locked.");
         }
         Cmd::Whoami => {
@@ -903,7 +903,7 @@ fn run(cli: Cli) -> Res<()> {
             for k in seckey::load(&cfg).map(|k| k.keys).unwrap_or_default() {
                 let _ = s.end_session(&k.session);
             }
-            state::forget(&cfg, true);
+            state::forget(&cfg, true).map_err(|e| format!("changed the password, but couldn't forget this terminal's session on this computer ({e}); run `plaintext lock`"))?;
             say!("Password changed. Other devices need to sign in again.");
         }
         Cmd::Sessions { end } => {
@@ -968,16 +968,17 @@ fn key_cmd(k: KeyCmd) -> Res<()> {
             };
             // End their server sessions too (unlocking first if nothing here can);
             // the copies that held them are gone either way.
-            if !state::end_sessions(&cfg, ended.clone()) && !(state::open().is_ok() && state::end_sessions(&cfg, ended)) {
-                note!("Couldn't end their sessions on the server; they end on their own within 30 days, or with `plaintext sessions --end ID`.");
-                if !all && seckey::load(&cfg).is_ok_and(|k| k.keys.is_empty()) {
-                    // A keyed session left here can only be the removed key's: let `lock` end it.
+            let end = || state::end_sessions(&cfg, ended.clone()).map_err(|e| format!("ended their sessions, but couldn't forget this terminal's on this computer ({e}); run `plaintext lock`"));
+            if !end()? && !(state::open().is_ok() && end()?) {
+                note!("Couldn't end their sessions on the server ({}); they end on their own within 30 days, or with `plaintext sessions --end ID`.", ended.join(", "));
+                if !all && state::stored_session(&cfg).is_some_and(|id| ended.contains(&id)) {
+                    // This terminal runs on the removed key's session: let `lock` end it.
                     state::unkey(&cfg);
                 }
             }
             if all {
                 // Whatever this terminal runs on may be a key's that's gone now (or unknown, if the list was damaged).
-                state::forget(&cfg, true);
+                state::forget(&cfg, true).map_err(|e| format!("removed them, but couldn't lock this terminal ({e}); run `plaintext lock`"))?;
                 say!("This terminal is locked.");
             }
         }

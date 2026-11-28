@@ -111,6 +111,8 @@ fn login(cfg: &Config, d: &Derived, name: &str) -> Res<(S, String)> {
 fn keep(cfg: &Config, keys: &mut Keys, i: usize, s: &S, session: String, cred: &[u8], out: &[u8; 32]) -> Res<()> {
     keys.keys[i].session = session;
     keys.keys[i].sealed = hex::encode(seal_for_security_key(out, &s.account.id, cred, &s.account.account_key, &s.token));
+    // ponytail: load, change, save with no lock, so an `add` and a renewal at the same
+    // moment can drop one's change to the list (a person is behind both). Merge before saving if that bites.
     save(cfg, keys).inspect_err(|_| {
         let _ = s.end_session(&keys.keys[i].session);
     })
@@ -130,6 +132,8 @@ pub fn add(cfg: &Config, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> 
     if !auth.has_pin()? {
         return Err("this security key has no PIN. Set one first (for a YubiKey: ykman fido access change-pin; or fido2-token -S), so that a touch alone can't unlock".into());
     }
+    // Signed in before the PIN and touches, so a wrong password shows before the key
+    // makes a credential; Ctrl-C in between leaves an unused session for its 30 days.
     let (s, session) = login(cfg, &password(cfg, ask)?, name)?;
     let made = (|| -> Res<_> {
         let pin = ask("Security key PIN: ")?;
@@ -159,7 +163,10 @@ pub fn add(cfg: &Config, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> 
     keys.keys.push(Enrolled { name: name.into(), cred: hex::encode(&cred), session: String::new(), sealed: String::new(), added: now() });
     let i = keys.keys.len() - 1;
     keep(cfg, &mut keys, i, &s, session, &cred, &out)?;
-    state::remember(cfg, &s, true)?;
+    // It's added either way; failing here mustn't make `add` look worth repeating.
+    if let Err(e) = state::remember(cfg, &s, true) {
+        eprintln!("plaintext: warning: added {name}, but couldn't unlock this terminal with it ({e}); `plaintext unlock` does");
+    }
     Ok(s)
 }
 
@@ -520,7 +527,7 @@ pub mod tests {
         assert_eq!(asked.take(), ["PIN for security key blue: "]);
 
         // Locking forgets the session here but leaves the key's copy working.
-        state::forget(&cfg, false);
+        state::forget(&cfg, false).unwrap();
         unlock(&cfg, &mut key, &mut ask).unwrap();
         assert_eq!(asked.take().len(), 1, "still just the PIN");
 
@@ -537,8 +544,14 @@ pub mod tests {
         save(&cfg, &moved).unwrap();
         asked.take();
 
+        // This terminal's session id is worked out here as the server lists it. One
+        // that can't be ended (already gone, offline) stays for `unkey` and `lock`.
+        let blue = load(&cfg).unwrap().keys[0].session.clone();
+        assert_eq!(state::stored_session(&cfg).as_ref(), Some(&blue));
         // Once the key's session has ended, the password renews it, once.
-        first.end_session(&load(&cfg).unwrap().keys[0].session).unwrap();
+        first.end_session(&blue).unwrap();
+        assert!(!state::end_sessions(&cfg, vec![blue.clone()]).unwrap());
+        assert_eq!(state::stored_session(&cfg), Some(blue));
         unlock(&cfg, &mut key, &mut ask).unwrap();
         assert_eq!(asked.take(), ["PIN for security key blue: ", "Password for alice: "]);
         unlock(&cfg, &mut key, &mut ask).unwrap();
@@ -553,11 +566,11 @@ pub mod tests {
         let mut red = Soft { pin: Some("1234".into()), always_uv: true, ..Default::default() };
         add(&cfg, &mut red, "red", &mut ask).unwrap();
         asked.take();
-        state::forget(&cfg, false);
+        state::forget(&cfg, false).unwrap();
         unlock(&cfg, &mut red, &mut ask).unwrap();
         assert_eq!(asked.take(), ["PIN for security key red: "]);
         let ids: Vec<String> = load(&cfg).unwrap().keys.into_iter().map(|k| k.session).collect();
-        assert!(state::end_sessions(&cfg, ids.clone()));
+        assert!(state::end_sessions(&cfg, ids.clone()).unwrap());
         assert!(first.sessions().unwrap().iter().all(|x| !ids.contains(&x.id)));
         assert!(state::entry(&cfg, "session").unwrap().get().is_err(), "this terminal's session was red's");
 
@@ -575,6 +588,23 @@ pub mod tests {
         assert!(load(&cfg).is_err());
         assert!(add(&cfg, &mut key, "green", &mut ask).is_err());
         assert!(clear(&cfg).is_err());
+        std::fs::remove_dir_all(&p).unwrap();
+
+        // Neither is a session or Secret Key that can't be deleted, nor its account.
+        state::save_config(&cfg).unwrap();
+        for what in ["session", "secret-key"] {
+            let state::Store::File(p) = state::entry(&cfg, what).unwrap() else { unreachable!() };
+            let _ = std::fs::remove_file(&p);
+            std::fs::create_dir_all(p.join("x")).unwrap();
+            assert!(state::remove_account(&cfg).is_err(), "{what}");
+            assert_eq!(state::load_accounts().unwrap().accounts.len(), 1, "{what}");
+            if what == "session" {
+                assert!(state::forget(&cfg, false).is_err());
+            }
+            std::fs::remove_dir_all(&p).unwrap();
+        }
+        state::remove_account(&cfg).unwrap();
+        assert!(state::load_accounts().unwrap().accounts.is_empty());
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_file(db);
     }
