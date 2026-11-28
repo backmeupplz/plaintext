@@ -387,13 +387,27 @@ impl<T: AsyncTransport> Session<T> {
         }
     }
 
-    /// Make a change and push it, refusing first if we may only read the vault
-    /// (see `check_async`).
+    /// Make a change and push it; if we may only read the vault (see
+    /// `check_async`), undo it and refuse. The change goes in before the pull,
+    /// as with `sync_vault`, so the pull still sees another device's newer copy
+    /// of the item (an edit keeps it as a conflict, a delete gives way to it).
     async fn change_async(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
-        let pulled = self.check_async(id).await?;
-        f(self.vaults.get_mut(id).expect("checked above"));
-        pulled?;
-        self.push_async(id).await
+        let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
+        let before = v.snapshot(&self.account);
+        f(v);
+        match self.check_async(id).await {
+            Ok(pulled) => {
+                pulled?;
+                self.push_async(id).await
+            }
+            Err(e) => {
+                // The undo also undid the pull; pull again so the roster that
+                // refused us stays (best effort: offline the old one says so).
+                self.vaults.insert(*id, Vault::restore(&self.account, *id, &before)?);
+                drop(self.pull_async(id).await);
+                Err(e)
+            }
+        }
     }
 
     /// Push pending changes (a pull came just before); on a conflict pull again and retry.

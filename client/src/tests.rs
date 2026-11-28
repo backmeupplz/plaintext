@@ -1150,6 +1150,10 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Disney", "d1sney"))));
     assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "changed"))));
     assert!(read_only(bob.delete_item(&fam, nid)));
+    // The roster that refused him stays: offline, he's still told so.
+    bob.t.1.set(true);
+    assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "offline"))));
+    bob.t.1.set(false);
     let mut meta = bob.vaults[&fam].meta.clone();
     meta.name = "Bob's now".into();
     assert!(read_only(bob.rename_vault(&fam, meta)));
@@ -1206,6 +1210,34 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(true);
     bob.writable(&fam).unwrap();
     bob.t.1.set(false);
+}
+
+#[test]
+fn an_edit_or_delete_keeps_another_device_s_newer_change() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let (n, d) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    alice.put_item(&fam, n, item("Netflix", "v1")).unwrap();
+    alice.put_item(&fam, d, item("Disney", "v1")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+
+    // Alice edits an item; bob, who hasn't seen that, edits it too...
+    alice.put_item(&fam, n, item("Netflix", "alice-v2")).unwrap();
+    bob.put_item(&fam, n, item("Netflix", "bob-v2")).unwrap();
+    // ...and deletes one she has just edited.
+    alice.put_item(&fam, d, item("Disney", "alice-v2")).unwrap();
+    bob.delete_item(&fam, d).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    let mut netflix: Vec<_> = v.items().filter(|(_, i)| i.title.starts_with("Netflix")).map(|(_, i)| i.password.as_str()).collect();
+    netflix.sort();
+    assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
+    assert_eq!(v.get(&d).map(|i| i.password.as_str()), Some("alice-v2"), "alice's edit brings Disney back");
 }
 
 /// A transport whose network can be switched off.
