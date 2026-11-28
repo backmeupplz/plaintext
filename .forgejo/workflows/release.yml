@@ -15,9 +15,10 @@
 #
 # Linux builds are static musl binaries and Windows is the GNU target, all cross-compiled with zig; the image is the
 # Linux server binary alone on an empty base, assembled by packaging/image.sh without a Docker daemon (jobs have none).
-# Pull requests that touch the release tooling or dependencies run the build job only, so a release is never the
-# first build. Actions are pinned to commits and every downloaded tool to a checksum, except rustup and the Rust
-# toolchain, which come over HTTPS from rustup's own servers.
+# Pull requests that touch the release tooling run the build job only, so a release is never its first build.
+# Dependency updates don't: these builds take far longer than PR CI may (ci.yml builds and tests every change).
+# Actions are pinned to commits and every downloaded tool to a checksum, except rustup and the Rust toolchain, which
+# come over HTTPS from rustup's own servers.
 #
 # The Mac runners are a shared host where every job runs as the same user, so an earlier job (another repo's, or a
 # pull request's) could leave files behind that change a later build, such as a .cargo/config.toml with a
@@ -40,7 +41,7 @@ on:
   release:
     types: [published]
   pull_request:
-    paths: [.forgejo/workflows/release.yml, packaging/**, docs/install, Cargo.lock, "**/Cargo.toml"]
+    paths: [.forgejo/workflows/release.yml, packaging/**, docs/install]
 permissions:
   contents: read
 # one release at a time (the tap is pushed, not merged, and `latest` must end on the newest), PRs on their own

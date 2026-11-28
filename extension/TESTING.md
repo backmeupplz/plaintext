@@ -58,7 +58,7 @@ The second command creates `alice` with the password `correct horse battery stap
 ## Building
 
 ```sh
-wasm/build.sh extension          # Rust core → extension/pkg (Docker on non-Linux hosts)
+wasm/build.sh extension          # Rust core → extension/pkg (Docker on hosts other than Linux x86_64 and Apple silicon)
 python3 extension/package.py 4   # extension/dist: chrome/, firefox/, the .zip and the unsigned .xpi (version 0.1.0.4)
 ```
 
