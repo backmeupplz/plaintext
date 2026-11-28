@@ -27,4 +27,4 @@ zeroize = "1"
 [dev-dependencies]
 plaintext-server = { path = "../server" }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
