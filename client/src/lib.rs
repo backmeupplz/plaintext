@@ -338,17 +338,33 @@ impl<T: Transport> Session<T> {
         self.push(id)
     }
 
-    /// Pull a vault and hand it back only if we may write to it. Every change goes
-    /// through here first: a reader's sync never pushes, so a change made anyway
-    /// would stay on this device without a word.
-    pub fn writable(&mut self, id: &Hex) -> Result<&mut Vault> {
+    /// Pull a vault and refuse if we may only read it. A reader's sync never
+    /// pushes, so a change made anyway would stay on this device without a word.
+    pub fn writable(&mut self, id: &Hex) -> Result<()> {
         self.pull(id)?;
-        let me = self.username().to_string();
-        let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
-        if v.role(&me, now()).is_none_or(|r| r < Role::Writer) {
-            return Err(plaintext_core::Error::ReadOnly.into());
+        self.may_write(id)
+    }
+
+    fn may_write(&self, id: &Hex) -> Result<()> {
+        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        match v.role(self.username(), now()) {
+            Some(r) if r >= Role::Writer => Ok(()),
+            _ => Err(plaintext_core::Error::ReadOnly.into()),
         }
-        Ok(v)
+    }
+
+    /// Make a change and push it, refusing first if we may only read the vault.
+    /// Offline, the change still goes in and waits for the next sync, unless the
+    /// roster we already have says we only read.
+    fn change(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
+        let pulled = self.pull(id);
+        self.may_write(id)?;
+        f(self.vaults.get_mut(id).expect("checked above"));
+        pulled?;
+        self.push(id)?;
+        // Made a reader between the pull and the push (a 409's pull saw it): the
+        // change wasn't sent, so say so.
+        self.may_write(id)
     }
 
     /// Push pending changes (a pull came just before); on a conflict pull again and retry.
@@ -580,8 +596,7 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn rename_vault(&mut self, id: &Hex, meta: VaultMeta) -> Result<()> {
-        self.writable(id)?.set_meta(meta);
-        self.push(id)
+        self.change(id, |v| v.set_meta(meta))
     }
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
@@ -679,16 +694,14 @@ impl<T: Transport> Session<T> {
 
     /// Add or replace an item and push it.
     pub fn put_item(&mut self, vault: &Hex, id: Hex, item: Item) -> Result<()> {
-        self.writable(vault)?.put(id, item);
-        self.push(vault)
+        self.change(vault, |v| v.put(id, item))
     }
 
     /// Delete an item and push. Its attachments stay on the server until a later
     /// sync collects them (`collect_files`), so another device that brings the item
     /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        self.writable(vault)?.delete(id);
-        self.push(vault)
+        self.change(vault, |v| v.delete(id))
     }
 
     // ---------- Files ----------
