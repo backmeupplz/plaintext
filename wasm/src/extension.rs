@@ -228,16 +228,35 @@ pub async fn set_exact_host<T: AsyncTransport>(s: &mut Session<T>, vault: &str, 
 /// should see. As in the CLI, a vault that couldn't push (out of storage, or
 /// another device got there first) is a warning, not a failed sync: its change
 /// stays on this device and goes at the next sync, and the rest still count.
-pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<String>, Error> {
+/// Each is `{text, unsent}`: `unsent` names the vault whose changes it says
+/// can't be sent (you may only read it now), for `unsent_changes` and `discard_changes`.
+pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<Value>, Error> {
     let r = s.sync_async().await;
-    let mut problems = s.problems.clone();
+    let unsent = |i| s.unsendable.iter().find(|(_, j)| *j == i).map(|(id, _)| id.to_string());
+    let mut problems: Vec<Value> = s.problems.iter().enumerate().map(|(i, p)| json!({ "text": p, "unsent": unsent(i) })).collect();
     match r {
         Ok(()) => {}
-        Err(Error::Server(413, msg)) => problems.push(format!("A change is kept on this device until there's room: {msg}")),
-        Err(Error::Server(409, msg)) => problems.push(format!("A change is kept on this device and sent at the next sync: {msg}")),
+        Err(Error::Server(413, msg)) => problems.push(json!({ "text": format!("A change is kept on this device until there's room: {msg}") })),
+        Err(Error::Server(409, msg)) => problems.push(json!({ "text": format!("A change is kept on this device and sent at the next sync: {msg}") })),
         Err(e) => return Err(e),
     }
     Ok(problems)
+}
+
+fn vault_id(vault: &str) -> Result<Hex, Error> {
+    vault.parse().map_err(|_| Error::NotFound("that vault".into()))
+}
+
+/// This device's changes to a vault that haven't reached the server, to show
+/// before `discard_changes` drops them: `{name, changed: [title], deleted, renamed}`.
+pub fn unsent_changes<T: AsyncTransport>(s: &Session<T>, vault: &str) -> Result<Value, Error> {
+    let v = s.vaults.get(&vault_id(vault)?).ok_or_else(|| Error::NotFound("that vault".into()))?;
+    Ok(json!({ "name": v.meta.name, "changed": v.changed().map(|(_, i)| &i.title).collect::<Vec<_>>(), "deleted": v.deleted(), "renamed": v.meta_changed() }))
+}
+
+/// Drop them (the vault is downloaded again) and the sync problem about them. Returns how many.
+pub async fn discard_changes<T: AsyncTransport>(s: &mut Session<T>, vault: &str) -> Result<usize, Error> {
+    s.discard_changes_async(&vault_id(vault)?).await
 }
 
 /// A short code JavaScript can branch on, next to the message for people.
@@ -378,12 +397,25 @@ impl Account {
         r.map_err(js_err)
     }
 
-    /// See `sync`: resolves to the problems, a JSON list of sentences.
+    /// See `sync`: resolves to the problems, a JSON list of `{text, unsent}`.
     pub async fn sync(&self) -> Result<String, JsValue> {
         let mut s = self.take()?;
         let r = sync(&mut s).await;
         *self.0.borrow_mut() = Some(s);
         r.map(|p| json!(p).to_string()).map_err(js_err)
+    }
+
+    #[wasm_bindgen(js_name = unsentChanges)]
+    pub fn unsent_changes(&self, vault: String) -> Result<String, JsValue> {
+        self.with(|s| unsent_changes(s, &vault).map(|v| v.to_string()))?.map_err(js_err)
+    }
+
+    #[wasm_bindgen(js_name = discardChanges)]
+    pub async fn discard_changes(&self, vault: String) -> Result<u32, JsValue> {
+        let mut s = self.take()?;
+        let r = discard_changes(&mut s, &vault).await;
+        *self.0.borrow_mut() = Some(s);
+        r.map(|n| n as u32).map_err(js_err)
     }
 
     pub fn list(&self, page: Option<String>, query: String) -> Result<String, JsValue> {

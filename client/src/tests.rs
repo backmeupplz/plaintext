@@ -1226,7 +1226,10 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.sync().unwrap();
     // The apps show problems as they are: no CLI command in them, the id goes in a list.
     assert!(bob.problems.iter().any(|p| p.ends_with("this device's changes to it can't be sent")), "{:?}", bob.problems);
-    assert_eq!(bob.unsendable, [fam]);
+    assert_eq!(bob.unsendable.len(), 1);
+    let (id, i) = bob.unsendable[0];
+    assert_eq!(id, fam);
+    assert!(bob.problems[i].ends_with("this device's changes to it can't be sent"), "{:?}", bob.problems);
     // What `vault reset` lists before dropping anything.
     let v = &bob.vaults[&fam];
     assert_eq!(v.changed().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Keep"]);
@@ -1246,8 +1249,12 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
     bob.t.1.set(false);
     assert_eq!(bob.vaults[&fam].changes(), 3);
+    let warnings = bob.problems.len();
     assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    // Its warning goes with the changes, so the apps stop showing it before the next sync.
     assert!(bob.unsendable.is_empty());
+    assert_eq!(bob.problems.len(), warnings - 1, "{:?}", bob.problems);
+    assert!(!bob.problems.iter().any(|p| p.ends_with("can't be sent")), "{:?}", bob.problems);
     assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
     let v = &bob.vaults[&fam];
     assert_eq!(v.get(&keep).unwrap().password, "k");

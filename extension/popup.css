@@ -47,6 +47,9 @@ label.check { display: flex; align-items: center; gap: 6px; color: var(--fg); ma
 .icon-btn.bordered { border: 1px solid var(--line); width: 36px; height: 36px; }
 .banner.offer { align-items: center; border: 1px solid var(--accent); }
 .banner.locked-account { flex-direction: column; align-items: stretch; }
+.banner.unsent { border: 1px solid var(--warn); }
+.banner.unsent ul { margin: 6px 0; padding-left: 18px; overflow-wrap: anywhere; }
+.banner.unsent .row-actions { justify-content: flex-end; gap: 6px; margin-top: 8px; }
 .unlock-head { display: flex; gap: 8px; align-items: center; }
 .unlock-row { display: flex; gap: 6px; margin-top: 8px; }
 .unlock-row input { flex: 1; min-width: 0; }

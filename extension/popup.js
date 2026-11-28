@@ -241,7 +241,58 @@ async function lockedAccounts(note) {
 
 function showProblems(note, problems) {
   for (const old of note.querySelectorAll('.problem')) old.remove()
-  note.append(...problems.map((p) => el('p', { class: 'banner warn problem', role: 'alert' }, icon('triangle-alert'), el('span', {}, p))))
+  note.append(...problems.map(problem))
+}
+
+/** One sync problem; one about changes that can't be sent offers to show and drop them. */
+function problem(p) {
+  const banner = el('div', { class: 'banner warn problem', role: 'alert' }, icon('triangle-alert'), el('span', { class: 'row-text' }, p.text))
+  if (p.unsent) banner.append(el('button', { class: 'small', type: 'button', onclick: () => reviewUnsent(banner, p) }, 'Review…'))
+  return banner
+}
+
+/** What dropping would lose, shown before anything is dropped. */
+async function reviewUnsent(banner, p) {
+  let c
+  try {
+    c = await ask('unsentChanges', { key: p.key, vault: p.unsent })
+  } catch (e) {
+    return say(explain(e), 'error')
+  }
+  const shown = c.changed.slice(0, 8)
+  const lines = [
+    shown.length && `Added or edited: ${shown.join(', ')}${c.changed.length > shown.length ? ` and ${c.changed.length - shown.length} more` : ''}`,
+    c.deleted && `${c.deleted} item${c.deleted > 1 ? 's' : ''} deleted`,
+    c.renamed && "The vault's name or description changed",
+  ].filter(Boolean)
+  const drop = el('button', { class: 'primary small', type: 'button', onclick: () => discard() }, 'Drop changes')
+  const box = el(
+    'div',
+    { class: 'banner problem unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}` },
+    icon('triangle-alert'),
+    el(
+      'div',
+      { class: 'row-text' },
+      el('div', {}, `You can only read ${c.name} now, so these changes on this device can't be sent:`),
+      el('ul', {}, ...lines.map((l) => el('li', {}, l))),
+      el('div', { class: 'muted small-text' }, 'Dropping them gets the vault again from the server. Copy out anything you want to keep first.'),
+      el('div', { class: 'row-actions' }, el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(banner) }, 'Keep'), drop),
+    ),
+  )
+  banner.replaceWith(box)
+  drop.focus()
+  async function discard() {
+    drop.disabled = true
+    try {
+      const n = await ask('discardChanges', { key: p.key, vault: p.unsent })
+      box.remove()
+      say(n ? `Dropped ${n} unsent change${n > 1 ? 's' : ''} to ${c.name}.` : `Nothing was left to drop in ${c.name}.`)
+      render(document.getElementById('list'))
+    } catch (e) {
+      drop.disabled = false
+      say(explain(e), 'error')
+    }
+  }
 }
 
 let renderSeq = 0

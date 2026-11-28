@@ -320,7 +320,7 @@ pub fn open() -> Res<S> {
         eprintln!("plaintext: warning: {}", crate::clean(p));
     }
     // By id: anyone who may write can name a vault anything.
-    for id in &s.unsendable {
+    for (id, _) in &s.unsendable {
         let name = s.vaults.get(id).map_or("", |v| &v.meta.name);
         eprintln!("plaintext: warning: to see or drop the unsent changes to vault {}, run plaintext vault reset {id}", crate::clean(name));
     }

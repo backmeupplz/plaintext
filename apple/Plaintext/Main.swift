@@ -41,6 +41,8 @@ struct PlaintextMain: App {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    /// Asked from the banner, which may go away before the person answers.
+    @State private var reviewing: AppModel.UnsentRequest?
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
@@ -55,7 +57,8 @@ struct RootView: View {
             }
         }
         .overlay(alignment: .bottom) { ToastView() }
-        .overlay(alignment: .top) { BannerView() }
+        .overlay(alignment: .top) { BannerView(reviewing: $reviewing) }
+        .unsentDialog($reviewing)
         .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
             if phase == .active { Task { await model.syncAll() } }
         }
@@ -166,8 +169,46 @@ struct ToastView: View {
     }
 }
 
+extension View {
+    /// Show what dropping a vault's unsent changes would lose, then drop them.
+    func unsentDialog(_ request: Binding<AppModel.UnsentRequest?>) -> some View {
+        modifier(UnsentDialog(request: request))
+    }
+}
+
+private struct UnsentDialog: ViewModifier {
+    @EnvironmentObject var model: AppModel
+    @Binding var request: AppModel.UnsentRequest?
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "Drop changes to \(request?.changes.name ?? "this vault")?",
+            isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }),
+            titleVisibility: .visible,
+            presenting: request
+        ) { r in
+            Button("Drop changes", role: .destructive) { Task { await model.discard(r) } }
+        } message: { r in
+            Text(summary(r.changes))
+        }
+    }
+
+    private func summary(_ c: UnsentChanges) -> String {
+        var lines = ["You can only read \(c.name) now, so these changes on this device can't be sent:"]
+        if !c.changed.isEmpty {
+            let more = c.changed.count > 8 ? " and \(c.changed.count - 8) more" : ""
+            lines.append("Added or edited: \(c.changed.prefix(8).joined(separator: ", "))\(more)")
+        }
+        if c.deleted > 0 { lines.append(c.deleted == 1 ? "1 item deleted" : "\(c.deleted) items deleted") }
+        if c.renamed { lines.append("The vault's name or description changed") }
+        lines.append("Dropping them gets the vault again from the server. Copy out anything you want to keep first.")
+        return lines.joined(separator: "\n")
+    }
+}
+
 struct BannerView: View {
     @EnvironmentObject var model: AppModel
+    @Binding var reviewing: AppModel.UnsentRequest?
 
     var body: some View {
         if let text = model.banner {
@@ -175,6 +216,12 @@ struct BannerView: View {
                 Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Palette.warn)
                 Text(text).font(.subheadline).foregroundStyle(Palette.fg).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
+                if let u = model.bannerUnsent, u.text == text {
+                    Button("Review…") { Task { reviewing = await model.unsentRequest(account: u.account, vault: u.vault) } }
+                        .font(.subheadline.weight(.semibold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Palette.accent)
+                }
                 Button { model.banner = nil } label: { Image(systemName: "xmark").foregroundStyle(Palette.muted) }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Dismiss")
@@ -188,6 +235,8 @@ struct BannerView: View {
             .transition(.move(edge: .top).combined(with: .opacity))
             .task(id: text) {
                 AccessibilityNotification.Announcement(text).post()
+                // One with an action stays until it's used or dismissed.
+                if model.bannerUnsent?.text == text { return }
                 try? await Task.sleep(for: .seconds(Device.voiceOver ? 20 : 8))
                 withAnimation { if model.banner == text { model.banner = nil } }
             }

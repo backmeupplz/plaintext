@@ -284,3 +284,65 @@ fn several_accounts() {
     assert!(app.vaults().iter().all(|v| v.account_id == h));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Changes made offline to vaults bob was then made a reader of: each sync
+/// says so, and the app can show and drop them.
+#[test]
+fn unsendable_changes() {
+    let url = server();
+    let (alice, _) = app();
+    let a = alice.signup(url.clone(), "alice".into(), "alice pw".into(), Some("setup-code".into())).unwrap().account.id;
+    let (bob, dir) = app();
+    let r = bob.signup(url.clone(), "bob".into(), "bob pw".into(), Some(alice.invite(a.clone()).unwrap())).unwrap();
+    let b = r.account.id.clone();
+    alice.sync(a.clone()).unwrap();
+    let mut it = item_template("login".into());
+    it.title = "Router".into();
+    let (fam, work) = (alice.create_vault(a.clone(), "Family".into()).unwrap(), alice.create_vault(a.clone(), "Work".into()).unwrap());
+    let router = alice.put_item(a.clone(), fam.clone(), None, it.clone()).unwrap();
+    for v in [&fam, &work] {
+        alice.share_vault(a.clone(), v.clone(), "bob".into(), Role::Writer, None).unwrap();
+    }
+    bob.sync(b.clone()).unwrap();
+
+    // Offline: an item added to each, and the router deleted.
+    bob.lock(false);
+    bob.resume("http://127.0.0.1:9".into(), r.unlock.clone()).unwrap();
+    for (v, title) in [(&fam, "Bank"), (&work, "Mail")] {
+        it.title = title.into();
+        bob.put_item(b.clone(), v.clone(), None, it.clone()).unwrap();
+    }
+    bob.delete_item(b.clone(), fam.clone(), router).unwrap();
+    for v in [&fam, &work] {
+        alice.share_vault(a.clone(), v.clone(), "bob".into(), Role::Reader, None).unwrap();
+    }
+    bob.lock(false);
+    bob.resume(url.clone(), r.unlock.clone()).unwrap();
+    let unsent = |app: &PlaintextApp| {
+        let info = &app.accounts()[0];
+        info.problems.iter().zip(&info.problem_unsent).filter_map(|(p, v)| Some((p.clone(), v.clone()?))).collect::<Vec<_>>()
+    };
+    let found = unsent(&bob);
+    let mut ids: Vec<String> = found.iter().map(|(_, v)| v.clone()).collect();
+    ids.sort();
+    let mut want = vec![fam.clone(), work.clone()];
+    want.sort();
+    assert_eq!(ids, want);
+    assert!(found.iter().all(|(p, _)| p.ends_with("can't be sent")), "{found:?}");
+    assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), UnsentChanges { name: "Family".into(), changed: vec!["Bank".into()], deleted: 1, renamed: false });
+
+    // Dropping the first warning's changes leaves the other warning on its own vault.
+    let (first, second) = (found[0].1.clone(), found[1].1.clone());
+    assert_eq!(bob.discard_changes(b.clone(), first.clone()).unwrap(), if first == fam { 2 } else { 1 });
+    assert_eq!(unsent(&bob).into_iter().map(|(_, v)| v).collect::<Vec<_>>(), std::slice::from_ref(&second));
+    assert_eq!(bob.unsent_changes(b.clone(), first.clone()).unwrap().changed, Vec::<String>::new());
+    assert!(bob.accounts()[0].pending, "the other vault's change is still here");
+    bob.discard_changes(b.clone(), second).unwrap();
+    assert!(!bob.accounts()[0].pending && bob.accounts()[0].problems.is_empty());
+    assert_eq!(bob.items(None, Some(fam.clone()), "".into(), false).iter().map(|i| i.title.clone()).collect::<Vec<_>>(), ["Router"]);
+    // Kept that way after a restart.
+    bob.lock(false);
+    bob.resume(url.clone(), r.unlock).unwrap();
+    assert!(bob.accounts()[0].problems.is_empty() && bob.items(None, Some(work.clone()), "".into(), false).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

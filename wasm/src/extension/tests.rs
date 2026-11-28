@@ -213,7 +213,7 @@ fn a_full_vault_is_a_warning_not_a_failed_sync() {
 
     // The sync still counts: the other device's item arrives and the warning is a problem.
     let problems = run(sync(&mut s)).unwrap();
-    assert!(problems.iter().any(|p| p.contains("until there's room")), "{problems:?}");
+    assert!(problems.iter().any(|p| p["text"].as_str().unwrap().contains("until there's room")), "{problems:?}");
     assert_eq!(list(&s, None, "From the CLI").len(), 1);
     // The refused change is in this device's copy, for the next sync.
     let back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
@@ -249,4 +249,36 @@ fn a_submit_without_a_username() {
     assert_eq!(save_offer(&s, "https://three.example/", "", "other"), "none");
     assert_eq!(code(&run(save_login(&mut s, "https://two.example/", "", "other")).unwrap_err()), "refused");
     assert_eq!(list(&s, None, "").len(), 3);
+}
+
+#[test]
+fn changes_a_reader_cant_send_are_shown_and_dropped() {
+    let url = server();
+    let (_, alice) = Session::signup(Http::new(&url), "gus", "pw", None, "cli").unwrap();
+    let mut alice = alice.unwrap();
+    let invite = alice.invite().unwrap();
+    let (sk, bob) = Session::signup(Http::new(&url), "hal", "pw", Some(&invite), "cli").unwrap();
+    bob.unwrap().trust_inviter(&invite).unwrap();
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    alice.share_vault(&fam, "hal", Role::Writer, None).unwrap();
+    let (mut s, _) = run(add(Later(Http::new(&url)), "pw", &sk.encode(), "x")).unwrap();
+    run(sync(&mut s)).unwrap();
+
+    // Saved here while he could write, but not sent before he became a reader.
+    let mut v = s.vaults.remove(&fam).unwrap();
+    v.put(core::new_item_id(), Item { title: "Bank".into(), ..Default::default() });
+    s.vaults.insert(fam, v);
+    alice.share_vault(&fam, "hal", Role::Reader, None).unwrap();
+    let problems = run(sync(&mut s)).unwrap();
+    let p = problems.iter().find(|p| p["unsent"] == json!(fam.to_string())).unwrap_or_else(|| panic!("{problems:?}"));
+    assert!(p["text"].as_str().unwrap().ends_with("can't be sent"), "{p}");
+
+    // The browser suspended the background meanwhile: picked up from this device's copy.
+    let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), json!({ "name": "Family", "changed": ["Bank"], "deleted": 0, "renamed": false }));
+    assert_eq!(run(discard_changes(&mut back, &fam.to_string())).unwrap(), 1);
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap()["changed"], json!([]));
+    assert!(run(sync(&mut back)).unwrap().is_empty());
+    assert_eq!(code(&run(discard_changes(&mut back, "nope")).unwrap_err()), "not_found");
 }

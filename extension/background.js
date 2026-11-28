@@ -48,11 +48,12 @@ async function remember(a, acct) {
   await chrome.storage.session.set({ [`session:${a.key}`]: acct.sessionState() })
 }
 
-/** Sync, keep this device's copies, and return what the user should know. */
+/** Sync, keep this device's copies, and return what the user should know:
+ *  `{ text, key, unsent }`, where `unsent` is a vault whose changes here can't be sent. */
 async function sync(a, acct) {
   let problems
   try {
-    problems = JSON.parse(await acct.sync())
+    problems = JSON.parse(await acct.sync()).map((p) => ({ text: p.text, key: a.key, unsent: p.unsent }))
   } catch (e) {
     // The server ended the session (expired, or signed out elsewhere): unlock again.
     if (e.name === 'signed_out') await forget(a.key)
@@ -323,11 +324,32 @@ async function fromPage(msg) {
         try {
           problems.push(...(await sync(a, acct)))
         } catch (e) {
-          problems.push(`${a.username} on ${hostOf(a.server)}: ${e.name === 'network' ? "couldn't reach the server" : e.message}`)
+          problems.push({ text: `${a.username} on ${hostOf(a.server)}: ${e.name === 'network' ? "couldn't reach the server" : e.message}` })
         }
       }
       await touch()
       return problems
+    }
+    case 'unsentChanges': {
+      const [, acct] = (await unlocked()).find(([a]) => a.key === msg.key) ?? []
+      if (!acct) throw fail('locked', 'Unlock Plaintext first.')
+      await touch()
+      return JSON.parse(acct.unsentChanges(msg.vault))
+    }
+    case 'discardChanges': {
+      const [a, acct] = (await unlocked()).find(([x]) => x.key === msg.key) ?? []
+      if (!acct) throw fail('locked', 'Unlock Plaintext first.')
+      await touch()
+      let n
+      try {
+        n = await acct.discardChanges(msg.vault)
+      } catch (e) {
+        if (e.name === 'signed_out') await forget(a.key)
+        throw e
+      }
+      // Or a restored copy would bring the changes back.
+      await save(a.key, acct)
+      return n
     }
     case 'pending': {
       const p = await pending(msg.tabId)
@@ -420,7 +442,7 @@ async function add({ server, secretKey, password }) {
 async function settle(a, acct) {
   const problems = []
   const copies = await local(`local:${a.key}`)
-  if (copies) await acct.loadLocal(copies).catch((e) => problems.push(`This device's saved copy couldn't be merged: ${e.message}`))
+  if (copies) await acct.loadLocal(copies).catch((e) => problems.push({ text: `This device's saved copy couldn't be merged: ${e.message}` }))
   await remember(a, acct)
   // Kept now so a failed first sync can still be reopened offline; a copy that
   // didn't merge is left as it was.
@@ -428,7 +450,7 @@ async function settle(a, acct) {
   try {
     problems.push(...(await sync(a, acct)))
   } catch (e) {
-    problems.push(e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : e.message)
+    problems.push({ text: e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : e.message })
   }
   return problems
 }

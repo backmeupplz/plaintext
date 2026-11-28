@@ -205,6 +205,23 @@ pub struct AccountInfo {
     /// What the last sync couldn't do: vaults that didn't verify (kept as last
     /// verified) and invite conflicts. Show them; the other vaults synced.
     pub problems: Vec<String>,
+    /// For each problem, the vault whose unsent changes it says can't be sent
+    /// (you may only read it now): `unsent_changes` shows them, `discard_changes`
+    /// drops them.
+    pub problem_unsent: Vec<Option<String>>,
+}
+
+/// This device's changes to a vault that haven't reached the server, to show
+/// before `discard_changes` drops them.
+#[derive(uniffi::Record, Debug, PartialEq)]
+pub struct UnsentChanges {
+    pub name: String,
+    /// Titles of the items added or edited here.
+    pub changed: Vec<String>,
+    /// How many items were deleted here.
+    pub deleted: u32,
+    /// The vault's name or description changed here.
+    pub renamed: bool,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -1146,6 +1163,22 @@ impl PlaintextApp {
         Ok(device_code(a.server.clone(), username, sk.encode()))
     }
 
+    /// What `discard_changes` would drop from a vault.
+    pub fn unsent_changes(&self, account: String, vault: String) -> Res<UnsentChanges> {
+        let id = hex_id(&vault)?;
+        self.peek(&account, |s| {
+            let v = s.vaults.get(&id).ok_or_else(|| not_found("that vault"))?;
+            Ok(UnsentChanges { name: v.meta.name.clone(), changed: v.changed().map(|(_, i)| i.title.clone()).collect(), deleted: v.deleted() as u32, renamed: v.meta_changed() })
+        })
+    }
+
+    /// Drop this device's changes to a vault that haven't reached the server (it
+    /// is downloaded again), and the sync problem about them. Returns how many.
+    pub fn discard_changes(&self, account: String, vault: String) -> Res<u32> {
+        let id = hex_id(&vault)?;
+        self.with(&account, |s| Ok(s.discard_changes(&id)? as u32))
+    }
+
     // ----- Vaults and items -----
 
     /// Every account's vaults: each account's default vault first, then by name.
@@ -1699,7 +1732,7 @@ impl PlaintextApp {
 
     fn start(&self, s: S, server: String) -> Res<AccountInfo> {
         let id = hex::encode(s.account.id);
-        let info = AccountInfo { id: id.clone(), server: server.clone(), username: s.username().into(), admin: s.admin, fingerprint: s.me().fingerprint(), pending: false, problems: vec![] };
+        let info = AccountInfo { id: id.clone(), server: server.clone(), username: s.username().into(), admin: s.admin, fingerprint: s.me().fingerprint(), pending: false, problems: vec![], problem_unsent: vec![] };
         let a = Arc::new(Acct { id: id.clone(), server, info: RwLock::new(info), session: Mutex::new(s) });
         {
             let mut accounts = self.accounts.write().expect("lock");
@@ -1731,6 +1764,7 @@ impl PlaintextApp {
             info.admin = s.admin;
             info.pending = s.vaults.values().any(|v| v.has_changes());
             info.problems = s.problems.clone();
+            info.problem_unsent = (0..s.problems.len()).map(|i| s.unsendable.iter().find(|(_, j)| *j == i).map(|(id, _)| id.to_string())).collect();
         }
         let rows = s.vaults.iter().flat_map(|(vid, v)| {
             v.items().map(move |(id, item)| Row { account: a.id.clone(), vault: *vid, vault_name: v.meta.name.clone(), id: *id, item: item.clone() })

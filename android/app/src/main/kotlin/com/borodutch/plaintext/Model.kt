@@ -29,6 +29,7 @@ import uniffi.plaintext_ffi.PlaintextException
 import uniffi.plaintext_ffi.Recipe
 import uniffi.plaintext_ffi.Role
 import uniffi.plaintext_ffi.UnlockData
+import uniffi.plaintext_ffi.UnsentChanges
 import uniffi.plaintext_ffi.VaultInfo
 import uniffi.plaintext_ffi.WatchItem
 import uniffi.plaintext_ffi.breachCount
@@ -81,6 +82,12 @@ sealed interface Route {
     data class People(val account: String) : Route
 }
 
+/** The vault whose unsent changes the banner's problem ([text]) offers to drop. */
+data class Unsent(val text: String, val account: String, val vault: String)
+
+/** Changes to drop, once the person confirms. */
+data class UnsentRequest(val account: String, val vault: String, val changes: UnsentChanges)
+
 data class Toast(val text: String, val undo: (() -> Unit)? = null, val id: Long = System.nanoTime())
 
 /**
@@ -115,6 +122,8 @@ class Model(val context: Context) {
 
     var toast by mutableStateOf<Toast?>(null)
     var banner by mutableStateOf<String?>(null)
+    var bannerUnsent by mutableStateOf<Unsent?>(null)
+    var reviewing by mutableStateOf<UnsentRequest?>(null)
     var syncing by mutableStateOf(false)
     /** Bumped on every reload, so screens reading Rust directly (item detail) re-read too. */
     var version by mutableStateOf(0)
@@ -451,10 +460,37 @@ class Model(val context: Context) {
             reload()
             // The server signed this device out of its only open account.
             if (accounts.isEmpty() && !locked) lock()
-            // What the sync couldn't do; the client's text can end with a CLI hint, and the app has its own Verify screen.
-            val problem = accounts.flatMap { it.problems }.firstOrNull()?.substringBefore(" (plaintext ")?.replaceFirstChar { it.uppercase() }
-            if (first != null) show(first!!) else if (problem != null) banner = problem
+            if (first != null) show(first!!) else showProblems()
             if (syncAgain) syncAll()
+        }
+    }
+
+    /** What the sync couldn't do; the client's text can end with a CLI hint, and the app has its own Verify screen. */
+    private fun showProblems() {
+        val all = accounts.flatMap { a -> a.problems.zip(a.problemUnsent) { p, v -> Triple(a.id, p, v) } }
+        // The banner shows one at a time: one the person can act on comes first.
+        val (account, p, vault) = all.firstOrNull { it.third != null } ?: all.firstOrNull() ?: return
+        val text = p.substringBefore(" (plaintext ").replaceFirstChar { it.uppercase() }
+        banner = text
+        bannerUnsent = vault?.let { Unsent(text, account, it) }
+    }
+
+    /** Show what dropping a vault's unsent changes would lose (see [discard]). */
+    fun review(u: Unsent) = act { reviewing = UnsentRequest(u.account, u.vault, call { it.unsentChanges(u.account, u.vault) }) }
+
+    fun discard(r: UnsentRequest) {
+        reviewing = null
+        scope.launch {
+            try {
+                val n = call { it.discardChanges(r.account, r.vault) }.toInt()
+                if (bannerUnsent.let { it != null && it.account == r.account && it.vault == r.vault && it.text == banner }) banner = null
+                reload()
+                if (banner == null) showProblems()
+                flash(if (n == 0) "Nothing was left to drop" else "Dropped $n unsent change${if (n == 1) "" else "s"}")
+            } catch (e: Exception) {
+                reload()
+                show(e)
+            }
         }
     }
 

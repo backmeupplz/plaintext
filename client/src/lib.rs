@@ -229,8 +229,9 @@ pub struct Session<T: AsyncTransport> {
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
     /// Vaults whose changes the last `sync` couldn't send because we may only
-    /// read them now; `discard_changes` drops them.
-    pub unsendable: Vec<Hex>,
+    /// read them now, each with the index of its warning in `problems`;
+    /// `discard_changes` drops the changes and the warning.
+    pub unsendable: Vec<(Hex, usize)>,
 }
 
 /// The logic, written once. Browsers call these through an `AsyncTransport`;
@@ -328,7 +329,7 @@ impl<T: AsyncTransport> Session<T> {
                     let name = known.unwrap_or_else(|| id.to_string());
                     // Only pending changes make a reader's push fail.
                     let hint = if matches!(e, Error::Core(plaintext_core::Error::ReadOnly)) {
-                        self.unsendable.push(*id);
+                        self.unsendable.push((*id, self.problems.len()));
                         ", so this device's changes to it can't be sent"
                     } else {
                         ""
@@ -433,25 +434,33 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
         self.pull_async(id).await?;
         let n = self.vaults[id].changes();
-        if n == 0 {
-            return Ok(0);
+        if n > 0 {
+            // Edits overwrote, and deletes removed, the server's copies: fetch every item.
+            let mut fresh = Vault::new(*id);
+            let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
+            let mut keyring = self.keyring.clone();
+            let changed = fresh.apply(&resp, &mut keyring, now())?;
+            let old = &self.vaults[id];
+            if !fresh.same_head(old) {
+                // Newer: another device pushed in between. Older, or a different copy
+                // of the same version: the server is lying.
+                return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+            }
+            // The next sync uploads the keyring, as after any pull.
+            self.keyring = keyring;
+            self.keyring_dirty |= changed;
+            self.vaults.insert(*id, fresh);
         }
-        // Edits overwrote, and deletes removed, the server's copies: fetch every item.
-        let mut fresh = Vault::new(*id);
-        let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
-        let mut keyring = self.keyring.clone();
-        let changed = fresh.apply(&resp, &mut keyring, now())?;
-        let old = &self.vaults[id];
-        if !fresh.same_head(old) {
-            // Newer: another device pushed in between. Older, or a different copy
-            // of the same version: the server is lying.
-            return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+        // Nothing is left to send: so is the last sync's warning about it.
+        if let Some(k) = self.unsendable.iter().position(|(v, _)| v == id) {
+            let (_, i) = self.unsendable.remove(k);
+            if i < self.problems.len() {
+                self.problems.remove(i);
+            }
+            for (_, j) in &mut self.unsendable {
+                *j -= usize::from(*j > i);
+            }
         }
-        // The next sync uploads the keyring, as after any pull.
-        self.keyring = keyring;
-        self.keyring_dirty |= changed;
-        self.vaults.insert(*id, fresh);
-        self.unsendable.retain(|v| v != id);
         Ok(n)
     }
 

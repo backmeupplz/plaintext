@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Icon
@@ -45,6 +46,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import uniffi.plaintext_ffi.UnsentChanges
 
 @Composable
 fun Root() {
@@ -124,9 +126,32 @@ private fun Banner() {
         ) {
             Icon(Icons.Rounded.ErrorOutline, null, tint = P.danger)
             Text(text ?: "", color = P.fg, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 12.dp))
+            model.bannerUnsent?.takeIf { it.text == text }?.let { u -> TextButton(onClick = { model.review(u) }) { Text("Review…", color = P.accent) } }
             IconButton(onClick = { model.banner = null }) { Icon(Icons.Rounded.Close, "Dismiss", tint = P.muted) }
         }
     }
+    model.reviewing?.let { r ->
+        AlertDialog(
+            onDismissRequest = { model.reviewing = null },
+            title = { Text("Drop changes to ${r.changes.name}?") },
+            text = { Text(unsentSummary(r.changes)) },
+            confirmButton = { TextButton(onClick = { model.discard(r) }) { Text("Drop changes", color = P.danger) } },
+            dismissButton = { TextButton(onClick = { model.reviewing = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+private fun unsentSummary(c: UnsentChanges): String {
+    val lines = mutableListOf("You can only read ${c.name} now, so these changes on this device can't be sent:")
+    if (c.changed.isNotEmpty()) {
+        val more = if (c.changed.size > 8) " and ${c.changed.size - 8} more" else ""
+        lines += "Added or edited: ${c.changed.take(8).joinToString(", ")}$more"
+    }
+    val deleted = c.deleted.toInt()
+    if (deleted > 0) lines += if (deleted == 1) "1 item deleted" else "$deleted items deleted"
+    if (c.renamed) lines += "The vault's name or description changed"
+    lines += "Dropping them gets the vault again from the server. Copy out anything you want to keep first."
+    return lines.joinToString("\n")
 }
 
 /** Short confirmations ("Password copied"), with Undo where it applies. */
