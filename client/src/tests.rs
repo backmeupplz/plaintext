@@ -2365,6 +2365,60 @@ fn over_the_quota_a_big_push_goes_whole() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Over the quota a push must remove items, so a delete that removes nothing is
+/// refused: one the server already has (another device deleted the same item)
+/// is dropped on the pull, and an addition deleted before it went out leaves
+/// nothing to send. Neither holds up the owner taking access away.
+#[test]
+fn over_the_quota_deletes_the_server_has_done_are_dropped() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    roomy.sync().unwrap();
+    let v = roomy.default_vault().unwrap();
+    let a = plaintext_core::new_item_id();
+    roomy.put_item(&v, a, item("A", "a")).unwrap();
+    roomy.put_item(&v, plaintext_core::new_item_id(), item("B", "b")).unwrap();
+    let _ = join(Http::new(&url), "bob", "bob pw", None, "t");
+    roomy.share_vault(&v, "bob", Role::Writer, None).unwrap();
+    let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut d1 = login(&full, "alice pw", &ask);
+    let mut d2 = login(&full, "alice pw", &ask);
+    d1.sync().unwrap();
+    d2.sync().unwrap();
+    d2.vaults.get_mut(&v).unwrap().delete(a);
+    d1.delete_item(&v, a).unwrap();
+    d2.sync().unwrap();
+    assert!(!d2.vaults[&v].has_changes());
+    let x = plaintext_core::new_item_id();
+    d2.vaults.get_mut(&v).unwrap().put(x, item("X", "x"));
+    d2.vaults.get_mut(&v).unwrap().delete(x);
+    assert!(!d2.vaults[&v].has_changes());
+    d2.revoke(&v, "bob").unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A device updated from an older app (its snapshot has no `exact_base`) on an
+/// idle vault still splits a big import: with nothing pending, its copies are
+/// the server's.
+#[test]
+fn an_updated_idle_device_splits_a_big_import() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, stage_slack: Some(4096), ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    let v = alice.default_vault().unwrap();
+    alice.put_item(&v, plaintext_core::new_item_id(), item("One", "1")).unwrap();
+    let mut json = serde_json::to_value(&alice.vaults[&v]).unwrap();
+    json.as_object_mut().unwrap().remove("exact_base");
+    alice.vaults.insert(v, serde_json::from_value(json).unwrap());
+    alice.stage_past = 1024;
+    for i in 0..6 {
+        alice.vaults.get_mut(&v).unwrap().put(plaintext_core::new_item_id(), Item { notes: "x".repeat(2000), ..item(&format!("I{i}"), "p") });
+    }
+    alice.sync().unwrap();
+    assert!(!alice.vaults[&v].has_changes());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Leaving a vault the server stopped listing drops this device's unsent changes
 /// to it too, so sync stops reporting them.
 #[test]

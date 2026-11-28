@@ -191,6 +191,10 @@ impl Vault {
 
     /// Remember what an edit or delete started from (once per pending change).
     fn mark_base(&mut self, id: Hex) {
+        // Nothing pending: the local copies are the server's as of the last
+        // manifest, so the `base`s set from here on are exact (even in a snapshot
+        // from an older app).
+        self.exact_base |= self.dirty.is_empty() && self.deleted.is_empty();
         if let Some(e) = self.entries.get(&id)
             && !self.dirty.contains(&id)
             && !self.deleted.contains(&id)
@@ -210,9 +214,15 @@ impl Vault {
 
     pub fn delete(&mut self, id: Hex) {
         self.mark_base(id);
+        // An addition never sent (no server copy, never sealed for a push) has
+        // nothing to delete on the server: over the quota such a delete would
+        // remove nothing and be refused.
+        let unsent = self.dirty.contains(&id) && !self.base.contains_key(&id) && self.entries.get(&id).is_some_and(|e| e.blob.is_empty());
         self.entries.remove(&id);
         self.dirty.remove(&id);
-        self.deleted.insert(id);
+        if !unsent {
+            self.deleted.insert(id);
+        }
     }
 
     /// Of the files the server lists for this vault, the ones to delete: no item
@@ -556,6 +566,16 @@ impl Vault {
                 self.base_files.remove(&id);
             }
         }
+        // A delete the server already has (another device deleted it too, or our
+        // own push whose answer was lost) is done: sent again it would remove
+        // nothing, which over the quota is refused.
+        let done: Vec<Hex> = self.deleted.iter().filter(|id| !m.items.contains_key(id)).copied().collect();
+        for id in done {
+            self.deleted.remove(&id);
+            self.base.remove(&id);
+            self.base_content.remove(&id);
+            self.base_files.remove(&id);
+        }
         // Every pending change now starts from the server's copy: a partial push
         // lists it so. One the server dropped (deleted elsewhere) gets an empty
         // `base`: a partial push leaves it out, and if it comes back it's a change
@@ -786,6 +806,24 @@ mod tests {
         b.last = a.last.clone();
         b.counter = 1;
         assert!(!a.same_head(&b));
+    }
+
+    /// With nothing pending, an older app's snapshot holds the server's copies,
+    /// so a change made after loading it may be pushed in parts.
+    #[test]
+    fn an_idle_older_snapshot_splits() {
+        let me = crate::Keyring::new("alice").me();
+        let (mut v, _) = Vault::create(&me, "x").unwrap();
+        v.put(Hex([1; 16]), Item::default());
+        let p = v.push(&me, 0).unwrap();
+        v.pushed(&p);
+        let mut json = serde_json::to_value(&v).unwrap();
+        json.as_object_mut().unwrap().remove("exact_base");
+        let mut old: Vault = serde_json::from_value(json).unwrap();
+        for i in 2..5u8 {
+            old.put(Hex([i; 16]), Item::default());
+        }
+        assert_eq!(old.push_part(&me, 0, 1).unwrap().upserts.len(), 1);
     }
 
     /// A snapshot from an older app may hold stale `base`s: it pushes everything

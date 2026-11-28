@@ -1047,6 +1047,41 @@ fn partial_push_leaves_out_an_item_deleted_elsewhere() {
     assert_eq!(titles(&vb), ["x=px2"]);
 }
 
+/// A delete that would remove nothing isn't sent (over the quota it's refused):
+/// one the server already has is done once pulled, and an addition deleted
+/// before it went out was never there. One sealed for a push whose answer was
+/// lost may be there, so it still goes out.
+#[test]
+fn deletes_of_items_the_server_lacks_are_dropped() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut va, nv) = Vault::create(&me, "Shared").unwrap();
+    let mut log = Log::new(&nv);
+    let x = new_item_id();
+    va.put(x, login("x", "px"));
+    let p = va.push(&me, 0).unwrap();
+    va.pushed(&p);
+    log.put(&p);
+    let mut vb = Vault::new(va.id);
+    vb.apply(&log.full("alice"), &mut a, 0).unwrap();
+    va.delete(x);
+    vb.delete(x);
+    let pb = vb.push(&me, 0).unwrap();
+    vb.pushed(&pb);
+    log.put(&pb);
+    va.apply(&delta(&log, &pb), &mut a, 0).unwrap();
+    assert!(!va.has_changes());
+    let y = new_item_id();
+    va.put(y, login("y", "py"));
+    va.delete(y);
+    assert!(!va.has_changes());
+    let z = new_item_id();
+    va.put(z, login("z", "pz"));
+    let _lost = va.push(&me, 0).unwrap();
+    va.delete(z);
+    assert_eq!(va.push(&me, 0).unwrap().deletes, [z]);
+}
+
 /// A push in parts: each lists the server's copies of what it leaves out, so
 /// other devices take every part (another device's push in between included),
 /// and a device starting afresh sees the same.
