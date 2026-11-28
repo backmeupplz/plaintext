@@ -481,7 +481,14 @@ class Model(val context: Context) {
     }
 
     /** Show what dropping a vault's unsent changes would lose (see [discard]). */
-    fun review(u: Unsent) = act { reviewing = UnsentRequest(u.account, u.vault, call { it.unsentChanges(u.account, u.vault) }) }
+    fun review(u: Unsent) {
+        val e = epoch
+        act {
+            val changes = call { it.unsentChanges(u.account, u.vault) }
+            // Locked meanwhile: nothing opens over the lock screen.
+            if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes)
+        }
+    }
 
     fun discard(r: UnsentRequest) {
         reviewing = null

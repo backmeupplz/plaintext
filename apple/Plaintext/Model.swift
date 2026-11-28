@@ -548,8 +548,10 @@ final class AppModel: ObservableObject {
 
     /// What dropping a vault's unsent changes would lose, to confirm with `unsentDialog`.
     func unsentRequest(account: String, vault: String) async -> UnsentRequest? {
+        let gen = lockGen
         do {
             let changes = try await call { try $0.unsentChanges(account: account, vault: vault) }
+            if lockedSince(gen) { return nil }
             return UnsentRequest(account: account, vault: vault, changes: changes)
         } catch {
             show(error)
