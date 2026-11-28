@@ -569,7 +569,8 @@ pub mod tests {
         state::forget(&cfg, false).unwrap();
         unlock(&cfg, &mut red, &mut ask).unwrap();
         assert_eq!(asked.take(), ["PIN for security key red: "]);
-        let ids: Vec<String> = load(&cfg).unwrap().keys.into_iter().map(|k| k.session).collect();
+        let mut ids: Vec<String> = load(&cfg).unwrap().keys.into_iter().map(|k| k.session).collect();
+        ids.reverse(); // red's first: it's still ended last
         assert!(state::end_sessions(&cfg, ids.clone()).unwrap());
         assert!(first.sessions().unwrap().iter().all(|x| !ids.contains(&x.id)));
         assert!(state::entry(&cfg, "session").unwrap().get().is_err(), "this terminal's session was red's");

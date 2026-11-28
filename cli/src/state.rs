@@ -202,12 +202,10 @@ pub fn save_config(cfg: &Config) -> Res<()> {
 pub fn remove_account(cfg: &Config) -> Res<()> {
     let mut a = load_accounts()?;
     // The security keys' sessions end too, if this terminal has a session to do it with.
-    let ended = match crate::seckey::load(cfg) {
-        Ok(k) => end_sessions(cfg, k.keys.into_iter().map(|k| k.session).collect())?,
-        Err(_) => false,
-    };
-    if !ended {
-        eprintln!("plaintext: the sessions of this computer's security keys couldn't be ended; they end on their own within 30 days, or end them from another device with `plaintext sessions --end`.");
+    let ids: Option<Vec<String>> = crate::seckey::load(cfg).ok().map(|k| k.keys.into_iter().map(|k| k.session).collect());
+    if !ids.clone().map_or(Ok(false), |ids| end_sessions(cfg, ids))? {
+        let ids = ids.map_or("their ids are unknown".into(), |ids| ids.join(", "));
+        eprintln!("plaintext: the sessions of this computer's security keys ({ids}) couldn't be ended; they end on their own within 30 days, or end them from another device with `plaintext sessions --end ID`.");
     }
     crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e}), so it's still signed in; try again"))?;
     forget(cfg, true)?;

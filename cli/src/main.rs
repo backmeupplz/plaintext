@@ -968,7 +968,7 @@ fn key_cmd(k: KeyCmd) -> Res<()> {
             };
             // End their server sessions too (unlocking first if nothing here can);
             // the copies that held them are gone either way.
-            let end = || state::end_sessions(&cfg, ended.clone()).map_err(|e| format!("ended their sessions, but couldn't forget this terminal's on this computer ({e}); run `plaintext lock`"));
+            let end = || state::end_sessions(&cfg, ended.clone()).map_err(|e| format!("couldn't delete this terminal's ended session on this computer ({e}); run `plaintext lock`"));
             if !end()? && !(state::open().is_ok() && end()?) {
                 note!("Couldn't end their sessions on the server ({}); they end on their own within 30 days, or with `plaintext sessions --end ID`.", ended.join(", "));
                 if !all && state::stored_session(&cfg).is_some_and(|id| ended.contains(&id)) {
@@ -1001,7 +1001,7 @@ fn account_cmd(a: AccountCmd) -> Res<()> {
         }
         AccountCmd::Remove { account } => {
             let c = accts.accounts[state::pick(&accts.accounts, &account)?].clone();
-            state::remove_account(&c)?;
+            state::remove_account(&c).map_err(|e| format!("couldn't forget {} on this computer ({e}), so it's still listed; try again", c.name()))?;
             say!("Signed out of {} and forgot its Secret Key on this computer. Your data on the server is untouched.", c.name());
         }
         AccountCmd::Delete => {
