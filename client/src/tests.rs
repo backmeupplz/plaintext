@@ -2111,6 +2111,14 @@ fn security_key_for_sign_in() {
     alice.end_session(&id).unwrap();
     let SignIn::Key(mut p) = Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() else { panic!("still trusted after its session ended") };
     let (_, trust) = p.finish(Some(key.assert(&rp, &p.needed.challenge.0, &url)), None).unwrap();
+    // A device ending its own other session (the CLI does, for its unlock keys) stays trusted.
+    let signed_in = || match Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() {
+        SignIn::Done(s) => s,
+        SignIn::Key(_) => panic!("no longer trusted"),
+    };
+    let (one, two) = (signed_in(), signed_in());
+    one.end_session(&two.sessions().unwrap().into_iter().find(|x| x.current).unwrap().id).unwrap();
+    signed_in();
     // Trust lapses 90 days after the device last signed in.
     let db = plaintext_server::open_db(path.to_str().unwrap()).unwrap();
     db.execute_batch("UPDATE trusted_devices SET used = used - 89 * 86400").unwrap();

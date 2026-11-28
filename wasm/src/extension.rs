@@ -516,8 +516,8 @@ impl SignInResult {
 }
 
 /// A sign-in waiting for the account's security key (DESIGN "Signing in with a
-/// security key"): the approval page (`page`) takes the key's answer, then
-/// `finish` signs in; or `finish` with a recovery code.
+/// security key"): `finish` with the key's answer to `request`, or with a
+/// recovery code, or after the approval page (`page`) took the key's answer.
 #[wasm_bindgen]
 pub struct PendingSignIn {
     p: Rc<RefCell<Option<Pending<Fetch>>>>,
@@ -563,12 +563,15 @@ impl PendingSignIn {
         let assertion = assertion.map(|a| serde_json::from_str(&a)).transpose().map_err(|_| js_err(core::Error::Tampered.into()))?;
         let mut p = self.p.borrow_mut().take().ok_or_else(busy)?;
         let r = p.finish_async(assertion, recovery.as_deref().filter(|c| !c.trim().is_empty())).await;
+        let signed_in = p.signed_in();
         *self.p.borrow_mut() = Some(p);
         let (s, trust) = r.map_err(|e| {
             let (name, text) = match &e {
                 Error::Server(409, _) => ("not_approved", "Your security key hasn't approved this sign-in yet. Open the approval page, touch your key there, then continue.".into()),
                 Error::Server(401, m) if m.contains("recovery code") => ("bad_code", "That recovery code is wrong or already used.".into()),
                 Error::Server(401, m) if m.contains("too long") => ("expired", "This sign-in took too long. Unlock again to start over.".into()),
+                // The server refused the key's answer, and says why (not set up for this account, a copied key).
+                Error::Server(401, m) if !signed_in => ("key_refused", m.chars().take(1).flat_map(char::to_uppercase).chain(m.chars().skip(1)).chain(['.']).collect()),
                 _ => (code(&e), e.to_string()),
             };
             let err = js_sys::Error::new(&text);

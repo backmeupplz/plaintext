@@ -29,7 +29,7 @@ async function start() {
     return main.replaceChildren(el('p', { class: 'error pad' }, explain(e)))
   }
   if (!st.accounts.length) return welcome()
-  // A sign-in left waiting for its security key while the approval page was open.
+  // A sign-in left waiting for its security key (the popup closed meanwhile).
   const waits = (await ask('awaitingKey').catch(() => [])).filter((w) => st.accounts.some((a) => a.key === w.key && !a.unlocked))
   if (waits.length) return keyPanel(waits)
   if (!st.accounts.some((a) => a.unlocked)) return locked(st.accounts)

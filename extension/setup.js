@@ -46,7 +46,7 @@ $('add').addEventListener('submit', (e) => {
   ask('add', { server: url.href, secretKey: $('sk').value, password: $('pw').value })
     .then(function signedIn(r) {
       msg.className = ''
-      // The account needs its security key: approve in a new tab, then continue here.
+      // The account needs its security key: ask it here (or approve on the server's page).
       if (r.error === 'key_needed') {
         msg.textContent = ''
         return $('key-step').replaceChildren(keyStep(r, (done) => ($('key-step').replaceChildren(), signedIn(done))))
