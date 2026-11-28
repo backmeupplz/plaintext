@@ -1,0 +1,40 @@
+name: Android
+# The Android app: builds the FFI for x86_64 with cargo-ndk (dev profile, for speed), generates the Kotlin bindings and
+# makes the R8-minified release APK, unsigned (the release key isn't on CI). R8 runs here because a missing keep rule
+# only shows up in the minified build. The FFI itself is tested by `cargo test` in ci.yml.
+on:
+  pull_request:
+    paths: ['android/**', 'ffi/**', 'client/**', 'core/**', 'Cargo.lock', 'Cargo.toml', '.forgejo/workflows/android.yml']
+  push:
+    branches: [main]
+    paths: ['android/**', 'ffi/**', 'client/**', 'core/**', 'Cargo.lock', 'Cargo.toml', '.forgejo/workflows/android.yml']
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: 17
+      # The Forgejo job image has no Android SDK. Gradle installs the platform and build tools itself.
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          packages: platform-tools ndk;28.2.13676358
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      - run: ABIS=x86_64 PROFILE=dev TASK=assembleRelease android/build.sh

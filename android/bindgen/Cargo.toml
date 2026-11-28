@@ -1,0 +1,10 @@
+[package]
+name = "uniffi-bindgen-kotlin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Generates the Android app's Kotlin bindings for plaintext-ffi (android/build.sh runs it)"
+
+[dependencies]
+uniffi = { version = "0.33", features = ["cli"] }
