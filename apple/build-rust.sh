@@ -18,17 +18,17 @@ cargo=cargo
 target_dir="${CARGO_TARGET_DIR:-target}"
 
 export IPHONEOS_DEPLOYMENT_TARGET=17.0 MACOSX_DEPLOYMENT_TARGET=14.0
-for t in $targets; do
-  $cargo build --locked -p plaintext-ffi --lib --profile "$profile" --target "$t"
-done
+set --
+for t in $targets; do set -- "$@" --target "$t"; done
+$cargo build --locked -p plaintext-ffi --lib --profile "$profile" "$@" # all targets in one go, built side by side
 
 out=apple/Generated
 rm -rf "$out" apple/PlaintextFFI.xcframework
 mkdir -p "$out/headers"
 lib() { echo "$target_dir/$1/$dir/libplaintext_ffi.a"; }
-$cargo run --locked -q -p plaintext-ffi --features bindgen --bin uniffi-bindgen-swift -- \
+$cargo run --locked -q -p uniffi-bindgen-kotlin --bin uniffi-bindgen-swift -- \
   "$(lib ${targets%% *})" "$out" --swift-sources --headers
-$cargo run --locked -q -p plaintext-ffi --features bindgen --bin uniffi-bindgen-swift -- \
+$cargo run --locked -q -p uniffi-bindgen-kotlin --bin uniffi-bindgen-swift -- \
   "$(lib ${targets%% *})" "$out/headers" --modulemap --module-name plaintext_ffiFFI --modulemap-filename module.modulemap
 mv "$out"/*.h "$out/headers/"
 

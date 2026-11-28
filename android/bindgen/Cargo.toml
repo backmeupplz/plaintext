@@ -4,7 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Generates the Android app's Kotlin bindings for plaintext-ffi (android/build.sh runs it)"
+description = "Generates the apps' bindings for plaintext-ffi: Kotlin (android/build.sh) and Swift (apple/build-rust.sh)"
+default-run = "uniffi-bindgen-kotlin"
+
+# Swift's bindgen reads the built library, so it lives here rather than in plaintext-ffi: a change to the
+# Rust code then doesn't rebuild the whole FFI for the host just to run it.
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/swift.rs"
 
 [dependencies]
 uniffi = { version = "0.33", features = ["cli"] }

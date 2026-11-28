@@ -9,14 +9,6 @@ description = "UniFFI bindings for the Plaintext apps (Swift, Kotlin)"
 name = "plaintext_ffi"
 crate-type = ["lib", "staticlib", "cdylib"]
 
-[[bin]]
-name = "uniffi-bindgen-swift"
-path = "src/bindgen.rs"
-required-features = ["bindgen"]
-
-[features]
-bindgen = ["uniffi/cli"]
-
 [dependencies]
 plaintext-client = { path = "../client" }
 hex = "0.4"
