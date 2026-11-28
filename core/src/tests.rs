@@ -1007,3 +1007,90 @@ fn unicode_hosts_match_their_punycode() {
     assert!(on("http://１２７．０．０．１:8080", "http://127.0.0.1:8080/", true));
     assert_eq!(site::host("https://www.Bücher.de/x").as_deref(), Some("xn--bcher-kva.de"));
 }
+
+/// An item deleted here and elsewhere, then saved here again: a partial push
+/// mustn't list it at the copy the server dropped.
+#[test]
+fn partial_push_leaves_out_an_item_deleted_elsewhere() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut va, nv) = Vault::create(&me, "Shared").unwrap();
+    let mut log = Log::new(&nv);
+    let (x, y) = (new_item_id(), new_item_id());
+    va.put(x, login("x", "px"));
+    va.put(y, login("y", "py"));
+    let p = va.push(&me, 0).unwrap();
+    va.pushed(&p);
+    log.put(&p);
+    let mut vb = Vault::new(va.id);
+    vb.apply(&log.full("alice"), &mut a, 0).unwrap();
+    // Both delete x; b's goes out first, and a pulls it.
+    va.delete(x);
+    vb.delete(x);
+    let pb = vb.push(&me, 0).unwrap();
+    vb.pushed(&pb);
+    log.put(&pb);
+    va.apply(&delta(&log, &pb), &mut a, 0).unwrap();
+    // a saves x again (undo) and deletes y; over the quota it sends the deletes alone.
+    va.put(x, login("x", "px2"));
+    va.delete(y);
+    let pd = va.push_part(&me, 0, 0).unwrap();
+    assert!(pd.upserts.is_empty());
+    va.pushed(&pd);
+    log.put(&pd);
+    vb.apply(&delta(&log, &pd), &mut a, 0).unwrap();
+    assert!(titles(&vb).is_empty());
+    let p = va.push(&me, 0).unwrap();
+    va.pushed(&p);
+    log.put(&p);
+    vb.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    assert_eq!(titles(&vb), ["x=px2"]);
+}
+
+/// A push in parts: each lists the server's copies of what it leaves out, so
+/// other devices take every part (another device's push in between included),
+/// and a device starting afresh sees the same.
+#[test]
+fn pushes_in_parts() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let (e, d) = (new_item_id(), new_item_id());
+    v1.put(e, login("edit", "old"));
+    v1.put(d, login("delete", "d"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    let mut v2 = Vault::new(v1.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v1.put(e, login("edit", "new"));
+    v1.delete(d);
+    for i in 0..3 {
+        v1.put(new_item_id(), login(&format!("new{i}"), "n"));
+    }
+    let mut parts = 0;
+    while v1.has_changes() {
+        let p = v1.push_part(&me, 0, 1).unwrap();
+        assert_eq!(p.upserts.len(), 1);
+        assert_eq!(p.deletes.is_empty(), parts > 0);
+        v1.pushed(&p);
+        log.put(&p);
+        v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
+        let mut fresh = Vault::new(v1.id);
+        fresh.apply(&log.full("alice"), &mut a, 0).unwrap();
+        assert_eq!(titles(&fresh), titles(&v2));
+        parts += 1;
+        if parts == 1 {
+            // Another device pushes in between (a 409 for this one, which pulls).
+            v2.put(new_item_id(), login("other", "o"));
+            let p2 = v2.push(&me, 0).unwrap();
+            v2.pushed(&p2);
+            log.put(&p2);
+            v1.apply(&delta(&log, &p2), &mut a, 0).unwrap();
+        }
+    }
+    assert_eq!(parts, 4);
+    assert_eq!(titles(&v2), titles(&v1));
+    assert_eq!(titles(&v2), ["edit=new", "new0=n", "new1=n", "new2=n", "other=o"]);
+}

@@ -2209,3 +2209,26 @@ fn staging_is_capped_without_a_quota() {
     assert_eq!(stage(&alice, st, 200), 413);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Without a quota a member may stage only so much beyond a vault's items, so
+/// a big import goes out in several pushes, each of at most four stage parts.
+#[test]
+fn big_imports_go_out_in_several_pushes() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, stage_slack: Some(4000), ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    alice.stage_past = 1000;
+    let v = alice.default_vault().unwrap();
+    let manifests = count(&path, "SELECT COUNT(*) FROM manifests");
+    // 12 items of about 800 bytes sealed: four to a push.
+    for i in 0..12 {
+        alice.vaults.get_mut(&v).unwrap().put(plaintext_core::new_item_id(), Item { notes: "n".repeat(600), ..item(&format!("Item {i}"), "x") });
+    }
+    alice.sync().unwrap();
+    assert!(!alice.vaults[&v].has_changes());
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM manifests") - manifests, 3);
+    let mut alice2 = login(&url, "alice pw", &ask);
+    alice2.sync().unwrap();
+    assert_eq!(alice2.vaults[&v].items().count(), 12);
+    let _ = std::fs::remove_file(&path);
+}

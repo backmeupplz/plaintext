@@ -87,6 +87,11 @@ pub struct Vault {
     orphans: BTreeMap<Hex, u64>,
     #[serde(default)]
     files_checked: u64,
+    /// Every pending change's `base` is the server's copy as of the last manifest
+    /// (empty if the server dropped it), so a partial push may list the server's
+    /// copies (`push_part`). False in snapshots from apps that didn't keep it so.
+    #[serde(default)]
+    exact_base: bool,
 }
 
 fn h(b: &[u8]) -> B64 {
@@ -137,6 +142,7 @@ impl Vault {
             base_files: BTreeMap::new(),
             orphans: BTreeMap::new(),
             files_checked: 0,
+            exact_base: true,
         }
     }
 
@@ -533,16 +539,6 @@ impl Vault {
                 next.insert(*id, e.clone());
             }
         }
-        // An item edited here that the server no longer has: a deletes-only push
-        // mustn't list it, and if it comes back it's a change (rebased, with a
-        // conflict copy if its content differs).
-        for id in &self.dirty {
-            if !m.items.contains_key(id)
-                && let Some(b) = self.base.get_mut(id)
-            {
-                b.0.clear();
-            }
-        }
         self.entries = next;
         self.deleted = deleted;
         for (id, hash, content, files) in rebase {
@@ -556,6 +552,21 @@ impl Vault {
                 self.base_files.remove(&id);
             }
         }
+        // Every pending change now starts from the server's copy: a partial push
+        // lists it so. One the server dropped (deleted elsewhere) gets an empty
+        // `base`: a partial push leaves it out, and if it comes back it's a change
+        // (rebased, with a conflict copy if its content differs).
+        for id in self.dirty.iter().chain(&self.deleted) {
+            match m.items.get(id) {
+                Some(hash) => drop(self.base.insert(*id, hash.clone())),
+                None => {
+                    if let Some(b) = self.base.get_mut(id) {
+                        b.0.clear();
+                    }
+                }
+            }
+        }
+        self.exact_base = true;
         for (id, mut item) in conflicts {
             // The server serves this version under `id` until our edit is pushed.
             self.base_files.entry(id).or_default().extend(item.file_ids());
@@ -594,34 +605,43 @@ impl Vault {
     /// Seal pending changes into a signed request. After a 2xx call `pushed`;
     /// after a 409, pull (`apply`) and push again.
     pub fn push(&mut self, me: &Me, now: u64) -> Result<VaultPut, Error> {
-        self.seal_push(me, now, false)
+        self.seal_push(me, now, usize::MAX)
     }
 
-    /// Like `push`, but only the pending deletes (and the name, if changed): added
-    /// and edited items stay pending, as the server has them. Over the quota a push
-    /// must remove items, so a refused addition mustn't hold deletes up.
-    pub fn push_deletes(&mut self, me: &Me, now: u64) -> Result<VaultPut, Error> {
-        self.seal_push(me, now, true)
+    /// Like `push`, but with only as many added and edited items as fit in `budget`
+    /// bytes sealed (at least one, unless `budget` is 0), with every delete and the
+    /// name. The rest stay pending, as the server has them. Over the quota a push
+    /// must remove items, so a refused addition mustn't hold deletes up (`budget`
+    /// 0); without a quota a member may stage only so much at once (a big import).
+    /// A vault restored from an older app's snapshot pushes everything until its
+    /// next pull with a manifest (or a push leaving nothing pending): until then it
+    /// can't tell which server copies a partial push would list.
+    pub fn push_part(&mut self, me: &Me, now: u64, budget: usize) -> Result<VaultPut, Error> {
+        self.seal_push(me, now, if self.exact_base { budget } else { usize::MAX })
     }
 
-    fn seal_push(&mut self, me: &Me, now: u64, deletes_only: bool) -> Result<VaultPut, Error> {
+    fn seal_push(&mut self, me: &Me, now: u64, budget: usize) -> Result<VaultPut, Error> {
         if self.role(&me.username, now).is_none_or(|r| r < Role::Writer) {
             return Err(Error::ReadOnly);
         }
         let vk = self.key()?;
-        let mut upserts = Vec::new();
-        for id in self.dirty.iter().filter(|_| !deletes_only) {
-            let ad = self.item_ad(id);
-            let e = self.entries.get_mut(id).expect("dirty entries exist");
-            e.blob = seal_json(&vk, &ad, &e.item);
-            upserts.push(ItemBlob { id: *id, blob: B64(e.blob.clone()) });
+        let (mut upserts, mut used) = (Vec::new(), 0);
+        for id in self.dirty.iter().take_while(|_| budget > 0) {
+            let blob = seal_json(&vk, &self.item_ad(id), &self.entries[id].item);
+            if !upserts.is_empty() && used + blob.len() > budget {
+                break;
+            }
+            used += blob.len();
+            self.entries.get_mut(id).expect("dirty entries exist").blob = blob.clone();
+            upserts.push(ItemBlob { id: *id, blob: B64(blob) });
         }
-        // Left out of a deletes-only push, an edited item stays at the server's copy
+        let sent: BTreeSet<Hex> = upserts.iter().map(|u| u.id).collect();
+        // Left out of a partial push, an edited item stays at the server's copy
         // (`base`, empty once the server dropped it); an added one isn't there yet.
         let items = self
             .entries
             .iter()
-            .filter_map(|(id, e)| match self.dirty.contains(id) && deletes_only {
+            .filter_map(|(id, e)| match self.dirty.contains(id) && !sent.contains(id) {
                 false => Some((*id, h(&e.blob))),
                 true => self.base.get(id).filter(|b| !b.0.is_empty()).map(|b| (*id, b.clone())),
             })
@@ -659,6 +679,7 @@ impl Vault {
             self.base_files.remove(d);
         }
         self.meta_dirty = false;
+        self.exact_base |= self.dirty.is_empty() && self.deleted.is_empty();
     }
 
     fn next_roster(&self, me: &Me, now: u64) -> Result<Roster, Error> {
@@ -749,5 +770,30 @@ mod tests {
         b.last = a.last.clone();
         b.counter = 1;
         assert!(!a.same_head(&b));
+    }
+
+    /// A snapshot from an older app may hold stale `base`s: it pushes everything
+    /// at once until a push leaves nothing pending (or a pull brings a manifest).
+    #[test]
+    fn older_snapshots_push_everything() {
+        let me = crate::Keyring::new("alice").me();
+        let (mut v, _) = Vault::create(&me, "x").unwrap();
+        let x = Hex([1; 16]);
+        v.put(x, Item::default());
+        let p = v.push(&me, 0).unwrap();
+        v.pushed(&p);
+        v.delete(x);
+        v.put(Hex([2; 16]), Item::default());
+        v.put(Hex([3; 16]), Item::default());
+        assert_eq!(v.push_part(&me, 0, 1).unwrap().upserts.len(), 1);
+        let mut json = serde_json::to_value(&v).unwrap();
+        json.as_object_mut().unwrap().remove("exact_base");
+        let mut old: Vault = serde_json::from_value(json).unwrap();
+        assert_eq!(old.push_part(&me, 0, 0).unwrap().upserts.len(), 2);
+        let p = old.push_part(&me, 0, 1).unwrap();
+        assert_eq!((p.upserts.len(), p.deletes.len()), (2, 1));
+        old.pushed(&p);
+        old.put(Hex([4; 16]), Item::default());
+        assert!(old.push_part(&me, 0, 0).unwrap().upserts.is_empty());
     }
 }
