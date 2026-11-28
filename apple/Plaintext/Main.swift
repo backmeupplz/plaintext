@@ -111,10 +111,10 @@ enum Guard {
         Activity.watch()
         RunLoop.main.add(Timer(timeInterval: 15, repeats: true) { _ in MainActor.assumeIsolated { _ = Activity.check() } }, forMode: .common)
         #if os(iOS)
-        // Not while a sign-in waits on the browser's approval page for the security key.
-        on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 && model.keyPage == nil { model.lock() } }
+        // Not while the browser shows the approval page for a security key (`external`, once).
+        on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 && !model.external { model.lock() } }
         // Time away counts as time without use.
-        on(UIApplication.willEnterForegroundNotification) { _ in Activity.check() }
+        on(UIApplication.willEnterForegroundNotification) { _ in model.external = false; Activity.check() }
         on(UIApplication.protectedDataWillBecomeUnavailableNotification) { _ in model.lock() }
         // The app switcher snapshot shows nothing, onboarding (the Secret Key) included.
         on(UIScene.willDeactivateNotification) { n in PrivacyCover.set(n.object as? UIWindowScene, true) }
@@ -128,8 +128,8 @@ enum Guard {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { model.lock() }
         }
-        on(NSApplication.didResignActiveNotification) { _ in if autoLock == 0 && model.keyPage == nil { model.lock() } }
-        on(NSApplication.didBecomeActiveNotification) { _ in Activity.check() }
+        on(NSApplication.didResignActiveNotification) { _ in if autoLock == 0 && !model.external { model.lock() } }
+        on(NSApplication.didBecomeActiveNotification) { _ in model.external = false; Activity.check() }
         on(NSApplication.willTerminateNotification) { _ in Clipboard.clear() }
         // Sheets and Settings are windows of their own: hide each one as it appears.
         on(NSWindow.didBecomeKeyNotification) { _ in NoCapture.apply() }

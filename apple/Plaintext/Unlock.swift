@@ -94,6 +94,7 @@ struct UnlockView: View {
                     Task {
                         if await model.confirmOwnerToAdd() {
                             model.cancelKeyStep()
+                            keyFor = nil
                             signingIn = true
                         }
                     }
@@ -161,7 +162,10 @@ struct KeyStepView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("This account needs your security key to sign in on this device.").font(.headline)
             Button {
-                if let p = model.keyPage, let u = URL(string: p) { openURL(u) }
+                if let p = model.keyPage, let u = URL(string: p) {
+                    model.external = true
+                    openURL(u)
+                }
             } label: {
                 Label("Approve with my security key", systemImage: "key")
             }

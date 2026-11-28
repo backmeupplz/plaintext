@@ -506,6 +506,8 @@ async function finishKey({ key, recovery }) {
     trust = pending.trust()
   } catch (e) {
     if (e.name === 'expired') await chrome.storage.session.remove(k)
+    // The server may have finished it before the account failed to load: keep that, so trying again doesn't ask the key twice.
+    else await chrome.storage.session.set({ [k]: { ...p, state: pending.state() } })
     throw e
   } finally {
     pending.free()

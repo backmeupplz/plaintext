@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -419,7 +420,7 @@ private fun PasswordStep(flow: Flow) {
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     // The Secret Key of a sign-in this step left waiting for the account's security key.
-    var keySk by remember { mutableStateOf<String?>(null) }
+    var keySk by rememberSaveable { mutableStateOf<String?>(null) }
     // The account may already exist once the server answers: stay until it does.
     BackHandler(enabled = busy) {}
     val insecure = runCatching { serverAddress(flow.server).insecure }.getOrDefault(false)

@@ -243,8 +243,16 @@ pub fn sign_in(cfg: &Config, d: &Derived, device: &str, auth: &mut dyn Authentic
         true => Err(format!("none of this account's security keys was added for {rp}").into()),
         false => auth.assert(&rp, &creds, &cd),
     };
+    // The server finished but the account didn't load (the network): once more, without spending anything again.
+    let again = |p: &mut plaintext_client::Pending<plaintext_client::Http>, r: Result<(S, String), Error>| match r {
+        Err(Error::Network(_)) if p.signed_in() => p.finish(None, None),
+        r => r,
+    };
     let done = match answer {
-        Ok((id, auth_data, signature)) => p.finish(Some(Assertion { id: B64(id), client_data: B64(cd), auth_data: B64(auth_data), signature: B64(signature) }), None)?,
+        Ok((id, auth_data, signature)) => {
+            let r = p.finish(Some(Assertion { id: B64(id), client_data: B64(cd), auth_data: B64(auth_data), signature: B64(signature) }), None);
+            again(&mut p, r)?
+        }
         Err(e) => {
             eprintln!("plaintext: {}", crate::clean(&e.to_string()));
             let page = format!("{}{}", cfg.server, p.page());
@@ -252,7 +260,8 @@ pub fn sign_in(cfg: &Config, d: &Derived, device: &str, auth: &mut dyn Authentic
             loop {
                 let a = ask(&format!("Approve the sign-in at {page} with your security key and press Enter, or type a recovery code: "))?;
                 let code = Some(a.trim()).filter(|c| !c.is_empty());
-                match p.finish(None, code) {
+                let r = p.finish(None, code);
+                match again(&mut p, r) {
                     Err(Error::Server(409 | 401, m)) if tries < 4 && !m.contains("too long") => {
                         tries += 1;
                         eprintln!("plaintext: {}", crate::clean(&m));

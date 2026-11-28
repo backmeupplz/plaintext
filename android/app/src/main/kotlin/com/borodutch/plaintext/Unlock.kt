@@ -98,7 +98,7 @@ fun UnlockScreen() {
     var signingIn by rememberSaveable { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     // This screen's unlock is waiting for the account's security key.
-    var keyStep by remember { mutableStateOf(false) }
+    var keyStep by rememberSaveable { mutableStateOf(false) }
     val target = model.known(accountId) ?: model.lockedAccounts.firstOrNull()
     val canBiometric = model.vault.biometrics && model.vault.anySession() && Vault.biometricsAvailable(context)
 

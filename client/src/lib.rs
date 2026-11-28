@@ -279,7 +279,7 @@ impl<T: AsyncTransport> Pending<T> {
     /// background can be stopped while the approval page is open). As sensitive
     /// as the Account Key: keep it only in memory.
     pub fn state(&self) -> serde_json::Value {
-        serde_json::json!({ "account_id": hex::encode(self.account_id), "unlock_key": hex::encode(&self.unlock_key[..]), "needed": self.needed })
+        serde_json::json!({ "account_id": hex::encode(self.account_id), "unlock_key": hex::encode(&self.unlock_key[..]), "needed": self.needed, "done": self.done })
     }
 
     pub fn restore(t: T, state: &serde_json::Value) -> Result<Self> {
@@ -288,7 +288,14 @@ impl<T: AsyncTransport> Pending<T> {
         let account_id = hex32("account_id").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
         let unlock_key: [u8; 32] = hex32("unlock_key").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
         let needed = serde_json::from_value(state.get("needed").cloned().ok_or_else(bad)?).map_err(|_| bad())?;
-        Ok(Pending { t: Some(t), account_id, unlock_key: zeroize::Zeroizing::new(unlock_key), needed, done: None })
+        let done = state.get("done").cloned().and_then(|d| serde_json::from_value(d).ok());
+        Ok(Pending { t: Some(t), account_id, unlock_key: zeroize::Zeroizing::new(unlock_key), needed, done })
+    }
+
+    /// The server finished the sign-in, but opening the account failed: `finish`
+    /// again (with nothing) only opens it.
+    pub fn signed_in(&self) -> bool {
+        self.done.is_some()
     }
 
     /// Where the approval page is, after the server's address, for apps that

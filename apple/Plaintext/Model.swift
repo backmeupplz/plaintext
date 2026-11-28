@@ -129,6 +129,9 @@ final class AppModel: ObservableObject {
     /// A sign-in waiting for the account's security key (DESIGN "Signing in with a
     /// security key"): the server's approval page, which `KeyStepView` opens.
     @Published var keyPage: String?
+    /// The app went to the browser for the approval page: leaving it then doesn't
+    /// lock with auto-lock set to immediately. Cleared when the app is active again.
+    var external = false
     /// The vault the banner's problem offers to leave, while that banner shows.
     @Published var bannerLeave: (text: String, account: String, vault: String)?
     /// A vault to leave, once the person confirms (`leaveDialog`).
@@ -388,6 +391,12 @@ final class AppModel: ObservableObject {
 
     /// After the password (and the security key, if it took one) signed `k` in.
     func unlocked(_ k: KnownAccount, _ r: LoginResult, since gen: Int) {
+        // A sign-in finished for another account than this screen started: keep nothing under the wrong name.
+        guard r.account.id == k.id else {
+            lock()
+            banner = "That sign-in was for another account. Unlock again."
+            return
+        }
         saveSession(r.unlock, for: k)
         if lockedSince(gen) { return }
         reload()
