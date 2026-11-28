@@ -1663,7 +1663,7 @@ fn paged_pulls() {
     busy.hooks.borrow_mut().extend((0..5).map(|_| push("Busy")));
     let mut busy = Session::login(busy, &derive("alice pw", &ask), "t").unwrap();
     busy.sync().unwrap();
-    assert!(busy.problems.iter().any(|p| p.contains("kept changing")), "{:?}", busy.problems);
+    assert!(busy.problems.iter().any(|p| p.contains("kept changing") && !p.contains("leave")), "{:?}", busy.problems);
     assert!(!busy.vaults.contains_key(&personal));
     busy.sync().unwrap();
     assert_eq!(busy.vaults[&personal].items().count(), 46);

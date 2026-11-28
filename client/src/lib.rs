@@ -75,6 +75,9 @@ pub struct ImportReport {
 /// items in parts of about this size, well under the server's 32 MiB request limit.
 const STAGE_PAST: usize = 16 << 20;
 
+/// Why a pull gave up: the vault kept changing between its pages (`pull_pages_async`).
+const BUSY: &str = "it kept changing while it was pulled; the next sync tries again";
+
 /// An inbox message as opened, or why it couldn't be.
 pub type Received = std::result::Result<(Message, Content), plaintext_core::Error>;
 
@@ -354,11 +357,14 @@ impl<T: AsyncTransport> Session<T> {
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
+                    let busy = matches!(&e, Error::Refused(m) if m == BUSY);
                     match known {
                         // Your own vault: a server serving an old copy mustn't talk you into deleting it.
-                        Some((name, creator)) if creator == self.keyring.username => {
+                        // Nor a vault that was only busy: it will sync next time.
+                        Some((name, creator)) if creator == self.keyring.username || busy => {
                             self.problems.push(format!("vault {name} wasn't updated: {e}"))
                         }
+                        None if busy => self.problems.push(format!("vault {id} wasn't updated: {e}")),
                         k => {
                             let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
                             let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
@@ -448,7 +454,7 @@ impl<T: AsyncTransport> Session<T> {
             }
         }
         // Not a held-back change: nothing was pulled, so nothing may be collected on its strength.
-        Err(Error::Refused("it kept changing while it was pulled; the next sync tries again".into()))
+        Err(Error::Refused(BUSY.into()))
     }
 
     async fn sync_and_tidy(&mut self, id: &Hex) -> Result<()> {
