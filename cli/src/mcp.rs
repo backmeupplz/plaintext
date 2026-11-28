@@ -185,7 +185,16 @@ fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
                 ..Default::default()
             };
             let reference = format!("pt://{}/{}/password", s.vaults[&vid].meta.name, item.title);
-            s.put_item(&vid, new_id(), item)?;
+            let iid = new_id();
+            if let Err(e) = s.put_item(&vid, iid, item) {
+                // Take a refused item back out, or a retry would queue it twice (as the app does).
+                if let Some(v) = s.vaults.get_mut(&vid)
+                    && v.get(&iid).is_some()
+                {
+                    v.delete(iid);
+                }
+                return Err(e.into());
+            }
             state::save(s)?;
             format!("Saved. The password is available as {reference}")
         }

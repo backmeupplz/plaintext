@@ -239,6 +239,21 @@ pub const NONE: Option<&()> = None;
 /// How long a file no item refers to stays on the server (`Session::collect_files`).
 pub const FILE_GRACE: u64 = 7 * 24 * 3600;
 
+/// A vault by id prefix or name (case-insensitive). A full id wins over a vault
+/// someone named like it.
+fn find<'a>(name: &str, vaults: impl Iterator<Item = (&'a Hex, &'a Vault)> + Clone) -> Result<Hex> {
+    let n = name.to_lowercase();
+    if let Some((id, _)) = vaults.clone().find(|(id, _)| id.to_string() == n) {
+        return Ok(*id);
+    }
+    let hits: Vec<Hex> = vaults.filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n)).map(|(id, _)| *id).collect();
+    match hits.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(Error::NotFound(format!("vault {name}"))),
+        _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
+    }
+}
+
 /// A signed-in, unlocked account.
 pub struct Session<T: AsyncTransport> {
     pub t: T,
@@ -251,7 +266,9 @@ pub struct Session<T: AsyncTransport> {
     pub admin: bool,
     pub vaults: BTreeMap<Hex, Vault>,
     /// Vaults the server stopped listing. Their verified state is kept, so if
-    /// they come back the server can't hand us an older copy as if new.
+    /// they come back the server can't hand us an older copy as if new. Changes
+    /// made here can't be sent: sync says so until `discard_changes` drops them,
+    /// keeping only that guard (`Vault::forget`).
     pub hidden: BTreeMap<Hex, Vault>,
     /// Per vault, members whose accounts the server says were deleted.
     gone: BTreeMap<Hex, Vec<String>>,
@@ -260,7 +277,8 @@ pub struct Session<T: AsyncTransport> {
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
     /// Vaults whose changes the last `sync` couldn't send because we may only
-    /// read them now; `discard_changes` drops them.
+    /// read them now, or the server stopped listing them (`hidden`);
+    /// `discard_changes` drops them.
     pub unsendable: Vec<Hex>,
 }
 
@@ -360,8 +378,11 @@ impl<T: AsyncTransport> Session<T> {
                     // A vault opened before keeps its name, though it may never open again.
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| (v.meta.name.clone(), v.creator.clone()));
                     let read_only = matches!(e, Error::Core(plaintext_core::Error::ReadOnly));
-                    if known.is_none() {
-                        self.vaults.remove(id);
+                    // One reset while unlisted keeps its guard for the next try.
+                    if known.is_none()
+                        && let Some(v) = self.vaults.remove(id).filter(|v| v.counter > 0)
+                    {
+                        self.hidden.insert(*id, v);
                     }
                     let busy = matches!(&e, Error::Refused(m) if m == BUSY);
                     match known {
@@ -394,6 +415,11 @@ impl<T: AsyncTransport> Session<T> {
                 Err(e) => return Err(e),
             }
         }
+        for (id, v) in self.hidden.iter().filter(|(_, v)| v.has_changes()) {
+            let name = if v.meta.name.is_empty() { id.to_string() } else { v.meta.name.clone() };
+            self.problems.push(format!("vault {name} isn't listed for you any more, so this device's changes to it can't be sent unless it's shared with you again"));
+            self.unsendable.push(*id);
+        }
         // Someone can make you an owner and leave, and the vault counts against you
         // from then on (DESIGN "Leaving"). Name every vault you pay for: one you aren't a
         // current member of always, one you can open but didn't create only while storage
@@ -406,9 +432,13 @@ impl<T: AsyncTransport> Session<T> {
                     "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
                     v.meta.name, v.creator
                 )),
-                None => self.problems.push(format!(
-                    "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
-                )),
+                None => {
+                    // The name this device last saw, if it kept the vault (`hidden`).
+                    let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
+                    self.problems.push(format!(
+                        "vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
+                    ))
+                }
             }
         }
         // Users who joined with our invites get verified through their proof.
@@ -543,7 +573,15 @@ impl<T: AsyncTransport> Session<T> {
     /// (say, made before we became a reader) by downloading it again. The new copy
     /// must be the version this device already verified; otherwise, or if the
     /// download fails, nothing changes. Returns how many changes were dropped.
+    ///
+    /// A vault the server no longer lists can't be downloaded: it keeps only its
+    /// rollback guard, and is downloaded in full if it's listed again.
     pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
+        if let Some(v) = self.hidden.get_mut(id) {
+            let n = if v.has_changes() { v.forget() } else { 0 };
+            self.unsendable.retain(|v| v != id);
+            return Ok(n);
+        }
         self.pull_async(id).await?;
         let n = self.vaults[id].changes();
         if n == 0 {
@@ -751,22 +789,12 @@ impl<T: AsyncTransport> Session<T> {
 
     /// Find a vault by id prefix or name (case-insensitive).
     pub fn vault(&self, name: &str) -> Result<Hex> {
-        let n = name.to_lowercase();
-        // A full id wins over a vault someone named like it.
-        if let Some(id) = self.vaults.keys().find(|id| id.to_string() == n) {
-            return Ok(*id);
-        }
-        let hits: Vec<Hex> = self
-            .vaults
-            .iter()
-            .filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n))
-            .map(|(id, _)| *id)
-            .collect();
-        match hits.as_slice() {
-            [one] => Ok(*one),
-            [] => Err(Error::NotFound(format!("vault {name}"))),
-            _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
-        }
+        find(name, self.vaults.iter())
+    }
+
+    /// Like `vault`, also among vaults the server stopped listing (`hidden`).
+    pub fn vault_or_hidden(&self, name: &str) -> Result<Hex> {
+        find(name, self.vaults.iter().chain(&self.hidden))
     }
 
     /// The vault new items go to by default: the one this account made at signup.
@@ -1177,9 +1205,10 @@ impl<T: Transport> Session<T> {
         self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
         // Kept as a vault this device knows nothing about: unsent changes are
         // gone, and if someone adds us again it starts afresh.
-        if self.vaults.remove(id).is_some() {
+        if self.vaults.remove(id).is_some() || self.hidden.contains_key(id) {
             self.hidden.insert(*id, Vault::new(*id));
         }
+        self.unsendable.retain(|u| u != id);
         Ok(())
     }
 

@@ -221,6 +221,23 @@ fn sync_and_server_tampering() {
     next.apply(&good, &mut a, 0).unwrap();
     let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![], sealed: Some(pf.sealed.clone()), ..Default::default() };
     assert_eq!(next.apply(&fork, &mut a, 0), Err(Error::Rollback));
+
+    // Reset to its rollback guard, a device downloads the vault afresh, but neither
+    // an older copy nor a different one at the counter it saw.
+    assert_eq!(next.forget(), 0);
+    assert_eq!(next.apply(&Log::new(&nv).full("alice"), &mut a, 0), Err(Error::Rollback));
+    assert_eq!(next.apply(&log2.full("alice"), &mut a, 0), Err(Error::Rollback));
+    // Nor the other branch grown past it, served whole or from its next manifest.
+    f.pushed(&pf);
+    f.put(new_item_id(), login("further", "w"));
+    let pf2 = f.push(&me, 0).unwrap();
+    log2.put(&pf2);
+    let mut ahead = log2.full("alice");
+    assert_eq!(next.apply(&ahead, &mut a, 0), Err(Error::Rollback));
+    ahead.manifests.drain(..2);
+    assert_eq!(next.apply(&ahead, &mut a, 0), Err(Error::Rollback));
+    next.apply(&good, &mut a, 0).unwrap();
+    assert_eq!(next.items().count(), 2);
 }
 
 #[test]

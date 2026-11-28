@@ -1153,6 +1153,23 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
     bob.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift), None);
+
+    // Bob is taken out of a vault he made while his agent stays in, with a change
+    // his device hadn't sent: it's named by its name, and leaving drops the change.
+    let kept = bob.create_vault("Kept").unwrap();
+    bob.share_vault(&kept, "mallory", Role::Owner, None).unwrap();
+    bob.share_vault(&kept, "bob-bot", Role::Writer, None).unwrap();
+    bob.vaults.get_mut(&kept).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
+    mallory.sync().unwrap();
+    mallory.revoke(&kept, "bob").unwrap();
+    assert_eq!(creator(&kept).as_deref(), Some("bob"));
+    bob.sync().unwrap();
+    assert!(bob.unsendable.contains(&kept));
+    assert!(bob.problems.iter().any(|p| p.starts_with("vault Kept counts against your storage")), "{:?}", bob.problems);
+    bob.leave_vault(&kept).unwrap();
+    assert!(bob.unsendable.is_empty() && !bob.hidden[&kept].has_changes());
+    bob.sync().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains("Kept") || p.contains(&kept.to_string())), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
 
     // Without a quota, an openable vault someone handed you costs nothing and isn't
@@ -1648,6 +1665,96 @@ fn an_edit_or_delete_keeps_another_device_s_newer_change() {
     assert_eq!(v.get(&d).map(|i| i.password.as_str()), Some("alice-v2"), "alice's edit brings Disney back");
     assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
 }
+
+#[test]
+fn a_vault_no_longer_listed_can_drop_its_unsent_changes() {
+    let (url, path) = server();
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default(), Default::default()), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let (nid, did) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    alice.put_item(&fam, nid, item("Netflix", "n3tfl1x-pass")).unwrap();
+    alice.put_item(&fam, did, item("Disney", "d1sney")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+
+    // Offline, bob edits, deletes and adds; meanwhile alice removes him.
+    bob.t.1.set(true);
+    let offline = |r: Result<()>| assert!(matches!(r, Err(Error::Network(_))), "{r:?}");
+    offline(bob.put_item(&fam, nid, item("Netflix", "edited offline")));
+    offline(bob.delete_item(&fam, did));
+    offline(bob.put_item(&fam, plaintext_core::new_item_id(), item("Offline", "o")));
+    bob.t.1.set(false);
+    alice.revoke(&fam, "bob").unwrap();
+    bob.sync().unwrap();
+    assert!(bob.hidden.contains_key(&fam) && !bob.vaults.contains_key(&fam));
+    // The CLI turns `unsendable` into its `vault reset` hint.
+    let warned = |s: &Session<Flaky>| s.problems.iter().any(|p| p.contains("Family isn't listed")) && s.unsendable == [fam];
+    assert!(warned(&bob), "{:?}", bob.problems);
+    bob.sync().unwrap();
+    assert!(warned(&bob), "every sync says so");
+    // Only the reset looks among vaults the server stopped listing.
+    assert!(bob.vault("Family").is_err());
+    assert_eq!(bob.vault_or_hidden(&fam.to_string()[..8]).unwrap(), fam);
+    assert_eq!(bob.vault_or_hidden("family").unwrap(), fam);
+    assert_eq!(bob.vault_or_hidden(&fam.to_string()).unwrap(), fam);
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert!(bob.unsendable.is_empty());
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
+    assert!(bob.hidden[&fam].counter > 0, "the rollback guard stays");
+
+    // Shared again, he gets the vault as the server has it; nothing he dropped reaches alice.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
+    assert!(v.get(&did).is_some());
+    assert_eq!(v.items().count(), 2);
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Later", "l")).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
+    assert!(v.get(&did).is_some());
+    assert!(v.items().any(|(_, i)| i.title == "Later") && !v.items().any(|(_, i)| i.title == "Offline"));
+
+    // A vault the server merely hides (no new key, nothing resent) comes back
+    // whole after a reset, and still can't be swapped for an older copy.
+    let mut a2 = Session::login(evil(&url), &derive("alice pw", &ask), "tablet").unwrap();
+    a2.sync().unwrap();
+    let old = a2.t.inner.send("GET", &format!("/v1/vaults/{fam}?since=0&latest=true"), Some(&a2.token), None).unwrap().1;
+    alice.put_item(&fam, nid, item("Netflix", "newer")).unwrap();
+    a2.sync().unwrap();
+    a2.t.hide.set(Some(fam));
+    a2.sync().unwrap();
+    let hidden = a2.hidden.get_mut(&fam).unwrap();
+    hidden.put(nid, item("Netflix", "dropped"));
+    hidden.delete(did);
+    a2.sync().unwrap();
+    assert!(a2.problems.iter().any(|p| p.contains("isn't listed")), "{:?}", a2.problems);
+    assert_eq!(a2.discard_changes(&fam).unwrap(), 2);
+    a2.t.hide.set(None);
+    *a2.t.replay.borrow_mut() = Some((format!("/v1/vaults/{fam}?"), old));
+    for _ in 0..2 {
+        a2.sync().unwrap();
+        assert!(a2.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a2.problems);
+        assert!(!a2.vaults.contains_key(&fam) && a2.hidden[&fam].counter > 0, "the guard survives a refused copy");
+    }
+    *a2.t.replay.borrow_mut() = None;
+    a2.sync().unwrap();
+    assert!(a2.problems.is_empty(), "{:?}", a2.problems);
+    let (mine, theirs) = (&a2.vaults[&fam], &alice.vaults[&fam]);
+    assert_eq!(mine.get(&nid).unwrap().password, "newer");
+    assert!(mine.get(&did).is_some());
+    assert_eq!(mine.items().count(), theirs.items().count());
+    assert!(mine.same_head(theirs));
+    let _ = std::fs::remove_file(&path);
+}
+
 
 /// A transport whose network can be switched off, or a GET answered with an old reply.
 struct Flaky(Http, std::cell::Cell<bool>, std::cell::RefCell<Option<(String, Vec<u8>)>>);
