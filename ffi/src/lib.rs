@@ -959,7 +959,10 @@ fn writable(s: &S, vid: &Hex) -> Res<()> {
 /// harmless if the put did arrive), so trying again doesn't leave a second copy.
 fn put_new(s: &mut S, vid: &Hex, iid: Hex, it: Item) -> Res<()> {
     s.put_item(vid, iid, it).map_err(|e| {
-        if let Some(v) = s.vaults.get_mut(vid) {
+        // A refused put changed nothing: a delete would queue a change of its own.
+        if let Some(v) = s.vaults.get_mut(vid)
+            && v.get(&iid).is_some()
+        {
             v.delete(iid);
         }
         e.into()
@@ -1271,7 +1274,8 @@ impl PlaintextApp {
     pub fn move_item(&self, account: String, vault: String, id: String, to_account: String, to_vault: String) -> Res<String> {
         let (vid, iid, to) = (hex_id(&vault)?, hex_id(&id)?, hex_id(&to_vault)?);
         let (mut it, files) = self.with(&account, |s| {
-            writable(s, &vid)?;
+            // The freshest roster, so a stale writer isn't left with a copy in each place.
+            s.writable(&vid)?;
             let it = get_item(s, &vid, &iid)?;
             let mut files = Vec::new();
             for f in &it.files {

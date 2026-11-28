@@ -172,6 +172,8 @@ fn app_end_to_end() {
     alice.send_item(a.clone(), work.clone(), moved.clone(), "bob".into(), None).unwrap();
     let inbox = bob.inbox(b.clone()).unwrap();
     assert!(matches!(&inbox[0].content, InboxContent::Item { item } if item.title == "GitHub"));
+    assert!(matches!(bob.save_from_inbox(b.clone(), inbox[0].id.clone(), Some(view.clone())), Err(PlaintextError::ReadOnly)));
+    assert!(!bob.acct(&b).unwrap().session.lock().unwrap().vaults[&hex_id(&view).unwrap()].has_changes(), "a refused save queues nothing");
     bob.save_from_inbox(b.clone(), inbox[0].id.clone(), None).unwrap();
     assert!(bob.inbox(b.clone()).unwrap().is_empty());
     let link = alice.create_link(a.clone(), work.clone(), moved.clone(), "https://vault.family.org/s/".into(), 3600, true).unwrap();

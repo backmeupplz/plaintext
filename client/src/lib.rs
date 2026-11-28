@@ -792,18 +792,21 @@ impl<T: Transport> Session<T> {
             None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => s.default_vault().map(Some),
             None => Ok(s.own_vault(&v.name)),
         };
-        let mut checked = Vec::new();
+        // Kept, so a pull here that renames a vault can't send items to an unchecked one.
+        let mut targets = Vec::new();
         for v in &imported {
-            if let Some(id) = target(self, v)?
-                && !checked.contains(&id)
+            let to = target(self, v)?;
+            if let Some(id) = to
+                && !targets.contains(&to)
             {
                 self.writable(&id)?;
-                checked.push(id);
             }
+            targets.push(to);
         }
         let mut n = 0;
-        for v in imported {
-            let vid = match target(self, &v)? {
+        for (v, to) in imported.into_iter().zip(targets) {
+            // A name not found above may be a vault made earlier in this import.
+            let vid = match to.or_else(|| self.own_vault(&v.name)) {
                 Some(id) => id,
                 None => self.create_vault(&v.name)?,
             };
