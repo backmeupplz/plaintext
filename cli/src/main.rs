@@ -996,6 +996,9 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             };
             let (what, name) = if known { ("name", s.vaults[&id].meta.name.clone()) } else { ("full id", id.to_string()) };
             println!("This takes you and your agents out of {name}. If nobody else uses it, it's deleted with everything in it.");
+            if s.keyring.default_vault == Some(id) {
+                println!("It's the vault you made at signup, where new items go. If sync can't update it or the server stopped listing it, don't leave it for that: a server can do that on purpose to get it deleted.");
+            }
             if s.leaves_ownerless(&id)? {
                 println!("You're its only owner: the others keep it, but nobody can add people to it or replace its key any more.");
             }
