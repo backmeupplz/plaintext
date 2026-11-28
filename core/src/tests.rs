@@ -1250,3 +1250,45 @@ fn older_snapshots_split_after_a_pull_with_a_manifest() {
     v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
     assert_eq!(titles(&v2), ["x=x", "z=z"]);
 }
+
+/// An older app's snapshot with changes pending takes its `base`s from the
+/// latest manifest, fetched on its own, also one an older app wrote (with its
+/// sealed part inside): then it pushes in parts and drops a delete the server
+/// doesn't need. Another manifest at the same counter is a fork.
+#[test]
+fn older_snapshots_take_their_bases_from_the_latest_manifest() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let (x, y) = (new_item_id(), new_item_id());
+    v1.put(x, login("x", "x"));
+    let mut p = v1.push(&me, 0).unwrap();
+    // As an older app wrote it: the sealed part inside the envelope.
+    let mut env: ManifestEnvelope = serde_json::from_slice(&p.manifest.body.0).unwrap();
+    (env.sealed, env.sealed_hash) = (Some(p.sealed.clone()), None);
+    p.manifest = me.sign_doc("manifest", &env);
+    log.put(&p);
+    let mut v = Vault::new(v1.id);
+    v.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v.put(x, login("x", "edited"));
+    v.delete(y);
+    v.put(new_item_id(), login("z", "z"));
+    let mut json = serde_json::to_value(&v).unwrap();
+    json.as_object_mut().unwrap().remove("exact_base");
+    let mut old: Vault = serde_json::from_value(json).unwrap();
+    assert!(old.exact_base_query().is_some());
+    assert_eq!(old.push_part(&me, 0, 0).unwrap().upserts.len(), 2);
+    let latest = |m: &Signed, counter| VaultResponse { counter, manifests: vec![m.clone()], sealed: None, ..Default::default() };
+
+    // The server moved on meanwhile: the next pull brings that manifest.
+    assert_eq!(old.exact_base_from(&latest(&p.manifest, 3)), Ok(false));
+    let fork = v1.push(&me, 0).unwrap();
+    assert_eq!(old.exact_base_from(&latest(&fork.manifest, 2)), Err(Error::Rollback));
+
+    assert_eq!(old.exact_base_from(&latest(&p.manifest, 2)), Ok(true));
+    assert!(old.exact_base_query().is_none());
+    let p = old.push_part(&me, 0, 0).unwrap();
+    assert_eq!((p.upserts.len(), p.deletes.len()), (0, 0), "no delete of an item the server never had");
+    assert_eq!(old.push_part(&me, 0, 1).unwrap().upserts.len(), 1);
+}

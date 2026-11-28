@@ -551,6 +551,14 @@ impl<T: AsyncTransport> Session<T> {
         let v = self.vaults.get_mut(id).expect("checked above");
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
         self.gone.insert(*id, resp.gone);
+        // An older app's snapshot with changes pending, and no manifest pulled to
+        // fix its `base`s: fetch the latest one. Best effort: without it, the push
+        // sends everything at once, as that app did.
+        if let Some(q) = v.exact_base_query()
+            && let Ok(resp) = self.call_async::<VaultResponse>("GET", &format!("/v1/vaults/{id}?{q}"), NONE).await
+        {
+            self.vaults.get_mut(id).expect("checked above").exact_base_from(&resp)?;
+        }
         Ok(())
     }
 
@@ -733,7 +741,7 @@ impl<T: AsyncTransport> Session<T> {
                 Err(e @ Error::Server(507, _)) => {
                     let v = self.vaults.get_mut(id).expect("exists");
                     if v.deleted() > 0 && v.changed().next().is_some() {
-                        // An older app's snapshot can't push part of its changes yet (`push_part`).
+                        // An older app's snapshot can't push part of its changes until a pull fixes its `base`s (`push_part`).
                         let put = v.push_part(&me, now(), 0)?;
                         if put.upserts.is_empty() && self.send_put_async(id, &put).await.is_ok() {
                             self.vaults.get_mut(id).expect("exists").pushed(&put);

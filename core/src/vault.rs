@@ -566,22 +566,7 @@ impl Vault {
                 self.base_files.remove(&id);
             }
         }
-        // Every pending change now starts from the server's copy: a partial push
-        // lists it so. One the server dropped (deleted elsewhere) gets an empty
-        // `base`: a partial push leaves it out, and if it comes back it's a change
-        // (rebased, with a conflict copy if its content differs).
-        for id in self.dirty.iter().chain(&self.deleted) {
-            match m.items.get(id) {
-                Some(hash) => drop(self.base.insert(*id, hash.clone())),
-                None => {
-                    if let Some(b) = self.base.get_mut(id) {
-                        b.0.clear();
-                    }
-                }
-            }
-        }
-        self.exact_base = true;
-        self.drop_done_deletes();
+        self.base_from(&m.items);
         for (id, mut item) in conflicts {
             // The server serves this version under `id` until our edit is pushed.
             self.base_files.entry(id).or_default().extend(item.file_ids());
@@ -600,6 +585,59 @@ impl Vault {
         self.counter = counter;
         self.last = last;
         Ok(kr_changed)
+    }
+
+    /// Every pending change now starts from the server's copy (`items`, the latest
+    /// manifest's): a partial push lists it so. One the server dropped (deleted
+    /// elsewhere) gets an empty `base`: a partial push leaves it out, and if it
+    /// comes back it's a change (rebased, with a conflict copy if its content differs).
+    fn base_from(&mut self, items: &BTreeMap<Hex, B64>) {
+        for id in self.dirty.iter().chain(&self.deleted) {
+            match items.get(id) {
+                Some(hash) => drop(self.base.insert(*id, hash.clone())),
+                None => {
+                    if let Some(b) = self.base.get_mut(id) {
+                        b.0.clear();
+                    }
+                }
+            }
+        }
+        self.exact_base = true;
+        self.drop_done_deletes();
+    }
+
+    /// A snapshot from an older app with changes pending can't tell which `base`s
+    /// are the server's copies, and a pull that brings no manifest doesn't fix that
+    /// (`push_part`). This query fetches the latest manifest alone, without items,
+    /// for `exact_base_from`; None when there's no need.
+    pub fn exact_base_query(&self) -> Option<String> {
+        let r = self.roster.as_ref().filter(|_| !self.exact_base && self.counter > 0)?;
+        if self.dirty.is_empty() && self.deleted.is_empty() {
+            return None;
+        }
+        // Items come after `after` by id: none come after the largest one.
+        Some(format!("since={}&latest=true&roster={}&after={}", self.counter - 1, r.version, Hex([0xff; 16])))
+    }
+
+    /// Take the `base`s from the latest manifest (`exact_base_query`), if it's
+    /// the one verified here; returns whether it was. A server that moved on
+    /// meanwhile leaves this to the next pull, which brings the new manifest.
+    pub fn exact_base_from(&mut self, resp: &VaultResponse) -> Result<bool, Error> {
+        let Some(s) = resp.manifests.last().filter(|_| resp.counter == self.counter) else {
+            return Ok(false);
+        };
+        // Verified when it was pulled or pushed: the same hash is the same manifest.
+        if h(&s.body.0) != self.last {
+            return Err(Error::Rollback);
+        }
+        let env: ManifestEnvelope = serde_json::from_slice(&s.body.0).map_err(|_| Error::BadJson)?;
+        let sealed = match (&env.sealed, &env.sealed_hash) {
+            (Some(sealed), _) => sealed,
+            (None, hash) => resp.sealed.as_ref().filter(|s| Some(&h(&s.0)) == hash.as_ref()).ok_or(Error::ManifestMismatch)?,
+        };
+        let m: ManifestBody = open_json(&self.key()?, &ad("manifest", &[&self.id.0]), &sealed.0)?;
+        self.base_from(&m.items);
+        Ok(true)
     }
 
     /// Right after a pull: a pending delete of an item the server doesn't have
@@ -647,9 +685,10 @@ impl Vault {
     /// name. The rest stay pending, as the server has them. Over the quota a push
     /// must remove items, so a refused addition mustn't hold deletes up (`budget`
     /// 0); without a quota a member may stage only so much at once (a big import).
-    /// A vault restored from an older app's snapshot pushes everything until its
-    /// next pull with a manifest (or a push leaving nothing pending): until then it
-    /// can't tell which server copies a partial push would list.
+    /// A vault restored from an older app's snapshot pushes everything until it
+    /// takes its `base`s from a manifest (a pull, `exact_base_from`) or a push leaves
+    /// nothing pending: until then it can't tell which server copies a partial push
+    /// would list.
     pub fn push_part(&mut self, me: &Me, now: u64, budget: usize) -> Result<VaultPut, Error> {
         self.seal_push(me, now, if self.exact_base { budget } else { usize::MAX })
     }
@@ -837,7 +876,7 @@ mod tests {
     }
 
     /// A snapshot from an older app may hold stale `base`s: it pushes everything
-    /// at once until a push leaves nothing pending (or a pull brings a manifest).
+    /// at once until a push leaves nothing pending (or it takes its `base`s from a manifest).
     #[test]
     fn older_snapshots_push_everything() {
         let me = crate::Keyring::new("alice").me();

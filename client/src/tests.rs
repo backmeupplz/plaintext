@@ -2450,3 +2450,69 @@ fn leaving_an_unlisted_vault_drops_its_unsent_changes() {
     assert!(bob.problems.is_empty(), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
 }
+
+/// An older app's snapshot with a change pending, on a vault no other device
+/// pushes to: a pull brings no manifest, so the client fetches the latest one to
+/// take its `base`s from, and a big import still goes in parts.
+#[test]
+fn a_pending_older_snapshot_splits_a_big_import() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, stage_slack: Some(4096), ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    let v = alice.default_vault().unwrap();
+    let one = plaintext_core::new_item_id();
+    alice.put_item(&v, one, item("One", "1")).unwrap();
+    // An edit the older app couldn't send.
+    alice.vaults.get_mut(&v).unwrap().put(one, item("One", "2"));
+    let mut json = serde_json::to_value(&alice.vaults[&v]).unwrap();
+    json.as_object_mut().unwrap().remove("exact_base");
+    alice.vaults.insert(v, serde_json::from_value(json).unwrap());
+    alice.stage_past = 1024;
+    for i in 0..6 {
+        alice.vaults.get_mut(&v).unwrap().put(plaintext_core::new_item_id(), Item { notes: "x".repeat(2000), ..item(&format!("I{i}"), "p") });
+    }
+    alice.sync().unwrap();
+    assert!(!alice.vaults[&v].has_changes());
+    assert_eq!(alice.vaults[&v].items().count(), 7);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An older app's snapshot over the quota, holding a delete of an item another
+/// device already deleted and an addition the server refuses (507): the pull
+/// drops the delete, so dropping the addition too lets the owner revoke.
+#[test]
+fn an_older_snapshot_drops_a_delete_the_server_already_applied() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    roomy.sync().unwrap();
+    let v = roomy.default_vault().unwrap();
+    let a = plaintext_core::new_item_id();
+    roomy.put_item(&v, a, item("A", "a")).unwrap();
+    roomy.put_item(&v, plaintext_core::new_item_id(), item("C", "c")).unwrap();
+    let _ = join(Http::new(&url), "bob", "bob pw", None, "t");
+    roomy.share_vault(&v, "bob", Role::Writer, None).unwrap();
+    let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut d1 = login(&full, "alice pw", &ask);
+    let mut d2 = login(&full, "alice pw", &ask);
+    d1.sync().unwrap();
+    d1.delete_item(&v, a).unwrap();
+    d2.sync().unwrap();
+    // What an older app could have left: a delete of `a` made offline, before the
+    // pull that showed it gone, and an addition, both held back by a 507.
+    let x = plaintext_core::new_item_id();
+    {
+        let vv = d2.vaults.get_mut(&v).unwrap();
+        vv.put(x, item("X", "x"));
+        vv.delete(a);
+    }
+    let mut json = serde_json::to_value(&d2.vaults[&v]).unwrap();
+    json.as_object_mut().unwrap().remove("exact_base");
+    d2.vaults.insert(v, serde_json::from_value(json).unwrap());
+    assert!(matches!(d2.sync(), Err(Error::Server(507, _))));
+    assert_eq!(d2.vaults[&v].deleted(), 0);
+    d2.vaults.get_mut(&v).unwrap().delete(x);
+    d2.sync().unwrap();
+    assert!(!d2.vaults[&v].has_changes());
+    d2.revoke(&v, "bob").unwrap();
+    let _ = std::fs::remove_file(&path);
+}
