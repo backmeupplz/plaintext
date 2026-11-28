@@ -268,6 +268,8 @@ fn lying_server_and_hostile_users() {
     // Caught and reported; the vault keeps its last verified state.
     a3.sync().unwrap();
     assert!(a3.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a3.problems);
+    // Without a hint to leave (delete) the vault the server is attacking.
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
     assert!(a3.vaults[&mine].items().any(|(_, i)| i.password == "added-later"));
     let _ = std::fs::remove_file(&path);
 }
@@ -1111,6 +1113,8 @@ fn nobody_is_stuck_paying_for_a_vault() {
     let gift = mallory.create_vault("Gift").unwrap();
     mallory.share_vault(&gift, "bob-bot", Role::Owner, None).unwrap();
     mallory.leave_vault(&gift).unwrap();
+    let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&open) && acct.paid.contains(&gift), "{acct:?}");
     bob.sync().unwrap();
     assert!(bob.vaults.contains_key(&open));
     assert!(!bob.problems.iter().any(|p| p.contains("vault Open") || p.contains(&open.to_string())), "{:?}", bob.problems);

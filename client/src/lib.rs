@@ -320,13 +320,21 @@ impl<T: Transport> Session<T> {
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
                     // A vault opened before keeps its name, though it may never open again.
-                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
+                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| (v.meta.name.clone(), v.creator.clone()));
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
-                    let name = known.unwrap_or_else(|| id.to_string());
-                    let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
-                    self.problems.push(format!("vault {name} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"));
+                    match known {
+                        // Your own vault: a server serving an old copy mustn't talk you into deleting it.
+                        Some((name, creator)) if creator == self.keyring.username => {
+                            self.problems.push(format!("vault {name} wasn't updated: {e}"))
+                        }
+                        k => {
+                            let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
+                            let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
+                            self.problems.push(format!("vault {name} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"));
+                        }
+                    }
                     failed.push(*id);
                 }
                 Err(e) => return Err(e),
