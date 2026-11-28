@@ -1437,22 +1437,26 @@ async fn update_roster(
                 return Err((StatusCode::CONFLICT, "someone left the vault: remove them with a new key first"));
             }
         }
-        // Adding someone needs room for the longer roster. Other changes (a promotion,
-        // removing someone with a new key) always go through, as long as the items don't grow.
+        // Adding someone needs room in the account that pays afterwards: for the longer
+        // roster, or for the whole vault if it moves to the signer. Other changes (a
+        // promotion, removing someone with a new key) always go through, as long as the
+        // items don't grow. Measured after any new key's items are re-sealed, which
+        // uses up the staged copies.
         let store = || -> R<()> {
             store_roster(&tx, &vault, &u.roster, &r)?;
-            store_keys(&tx, &vault, &u.keys)
+            store_keys(&tx, &vault, &u.keys)?;
+            if let Some(put) = &u.rotation {
+                push_within_quota(&tx, &cfg, &vault, || {
+                    tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
+                    store_put(&tx, &vault, put, &c.username)
+                })?;
+            }
+            Ok(())
         };
         if r.members.iter().any(|m| !had(&m.username)) {
             roster_within_quota(&tx, &cfg, &vault, &c.username, store)?;
         } else {
             store()?;
-        }
-        if let Some(put) = &u.rotation {
-            push_within_quota(&tx, &cfg, &vault, || {
-                tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
-                store_put(&tx, &vault, put, &c.username)
-            })?;
         }
         // As with a manifest, fields the server doesn't know may grow only while the
         // account paying for the vault (from now on, if the creator was removed; with any

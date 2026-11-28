@@ -314,7 +314,10 @@ impl<T: Transport> Session<T> {
                 // device may collect that change's own uploads meanwhile; DESIGN "Attachments").
                 Err(e) if e.held_back() => {
                     drop(self.collect_files(id, 0));
-                    full = Some(e);
+                    // A 409 is worth retrying soon, so it's the one reported.
+                    if !matches!(full, Some(Error::Server(409, _))) {
+                        full = Some(e);
+                    }
                 }
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
