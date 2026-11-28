@@ -128,8 +128,8 @@ final class AppModel: ObservableObject {
     @Published var banner: String?
     /// The vault whose unsent changes the banner's problem offers to drop, while that banner shows.
     @Published var bannerUnsent: (text: String, account: String, vault: String)?
-    /// The sync problem the banner showed last (`showProblems`).
-    private var lastProblem: String?
+    /// How many sync problems the banner has shown (`showProblems`).
+    private var problemTurn = 0
     /// Changes to drop, once the person confirms (`unsentDialog`). Held here, not
     /// by the banner, which may go away first; a lock closes it.
     @Published var reviewing: UnsentRequest?
@@ -543,8 +543,8 @@ final class AppModel: ObservableObject {
         // The banner shows one at a time, each in turn: the same one every time would
         // hide the rest (a vault that didn't verify, or another's Review).
         guard banner == nil, !all.isEmpty else { return }
-        let p = all[(all.firstIndex { $0.text == lastProblem }.map { $0 + 1 } ?? 0) % all.count]
-        lastProblem = p.text
+        let p = all[problemTurn % all.count]
+        problemTurn += 1
         // The client's text can end with a CLI hint; the app has its own Verify screen.
         let text = capitalized(p.text.components(separatedBy: " (plaintext ").first ?? p.text)
         banner = text

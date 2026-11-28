@@ -123,8 +123,8 @@ class Model(val context: Context) {
     var toast by mutableStateOf<Toast?>(null)
     var banner by mutableStateOf<String?>(null)
     var bannerUnsent by mutableStateOf<Unsent?>(null)
-    /** The sync problem the banner showed last ([showProblems]). */
-    private var lastProblem: String? = null
+    /** How many sync problems the banner has shown ([showProblems]). */
+    private var problemTurn = 0
     var reviewing by mutableStateOf<UnsentRequest?>(null)
     var syncing by mutableStateOf(false)
     /** Bumped on every reload, so screens reading Rust directly (item detail) re-read too. */
@@ -478,8 +478,7 @@ class Model(val context: Context) {
         // The banner shows one at a time, each in turn: the same one every time would
         // hide the rest (a vault that didn't verify, or another's Review).
         if (all.isEmpty()) return
-        val (account, p, vault) = all[(all.indexOfFirst { it.second == lastProblem } + 1) % all.size]
-        lastProblem = p
+        val (account, p, vault) = all[problemTurn++ % all.size]
         val text = p.substringBefore(" (plaintext ").replaceFirstChar { it.uppercase() }
         banner = text
         bannerUnsent = vault?.let { Unsent(text, account, it) }
