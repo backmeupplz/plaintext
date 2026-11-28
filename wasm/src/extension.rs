@@ -560,7 +560,7 @@ impl PendingSignIn {
     /// auth_data, signature}` in base64), a recovery code, or neither once the
     /// approval page has the key's answer (until then this fails with `not_approved`).
     pub async fn finish(&self, recovery: Option<String>, assertion: Option<String>) -> Result<Account, JsValue> {
-        let assertion = assertion.map(|a| serde_json::from_str(&a)).transpose().map_err(|_| js_err(Error::Refused("the security key's answer is malformed".into())))?;
+        let assertion = assertion.map(|a| serde_json::from_str(&a)).transpose().map_err(|_| js_err(Error::Refused("The security key's answer is malformed.".into())))?;
         let mut p = self.p.borrow_mut().take().ok_or_else(busy)?;
         let r = p.finish_async(assertion, recovery.as_deref().filter(|c| !c.trim().is_empty())).await;
         let signed_in = p.signed_in();
