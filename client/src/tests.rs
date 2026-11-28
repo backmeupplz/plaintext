@@ -2017,7 +2017,7 @@ fn paged_pulls() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, pull_page: Some(4 << 10), ..Default::default() });
     let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
     let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
-    join(Http::new(&url), "carol", "carol pw", None, "t");
+    let (csk, _) = join(Http::new(&url), "carol", "carol pw", None, "t");
     alice.sync().unwrap();
     let personal = alice.default_vault().unwrap();
     let pages = |vault: Hex| Pages { inner: Http::new(&url), vault, later: Cell::new(0), hooks: RefCell::new(vec![]), replay: None };
@@ -2058,10 +2058,11 @@ fn paged_pulls() {
     assert_eq!(fresh.vaults[&personal].items().count(), 41);
     assert!(fresh.vaults[&personal].items().any(|(_, i)| i.title == "Bob's"));
     // A vault that changes during every try is reported, not taken as a change the
-    // server held back, and the next sync gets it.
+    // server held back (nor as one to leave, though it's someone else's), and the
+    // next sync gets it.
     let busy = pages(personal);
     busy.hooks.borrow_mut().extend((0..5).map(|_| push("Busy")));
-    let mut busy = Session::login(busy, &derive("alice pw", &ask), "t").unwrap();
+    let mut busy = Session::login(busy, &derive("carol pw", &csk), "t").unwrap();
     busy.sync().unwrap();
     assert!(busy.problems.iter().any(|p| p.contains("kept changing") && !p.contains("leave")), "{:?}", busy.problems);
     assert!(!busy.vaults.contains_key(&personal));
