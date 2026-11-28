@@ -15,6 +15,60 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   android:
+    # Our own pushes and PRs run on the Mac runners, from the checkout, Rust toolchain and target/ ci.yml's jobs keep
+    # there, with a JDK, an Android SDK and NDK and a Gradle daemon that stay between runs. Outsiders' PRs (bridged from
+    # GitHub by the `github` user) never touch the Mac: they run in android-outside below.
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - name: Sources and Rust
+        run: |
+          ci="${PWD%%/work/*}/ci/plaintext"
+          mkdir -p "$ci" && cd "$ci"
+          rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
+          [ -d src/.git ] || git init -q src
+          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f FETCH_HEAD
+          git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
+          export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update >/dev/null
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nSRC=%s\n' "$CARGO_HOME" "$RUSTUP_HOME" "$ci/src" >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      # The pinned, checked Temurin and the SDK directory (only the license: Gradle installs the platform and build
+      # tools it needs) that the other apps' Android jobs keep per runner, plus the NDK and cargo-ndk.
+      - name: JDK, Android SDK and NDK, cargo-ndk
+        run: |
+          base="${PWD%%/work/*}"
+          jdk="$base/temurin-21.0.13+9"
+          if [ ! -x "$jdk/Contents/Home/bin/java" ]; then
+            rm -rf "$jdk.tmp" && mkdir -p "$jdk.tmp"
+            curl -fsSL -o "$jdk.tmp/jdk.tgz" "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.13_9.tar.gz"
+            echo "bf036b35b071bfb2f54f2c0af8ee8d88afa95ee6eb3dce02c0f94cfc2524d04a  $jdk.tmp/jdk.tgz" | shasum -a 256 -c
+            tar -xzf "$jdk.tmp/jdk.tgz" -C "$jdk.tmp" --strip-components 1 && rm "$jdk.tmp/jdk.tgz" && mv "$jdk.tmp" "$jdk"
+          fi
+          sdk="$base/android-sdk"
+          mkdir -p "$sdk/licenses"
+          printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee' > "$sdk/licenses/android-sdk-license"
+          ndk="$sdk/ndk/28.2.13676358"
+          if [ ! -f "$ndk/source.properties" ]; then
+            rm -rf "$ndk.tmp" && mkdir -p "$ndk.tmp"
+            curl -fsSL -o "$ndk.tmp/ndk.zip" https://dl.google.com/android/repository/android-ndk-r28c-darwin.zip
+            echo "0d4599e8bbf1a1668a0d51a541729b2246360f350018a2081d0b302dbb594f2a  $ndk.tmp/ndk.zip" | shasum -a 256 -c
+            unzip -q "$ndk.tmp/ndk.zip" -d "$ndk.tmp" && mv "$ndk.tmp/android-ndk-r28c" "$ndk" && rm -rf "$ndk.tmp"
+          fi
+          cargo ndk --version 2>/dev/null | grep -qx 'cargo-ndk 4.1.2' || cargo install cargo-ndk --locked --version 4.1.2
+          printf 'JAVA_HOME=%s\nANDROID_HOME=%s\nANDROID_NDK_HOME=%s\n' "$jdk/Contents/Home" "$sdk" "$ndk" >> "$GITHUB_ENV"
+      - name: Build
+        working-directory: ${{ env.SRC }}
+        run: ABIS=x86_64 PROFILE=dev TASK=assembleRelease android/build.sh
+
+  # Outsiders' PRs: Linux, which downloads everything each time (rare, so not worth caching)
+  android-outside:
+    if: github.event_name == 'pull_request' && !contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:

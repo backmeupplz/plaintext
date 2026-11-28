@@ -11,11 +11,83 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0 # the same for every job, so they share what the runner already built
+
+# Our own pushes and PRs run on the Mac runners, from a checkout, Rust toolchain and target/ kept per runner (shared by
+# the check, wasm and android jobs; a runner takes one job at a time), so cargo only rebuilds what changed. No actions:
+# nothing to download or start. Outsiders' PRs (bridged from GitHub by the `github` user) never touch the Mac: they
+# run in the *-outside jobs, which start from scratch on Linux.
 jobs:
   check:
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Sources and Rust
+        run: |
+          ci="${PWD%%/work/*}/ci/plaintext"
+          mkdir -p "$ci" && cd "$ci"
+          rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
+          [ -d src/.git ] || git init -q src
+          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f FETCH_HEAD
+          git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
+          export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update >/dev/null
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nSRC=%s\n' "$CARGO_HOME" "$RUSTUP_HOME" "$ci/src" >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Clippy and tests
+        working-directory: ${{ env.SRC }}
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: The landing page shows the release key docs/install checks
+        working-directory: ${{ env.SRC }}
+        run: |
+          key=$(sed -n "s/^key='\(.*\)'$/\1/p" docs/install)
+          [ -n "$key" ] && grep -qF "$key" docs/index.html
+
+  wasm:
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Sources and Rust
+        run: |
+          ci="${PWD%%/work/*}/ci/plaintext"
+          mkdir -p "$ci" && cd "$ci"
+          rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
+          [ -d src/.git ] || git init -q src
+          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f FETCH_HEAD
+          git -C src clean -fdq # untracked leftovers; target/ and other ignored files stay
+          export CARGO_HOME="$ci/cargo" RUSTUP_HOME="$ci/rustup"
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable -c clippy
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update >/dev/null
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nSRC=%s\n' "$CARGO_HOME" "$RUSTUP_HOME" "$ci/src" >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      # The Mac builds the same bytes as linux/amd64 (see wasm/build.sh).
+      - name: docs/s matches the source
+        working-directory: ${{ env.SRC }}
+        run: |
+          wasm/build.sh
+          git status --porcelain docs/s
+          test -z "$(git status --porcelain docs/s)" || { echo "Run wasm/build.sh and commit docs/s/"; exit 1; }
+      # The extension's core, driven under Node through the extension's own
+      # fetch glue against a real server; then both packages, linted as AMO does.
+      - name: Extension
+        working-directory: ${{ env.SRC }}
+        run: |
+          wasm/build.sh extension
+          PLAINTEXT_REQUIRE_PKG=1 cargo test --locked -p plaintext-wasm --test extension
+          python3 extension/package.py
+          npx --yes web-ext@10.8.0 lint --source-dir extension/dist/firefox --self-hosted
+
+  check-outside:
+    if: github.event_name == 'pull_request' && !contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -36,7 +108,8 @@ jobs:
           key=$(sed -n "s/^key='\(.*\)'$/\1/p" docs/install)
           [ -n "$key" ] && grep -qF "$key" docs/index.html
 
-  wasm:
+  wasm-outside:
+    if: github.event_name == 'pull_request' && !contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -51,8 +124,6 @@ jobs:
         run: |
           git status --porcelain docs/s
           test -z "$(git status --porcelain docs/s)" || { echo "Run wasm/build.sh and commit docs/s/"; exit 1; }
-      # The extension's core, driven under Node through the extension's own
-      # fetch glue against a real server; then both packages, linted as AMO does.
       - run: wasm/build.sh extension
       - run: PLAINTEXT_REQUIRE_PKG=1 cargo test --locked -p plaintext-wasm --test extension
       - run: python3 extension/package.py
