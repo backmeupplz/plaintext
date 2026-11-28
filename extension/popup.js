@@ -242,16 +242,23 @@ async function lockedAccounts(note) {
 function showProblems(note, problems) {
   for (const old of note.querySelectorAll('.problem')) old.remove()
   // A review the person has open stays while its warning does.
-  const open = (p) => p.unsent && note.querySelector(`.unsent[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"]`)
+  const open = (p) => p.unsent && note.querySelector(`.unsent${unsentSelector(p)}`)
   for (const box of note.querySelectorAll('.unsent')) {
     if (!problems.some((p) => p.key === box.dataset.key && p.unsent === box.dataset.vault)) box.remove()
   }
   note.append(...problems.filter((p) => !open(p)).map(problem))
 }
 
+const unsentSelector = (p) => `[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"]`
+
 /** One sync problem; one about changes that can't be sent offers to show and drop them. */
 function problem(p) {
-  const banner = el('div', { class: 'banner warn problem', role: 'alert' }, icon('triangle-alert'), el('span', { class: 'row-text' }, p.text))
+  const banner = el(
+    'div',
+    { class: 'banner warn problem', role: 'alert', 'data-key': p.unsent && p.key, 'data-vault': p.unsent },
+    icon('triangle-alert'),
+    el('span', { class: 'row-text' }, p.text),
+  )
   if (p.unsent) banner.append(el('button', { class: 'small', type: 'button', onclick: () => reviewUnsent(banner, p) }, 'Review…'))
   return banner
 }
@@ -264,6 +271,9 @@ async function reviewUnsent(banner, p) {
   } catch (e) {
     return say(explain(e), 'error')
   }
+  // A sync that finished meanwhile put up a new banner for it, or none.
+  if (!banner.isConnected) banner = document.querySelector(`.problem${unsentSelector(p)}`)
+  if (!banner) return
   const shown = c.changed.slice(0, 8)
   const lines = [
     shown.length && `Added or edited: ${shown.join(', ')}${c.changed.length > shown.length ? ` and ${c.changed.length - shown.length} more` : ''}`,

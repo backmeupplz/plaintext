@@ -538,8 +538,9 @@ final class AppModel: ObservableObject {
             banner = nil
         }
         let all = accounts.flatMap { a in zip(a.problems, a.problemUnsent).map { (account: a.id, text: $0, unsent: $1) } }
-        // The banner shows one at a time: one the person can act on comes first.
-        guard banner == nil, let p = all.first(where: { $0.unsent != nil }) ?? all.first else { return }
+        // The banner shows one at a time, in the client's order: one with an action
+        // mustn't hide a vault that didn't verify.
+        guard banner == nil, let p = all.first else { return }
         // The client's text can end with a CLI hint; the app has its own Verify screen.
         let text = capitalized(p.text.components(separatedBy: " (plaintext ").first ?? p.text)
         banner = text

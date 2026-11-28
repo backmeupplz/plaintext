@@ -473,8 +473,9 @@ class Model(val context: Context) {
         // Sent after all (made a writer again) or dropped elsewhere: its banner goes.
         bannerUnsent?.let { u -> if (u.text == banner && accounts.none { it.id == u.account && u.vault in it.problemUnsent }) banner = null }
         val all = accounts.flatMap { a -> a.problems.zip(a.problemUnsent) { p, v -> Triple(a.id, p, v) } }
-        // The banner shows one at a time: one the person can act on comes first.
-        val (account, p, vault) = all.firstOrNull { it.third != null } ?: all.firstOrNull() ?: return
+        // The banner shows one at a time, in the client's order: one with an action
+        // mustn't hide a vault that didn't verify.
+        val (account, p, vault) = all.firstOrNull() ?: return
         val text = p.substringBefore(" (plaintext ").replaceFirstChar { it.uppercase() }
         banner = text
         bannerUnsent = vault?.let { Unsent(text, account, it) }
@@ -483,10 +484,14 @@ class Model(val context: Context) {
     /** Show what dropping a vault's unsent changes would lose (see [discard]). */
     fun review(u: Unsent) {
         val e = epoch
-        act {
-            val changes = call { it.unsentChanges(u.account, u.vault) }
-            // Locked meanwhile: nothing opens over the lock screen.
-            if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes)
+        scope.launch {
+            // Locked meanwhile: nothing opens over the lock screen, an error neither.
+            try {
+                val changes = call { it.unsentChanges(u.account, u.vault) }
+                if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes)
+            } catch (x: Exception) {
+                if (epoch == e) show(x)
+            }
         }
     }
 
