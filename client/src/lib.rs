@@ -46,8 +46,7 @@ impl std::error::Error for Error {}
 
 impl Error {
     /// The server didn't take a vault's change this time: another device changed
-    /// it first (409), it was too big (413: for one request, or for every member's
-    /// next pull, `api::MAX_PUSH`) or the account is full (507).
+    /// it first (409), it was too big for one request (413) or the account is full (507).
     /// The change waits on the device for the next sync.
     pub fn held_back(&self) -> bool {
         matches!(self, Error::Server(409 | 413 | 507, _))
@@ -405,16 +404,48 @@ impl<T: AsyncTransport> Session<T> {
     }
 
     async fn pull_async(&mut self, id: &Hex) -> Result<()> {
-        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        let resp: VaultResponse = match self.call_async("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE).await {
-            // Waiting won't make it smaller: report this vault, sync the others.
-            Err(Error::Server(413, m)) => return Err(Error::Refused(format!("too big to pull ({m})"))),
-            r => r?,
-        };
-        let v = self.vaults.get_mut(id).expect("checked above");
+        let resp = self.pull_pages_async(id).await?;
+        let v = self.vaults.get_mut(id).expect("checked in pull_pages_async");
         self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
         self.gone.insert(*id, resp.gone);
         Ok(())
+    }
+
+    /// Every page of a pull, joined into one response for `Vault::apply`. Pages
+    /// must all show the vault at one counter: if it moves on midway, start over.
+    async fn pull_pages_async(&self, id: &Hex) -> Result<VaultResponse> {
+        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        'pull: for _ in 0..5 {
+            let mut all: Option<VaultResponse> = None;
+            loop {
+                let q = v.pull_query(all.as_ref())?;
+                let page: VaultResponse = match self.call_async("GET", &format!("/v1/vaults/{id}?{q}"), NONE).await {
+                    // Waiting won't make it smaller: report this vault, sync the others.
+                    Err(Error::Server(413, m)) => return Err(Error::Refused(format!("too big to pull ({m})"))),
+                    Err(Error::Server(409, _)) if all.is_some() => continue 'pull,
+                    r => r?,
+                };
+                // Each page brings something, or a server could keep a device asking forever.
+                if page.more && page.rosters.is_empty() && page.manifests.is_empty() && page.items.is_empty() {
+                    return Err(plaintext_core::Error::Tampered.into());
+                }
+                let a = match &mut all {
+                    None => all.insert(page),
+                    Some(a) if a.counter != page.counter => continue 'pull,
+                    Some(a) => {
+                        a.rosters.extend(page.rosters);
+                        a.manifests.extend(page.manifests);
+                        a.items.extend(page.items);
+                        (a.key, a.gone, a.more) = (page.key, page.gone, page.more);
+                        a
+                    }
+                };
+                if !a.more {
+                    return Ok(all.expect("set above"));
+                }
+            }
+        }
+        Err(Error::Server(409, "the vault kept changing while it was pulled; try again".into()))
     }
 
     async fn sync_and_tidy(&mut self, id: &Hex) -> Result<()> {
@@ -450,10 +481,6 @@ impl<T: AsyncTransport> Session<T> {
     /// server's staging area first, in parts, and the returned push commits them.
     async fn staged_async(&self, vault: &Hex, put: &VaultPut) -> Result<Option<VaultPut>> {
         let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
-        if items > MAX_PUSH {
-            // The server would refuse it after every part was sent (as if it had said so).
-            return Err(Error::Server(413, "not sent: more items than a device can pull in one go; push fewer at a time".into()));
-        }
         if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
             return Ok(None);
         }
@@ -1045,8 +1072,7 @@ impl<T: Transport> Session<T> {
 
     /// Save imported items: each source vault goes to our own vault of that name
     /// (made if needed; "Personal" and unnamed ones to the default vault), or all
-    /// to `into`. Refused before anything is saved if a vault would hold more than
-    /// one pull brings (`api::MAX_PUSH`). Every item goes into this device's copy
+    /// to `into`. Every item goes into this device's copy
     /// before anything is pushed, so a failed push loses nothing: the report
     /// carries that error, and the items go out with the next sync. Once an upload
     /// fails, the remaining attachments are left out and listed.
@@ -1061,24 +1087,6 @@ impl<T: Transport> Session<T> {
                 None => self.own_vault(&v.name).ok_or(v.name),
             };
             targets.push((to, v.items));
-        }
-        // Sealed, an item is padded to 256 bytes plus 41, and each attachment adds
-        // a reference of less than its name plus 256.
-        let sealed = |it: &Item, files: usize| serde_json::to_vec(it).map_or(0, |j| (j.len() + files).div_ceil(256) * 256 + 41);
-        let mut size = BTreeMap::<_, usize>::new();
-        for (to, items) in &targets {
-            let have = || to.as_ref().ok().and_then(|id| self.vaults.get(id)).map_or(0, |v| v.items().map(|(_, i)| sealed(i, 0)).sum());
-            let adds: usize = items.iter().map(|(it, files)| sealed(it, files.iter().map(|(name, _)| name.len() + 256).sum())).sum();
-            *size.entry(to.clone().map_err(|n| n.to_ascii_lowercase())).or_insert_with(have) += adds;
-        }
-        if let Some((to, _)) = size.iter().find(|(_, n)| **n > MAX_PUSH) {
-            let name = match to {
-                Ok(id) => self.vaults.get(id).map_or(String::new(), |v| v.meta.name.clone()),
-                Err(name) => name.clone(),
-            };
-            return Err(Error::Refused(format!(
-                "that's more than one vault can hold (64 MiB of items, for {name}): split the file, make a vault for each part and import each part into its own vault"
-            )));
         }
         // The vaults first: if one can't be made, nothing is imported yet.
         let mut made = Vec::new();

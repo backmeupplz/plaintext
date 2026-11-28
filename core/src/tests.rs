@@ -149,7 +149,7 @@ impl Log {
             rosters: self.rosters.clone(),
             key: self.keys.iter().rev().find(|k| k.username == user).map(|k| k.key.clone()),
             items: self.items.iter().map(|(id, blob)| ItemBlob { id: *id, blob: blob.clone() }).collect(),
-            gone: vec![],
+            ..Default::default()
         }
     }
 }
@@ -215,7 +215,7 @@ fn sync_and_server_tampering() {
     log2.put(&pf);
     let mut next = Vault::new(v.id);
     next.apply(&good, &mut a, 0).unwrap();
-    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![] };
+    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![], ..Default::default() };
     assert_eq!(next.apply(&fork, &mut a, 0), Err(Error::Rollback));
 }
 
@@ -301,7 +301,7 @@ fn concurrent_edit_keeps_conflict_copy() {
     v1.pushed(&p1);
     log.put(&p1);
     v2.put(id, login("bank", "from device 2"));
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![] };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![], ..Default::default() };
     v2.apply(&resp, &mut a, 0).unwrap();
     assert_eq!(v2.get(&id).unwrap().password, "from device 2");
     let copy = v2.items().find(|(_, i)| i.title == "bank (conflict)").unwrap().1;
@@ -569,7 +569,7 @@ fn audit_new_device_stays_on_pre_revocation_epoch() {
     let r = v.revoke(&am, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![] };
+    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], ..Default::default() };
     v.apply(&delta, &mut a, 0).unwrap();
     // Removed bob writes on the old branch; the server serves that branch to alice's new phone.
     vb.put(new_item_id(), login("Bank", "planted-by-removed-bob"));
@@ -601,7 +601,7 @@ fn audit_server_drops_concurrent_edit_without_conflict_copy() {
     log.put(&p1);
     v2.put(id, login("bank", "stale-edit-on-device-2"));
     // Same response as concurrent_edit_keeps_conflict_copy, minus the changed item's blob.
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![] };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![], ..Default::default() };
     // Refused: the other edit would otherwise vanish instead of becoming a conflict copy.
     assert_eq!(v2.apply(&resp, &mut a, 0), Err(Error::ManifestMismatch));
 }
@@ -740,7 +740,7 @@ fn audit_delayed_rotation_undoes_a_delete() {
     log.roster(&r);
     // Device 2 deletes the item, then pulls before pushing (as sync_vault does).
     d2.delete(id);
-    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![] };
+    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![], ..Default::default() };
     d2.apply(&resp, &mut a, 0).unwrap();
     assert!(d2.get(&id).is_none() && d2.has_changes(), "delete undone by a re-seal: item back = {:?}, pending delete = {}", d2.get(&id).map(|i| &i.title), d2.has_changes());
 }
@@ -793,7 +793,7 @@ fn attachments_are_padded() {
 
 /// A pull with just this manifest and its blobs (what the server sends after `p`).
 fn delta(log: &Log, p: &VaultPut) -> VaultResponse {
-    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![] }
+    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![], ..Default::default() }
 }
 
 fn titles(v: &Vault) -> Vec<String> {
@@ -858,7 +858,7 @@ fn pending_edit_and_delete_keep_syncing_after_a_rotation() {
     let r = v.revoke(&am, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![] };
+    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], ..Default::default() };
     v.apply(&rotation, &mut a, 0).unwrap();
     d2.put(x, login("edit me", "new"));
     d2.delete(y);

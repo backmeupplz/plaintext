@@ -248,13 +248,30 @@ impl Vault {
         ad("item", &[&self.id.0, &id.0])
     }
 
-    /// The `?since=&roster=` query for the next pull.
-    pub fn pull_query(&self) -> String {
-        match &self.roster {
-            Some(r) => format!("since={}&roster={}", self.counter, r.version),
+    /// The `?since=&roster=` query for the next pull: its first page, or with
+    /// `so_far` (the pages so far, joined) the page after them.
+    pub fn pull_query(&self, so_far: Option<&VaultResponse>) -> Result<String, Error> {
+        let (mut q, mut roster) = match &self.roster {
+            Some(r) => (format!("since={}", self.counter), Some(r.version)),
             // A device with no state starts from the latest manifest.
-            None => "since=0&latest=true".into(),
+            None => ("since=0&latest=true".to_string(), None),
+        };
+        let Some(p) = so_far else {
+            return Ok(roster.map_or(q.clone(), |r| format!("{q}&roster={r}")));
+        };
+        if let Some(s) = p.rosters.last() {
+            roster = Some(serde_json::from_slice::<Roster>(&s.body.0).map_err(|_| Error::BadJson)?.version);
         }
+        if let Some(r) = roster {
+            q += &format!("&roster={r}");
+        }
+        if let Some(s) = p.manifests.last() {
+            q += &format!("&from={}", serde_json::from_slice::<ManifestEnvelope>(&s.body.0).map_err(|_| Error::BadJson)?.counter);
+        }
+        if let Some(i) = p.items.last() {
+            q += &format!("&after={}", i.id);
+        }
+        Ok(q + &format!("&at={}", p.counter))
     }
 
     /// Verify a server response and merge it. Nothing changes, the keyring

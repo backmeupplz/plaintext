@@ -20,6 +20,7 @@ async fn main() {
         quota: env("PLAINTEXT_QUOTA_MB").map(|v| v.parse::<u64>().ok().and_then(|mb| mb.checked_mul(1 << 20)).expect("PLAINTEXT_QUOTA_MB is a whole number of megabytes")),
         trust_proxy: env("PLAINTEXT_TRUST_PROXY").is_some_and(|v| v == "1"),
         hsts: env("PLAINTEXT_URL").is_some_and(|v| plaintext_server::https_url(&v)),
+        pull_page: None,
     };
     let empty = db.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).expect("read database") == 0;
     if cfg.open_signup && cfg.setup_code.is_none() && empty {

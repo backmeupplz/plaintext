@@ -55,11 +55,14 @@ const BLOB_BODY: usize = 2 << 20;
 const VAULT_BODY: usize = 32 << 20;
 /// How long staged items wait for the push that commits them, in seconds.
 const STAGE_TTL: u64 = 86400;
+/// Stored bytes one pull response carries, past which the rest comes in further
+/// pages (`Config::pull_page`). With one entry over it (a roster, an old manifest
+/// of up to 16 MiB in base64 twice, or an item) and the latest manifest's sealed
+/// part, a page stays well under the 128 MiB clients read.
+const PULL_PAGE: usize = 16 << 20;
 
 const BAD: StatusCode = StatusCode::BAD_REQUEST;
 const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
-/// A push whose items a device couldn't pull in one go (`api::MAX_PUSH`).
-const TOO_BIG: (StatusCode, &str) = (StatusCode::PAYLOAD_TOO_LARGE, "more items than a device can pull in one go: push fewer at a time");
 /// 507, not 413: clients tell a full account from a request that's too big.
 const FULL: (StatusCode, &str) =
     (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items, share links or sent messages, or leave a vault someone handed you, to make room (attachments are freed about a week later, by a device that syncs the vault)");
@@ -172,6 +175,9 @@ pub struct Config {
     /// Clients reach this server over HTTPS (a `PLAINTEXT_URL` entry starts with
     /// `https://`): every response tells browsers to keep using it.
     pub hsts: bool,
+    /// Bytes of rosters, manifests and items one pull response carries before
+    /// the client asks for the next page. `None`: `PULL_PAGE` (tests page sooner).
+    pub pull_page: Option<usize>,
 }
 
 /// Whether any comma-separated `PLAINTEXT_URL` entry is an `https://` address
@@ -1147,13 +1153,6 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     }
     // Whatever this member staged is either in now or left over from a push that won't come.
     tx.execute("DELETE FROM staged WHERE vault_id = ? AND username = ?", params![vault, username]).map_err(db_err)?;
-    // Every member's next pull brings all of this push's items in one response.
-    let pushed: u64 = tx
-        .query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ? AND counter = ?", params![vault, env.counter], |r| r.get(0))
-        .map_err(db_err)?;
-    if pushed > MAX_PUSH as u64 {
-        return Err(TOO_BIG);
-    }
     for d in &put.deletes {
         tx.execute("DELETE FROM items WHERE vault_id = ? AND id = ?", params![vault, &d.0[..]]).map_err(db_err)?;
     }
@@ -1202,34 +1201,97 @@ struct Since {
     /// Only the latest manifest (for a device with no state yet).
     #[serde(default)]
     latest: bool,
+    /// A later page: manifests after `from` (instead of `since`), items after
+    /// `after` by id, and only while the vault is still at counter `at`.
+    from: Option<u64>,
+    after: Option<String>,
+    at: Option<u64>,
 }
 
-async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<Since>) -> R<Json<VaultResponse>> {
+/// How much of a pull response is used up.
+struct Page {
+    budget: usize,
+    used: usize,
+    /// An entry didn't fit: the rest comes in the next page.
+    full: bool,
+}
+
+impl Page {
+    /// Whether an entry of `n` bytes still goes in (the first one always does).
+    fn fits(&mut self, n: usize) -> bool {
+        self.full = self.used > 0 && self.used.saturating_add(n) > self.budget;
+        self.used = self.used.saturating_add(n);
+        !self.full
+    }
+}
+
+/// A pull, in pages: rosters after `roster`, then manifests, then items written
+/// after `since`, each in order, until `Config::pull_page` bytes are in (always at
+/// least one entry). `more` tells the client to ask for the rest; see DESIGN "Sync".
+async fn get_vault(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<Since>,
+) -> R<Json<VaultResponse>> {
     let vault = hex_id(&id)?;
+    let after = q.after.as_deref().map(hex_id).transpose()?;
     let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Reader)?;
-    if !c.human {
-        audit_log(&db, &vault, &c.username, "read")?;
-    }
     let (counter, epoch): (u64, u64) =
         db.query_row("SELECT counter, epoch FROM vaults WHERE id = ?", [&vault[..]], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db_err)?;
-    let signed_list = |sql: &str, after: i64| -> R<Vec<Signed>> {
+    // The pages of one pull must show one state of the vault: every change to its
+    // items or key moves the counter, and then the client starts over.
+    if q.at.is_some_and(|at| at != counter) {
+        return Err((StatusCode::CONFLICT, "vault changed, pull again"));
+    }
+    if !c.human && q.at.is_none() {
+        audit_log(&db, &vault, &c.username, "read")?;
+    }
+    let mut page = Page { budget: cfg.pull_page.unwrap_or(PULL_PAGE), used: 0, full: false };
+    let mut rosters = Vec::new();
+    let mut st = db.prepare("SELECT signed FROM rosters WHERE vault_id = ? AND version > ? ORDER BY version").map_err(db_err)?;
+    let mut rows = st.query(params![&vault[..], q.roster.map_or(-1, |v| v as i64)]).map_err(db_err)?;
+    while let Some(row) = rows.next().map_err(db_err)? {
+        let s: String = row.get(0).map_err(db_err)?;
+        if !page.fits(s.len()) {
+            break;
+        }
+        rosters.push(serde_json::from_str(&s).map_err(db_err)?);
+    }
+    drop(rows);
+    let mut manifests = Vec::new();
+    if !page.full {
+        let from = q.from.unwrap_or(q.since).max(q.since) as i64;
+        let sql = if q.latest {
+            "SELECT signed FROM manifests WHERE vault_id = ?1 AND counter > ?2 AND counter = (SELECT counter FROM vaults WHERE id = ?1)"
+        } else {
+            "SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter"
+        };
         let mut st = db.prepare(sql).map_err(db_err)?;
-        st.query_map(params![&vault[..], after], |r| r.get::<_, String>(0))
-            .map_err(db_err)?
-            .map(|s| serde_json::from_str(&s.map_err(db_err)?).map_err(db_err))
-            .collect()
-    };
-    let manifests = if q.latest {
-        signed_list("SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter DESC LIMIT 1", q.since as i64)?
-    } else {
-        signed_list("SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter", q.since as i64)?
-    };
-    let rosters = signed_list(
-        "SELECT signed FROM rosters WHERE vault_id = ? AND version > ? ORDER BY version",
-        q.roster.map_or(-1, |v| v as i64),
-    )?;
+        let mut rows = st.query(params![&vault[..], from]).map_err(db_err)?;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let s: String = row.get(0).map_err(db_err)?;
+            if !page.fits(s.len()) {
+                break;
+            }
+            manifests.push(serde_json::from_str(&s).map_err(db_err)?);
+        }
+    }
+    let mut items = Vec::new();
+    if !page.full {
+        let mut st = db.prepare("SELECT id, blob FROM items WHERE vault_id = ?1 AND counter > ?2 AND (?3 IS NULL OR id > ?3) ORDER BY id").map_err(db_err)?;
+        let mut rows = st.query(params![&vault[..], q.since, after.as_ref().map(|a| &a[..])]).map_err(db_err)?;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let blob: Vec<u8> = row.get(1).map_err(db_err)?;
+            if !page.fits(blob.len()) {
+                break;
+            }
+            items.push(ItemBlob { id: Hex(row.get(0).map_err(db_err)?), blob: B64(blob) });
+        }
+    }
     let key = db
         .query_row(
             "SELECT key FROM vault_keys WHERE vault_id = ? AND username = ? AND epoch = ?",
@@ -1239,12 +1301,6 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
         .optional()
         .map_err(db_err)?
         .map(B64);
-    let mut st = db.prepare("SELECT id, blob FROM items WHERE vault_id = ? AND counter > ?").map_err(db_err)?;
-    let items = st
-        .query_map(params![&vault[..], q.since], |r| Ok(ItemBlob { id: Hex(r.get(0)?), blob: B64(r.get(1)?) }))
-        .map_err(db_err)?
-        .collect::<Result<_, _>>()
-        .map_err(db_err)?;
     // Roster members the server no longer serves: they left, or their accounts were deleted.
     let (roster,): (String,) = db
         .query_row(
@@ -1263,7 +1319,7 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
             gone.push(m.username);
         }
     }
-    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone }))
+    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone, more: page.full }))
 }
 
 async fn put_vault(
@@ -1355,10 +1411,7 @@ async fn stage(
     // still stage up to the size of the vault's items, which is what re-sealing
     // them all for a new key takes: once per vault, whichever owner it is.
     let sum = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> R<u64> { tx.query_row(sql, p, |r| r.get(0)).map_err(db_err) };
-    let mine = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", &[&&vault[..], &c.username])?;
-    let refused = if mine > MAX_PUSH as u64 {
-        Some(TOO_BIG)
-    } else if let Some(quota) = cfg.quota {
+    let refused = if let Some(quota) = cfg.quota {
         let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
         // Owners' stages only: a writer's stage stays within the quota anyway, and mustn't use up the allowance.
         let all = sum(

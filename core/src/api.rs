@@ -162,13 +162,13 @@ pub struct ItemBlob {
     pub blob: B64,
 }
 
-/// `GET /v1/vaults/{id}?since=N&roster=V`
+/// `GET /v1/vaults/{id}?since=N&roster=V`, in pages (see `more`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VaultResponse {
     pub counter: u64,
     /// Every manifest after `since`, oldest first.
     pub manifests: Vec<Signed>,
-    /// Every roster version after `roster` (all of them when `roster` is absent).
+    /// Every roster version after `roster` (all of them when `roster` is absent), oldest first.
     pub rosters: Vec<Signed>,
     /// This user's wrapped key for the current epoch.
     pub key: Option<B64>,
@@ -178,6 +178,12 @@ pub struct VaultResponse {
     /// longer serves them; an owner's device removes them for real (new key).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gone: Vec<String>,
+    /// The rest comes in further pages: rosters, then manifests, then items (by
+    /// id), each in order. The client asks again with `roster`, `from` and `after`
+    /// set to the last of each it has, and `at` to this page's counter (409 once
+    /// the vault moved on: start over), and applies all pages as one response.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 /// `PUT /v1/vaults/{id}`: applied only if the server is still at `expected_counter`.
@@ -199,11 +205,6 @@ pub struct Staged {
     pub id: Hex,
     pub count: u64,
 }
-
-/// Most item bytes one push (or key rotation) may write. Every member's next pull
-/// brings them in one response, which clients take up to 128 MiB of, in base64
-/// and with a manifest of up to 16 MiB (twice base64).
-pub const MAX_PUSH: usize = 64 << 20;
 
 /// `POST /v1/vaults/{id}/leave`, signed (domain `leave`) by the member leaving.
 #[derive(Serialize, Deserialize, Clone, Debug)]

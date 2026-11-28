@@ -1236,7 +1236,7 @@ fn audit_agent_session_trusts_a_vault_the_server_made() {
         rosters: vec![fnv.roster.clone(), g.roster.clone()],
         key: Some(g.keys[0].key.clone()),
         items: p.upserts.clone(),
-        gone: vec![],
+        ..Default::default()
     };
     let forge = Forge { inner: Http::new(&url), id: fv.id, first, pushed: Default::default() };
 
@@ -1569,5 +1569,75 @@ fn device_state_offline_and_import() {
     assert!(back.admin && back.keyring.default_vault == Some(mine));
     assert!(Session::offline(Http::new(&url), alice.token.clone(), account(), Path::new("/nonexistent")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Pulls come in pages, which a device joins and checks as one response. A push
+/// landing between two pages makes the device start over rather than mix states.
+#[test]
+fn paged_pulls() {
+    use std::cell::{Cell, RefCell};
+    /// Counts later pages of pulls of `vault`, and runs `hook` before the first one.
+    struct Pages {
+        inner: Http,
+        vault: Hex,
+        later: Cell<usize>,
+        hook: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+    impl Transport for Pages {
+        fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+            if method == "GET" && path.starts_with(&format!("/v1/vaults/{}?", self.vault)) && path.contains("&at=") {
+                self.later.set(self.later.get() + 1);
+                if let Some(f) = self.hook.borrow_mut().take() {
+                    f();
+                }
+            }
+            self.inner.send(method, path, token, body)
+        }
+        fn host(&self) -> String {
+            self.inner.host()
+        }
+    }
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, pull_page: Some(4 << 10), ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    join(Http::new(&url), "carol", "carol pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    let pages = |vault: Hex| Pages { inner: Http::new(&url), vault, later: Cell::new(0), hook: RefCell::new(None) };
+    let mut behind = Session::login(pages(personal), &derive("alice pw", &ask), "t").unwrap();
+    behind.sync().unwrap();
+    // 40 items (about 12 KB sealed), three pushes and four roster versions: many 4 KB pages.
+    for i in 0..40 {
+        alice.vaults.get_mut(&personal).unwrap().put(plaintext_core::new_item_id(), item(&format!("Site {i}"), "pw"));
+        if i % 15 == 14 {
+            alice.sync_vault(&personal).unwrap();
+        }
+    }
+    alice.sync_vault(&personal).unwrap();
+    alice.share_vault(&personal, "carol", Role::Reader, None).unwrap();
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+
+    // A device that was away catches up on every roster, manifest and item.
+    behind.sync().unwrap();
+    assert!(behind.problems.is_empty(), "{:?}", behind.problems);
+    assert_eq!(behind.vaults[&personal].items().count(), 40);
+    assert_eq!(behind.vaults[&personal].roster.as_ref().unwrap().version, 3);
+    assert!(behind.t.later.get() >= 5, "{} later pages", behind.t.later.get());
+
+    // A new device's pull, with bob pushing between its first and second page.
+    let fresh = pages(personal);
+    *fresh.hook.borrow_mut() = Some(Box::new(move || bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "b0b")).unwrap()));
+    let mut fresh = Session::login(fresh, &derive("alice pw", &ask), "t").unwrap();
+    fresh.sync().unwrap();
+    assert!(fresh.problems.is_empty(), "{:?}", fresh.problems);
+    assert!(fresh.t.hook.borrow().is_none(), "bob pushed midway");
+    assert_eq!(fresh.vaults[&personal].items().count(), 41);
+    assert!(fresh.vaults[&personal].items().any(|(_, i)| i.title == "Bob's"));
+    // The 409 is a later page's only: a first page always answers.
+    let q = format!("/v1/vaults/{personal}?since=0&latest=true&at=1");
+    assert_eq!(status(alice.call::<VaultResponse>("GET", &q, NONE)), 409);
     let _ = std::fs::remove_file(&path);
 }
