@@ -206,8 +206,8 @@ pub struct AccountInfo {
     /// verified) and invite conflicts. Show them; the other vaults synced.
     pub problems: Vec<String>,
     /// For each problem, the vault whose unsent changes it says can't be sent
-    /// (you may only read it now): `unsent_changes` shows them, `discard_changes`
-    /// drops them.
+    /// (you may only read it now, or it isn't shared with you any more):
+    /// `unsent_changes` shows them, `discard_changes` drops them.
     pub problem_unsent: Vec<Option<String>>,
 }
 
@@ -215,8 +215,12 @@ pub struct AccountInfo {
 /// before `discard_changes` drops them.
 #[derive(uniffi::Record, Debug, PartialEq)]
 pub struct UnsentChanges {
+    /// The vault's name, or its id if it has none.
     pub name: String,
-    /// Titles of the items added or edited here.
+    /// It isn't shared with you any more: this device has the only copy of
+    /// these changes, and the apps can't show its items.
+    pub unlisted: bool,
+    /// Titles of the items added or edited here ("(untitled)" for none).
     pub changed: Vec<String>,
     /// How many items were deleted here.
     pub deleted: u32,
@@ -965,10 +969,6 @@ fn not_found(what: &str) -> PlaintextError {
     PlaintextError::NotFound { message: what.into() }
 }
 
-fn writer_again() -> PlaintextError {
-    PlaintextError::Invalid { message: "You can write to this vault again, so these changes go out with the next sync.".into() }
-}
-
 fn writable(s: &S, vid: &Hex) -> Res<()> {
     match s.vaults.get(vid).ok_or_else(|| not_found("that vault"))?.role(s.username(), now()) {
         Some(r) if r >= CoreRole::Writer => Ok(()),
@@ -1171,11 +1171,14 @@ impl PlaintextApp {
     pub fn unsent_changes(&self, account: String, vault: String) -> Res<UnsentChanges> {
         let id = hex_id(&vault)?;
         self.peek(&account, |s| {
-            let v = s.vaults.get(&id).ok_or_else(|| not_found("that vault"))?;
-            if writable(s, &id).is_ok() {
-                return Err(writer_again());
-            }
-            Ok(UnsentChanges { name: v.meta.name.clone(), changed: v.changed().map(|(_, i)| i.title.clone()).collect(), deleted: v.deleted() as u32, renamed: v.meta_changed() })
+            let (v, unlisted) = s.unsendable_changes(&id)?;
+            Ok(UnsentChanges {
+                name: if v.meta.name.is_empty() { vault } else { v.meta.name.clone() },
+                unlisted,
+                changed: v.changed().map(|(_, i)| if i.title.is_empty() { "(untitled)".into() } else { i.title.clone() }).collect(),
+                deleted: v.deleted() as u32,
+                renamed: v.meta_changed(),
+            })
         })
     }
 
@@ -1183,12 +1186,8 @@ impl PlaintextApp {
     /// is downloaded again), and the sync problem about them. Returns how many.
     pub fn discard_changes(&self, account: String, vault: String) -> Res<u32> {
         let id = hex_id(&vault)?;
-        // The preview read the roster this device has: ask the server for today's.
-        self.with(&account, |s| match s.writable(&id) {
-            Ok(()) => Err(writer_again()),
-            Err(ClientError::Core(core::Error::ReadOnly)) => Ok(s.discard_changes(&id)? as u32),
-            Err(e) => Err(e.into()),
-        })
+        // Only if the server still says they can't be sent.
+        self.with(&account, |s| Ok(s.discard_unsendable(&id)? as u32))
     }
 
     // ----- Vaults and items -----

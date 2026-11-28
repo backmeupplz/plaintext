@@ -98,10 +98,6 @@ fn load_vaults<T: AsyncTransport>(s: &mut Session<T>, state: &Value) {
     }
 }
 
-fn writer_again() -> Error {
-    Error::Refused("You can write to this vault again, so these changes go out with the next sync.".into())
-}
-
 fn writable<T: AsyncTransport>(s: &Session<T>, v: &Vault) -> bool {
     v.role(s.username(), now()).is_some_and(|r| r >= Role::Writer)
 }
@@ -233,7 +229,8 @@ pub async fn set_exact_host<T: AsyncTransport>(s: &mut Session<T>, vault: &str, 
 /// another device got there first) is a warning, not a failed sync: its change
 /// stays on this device and goes at the next sync, and the rest still count.
 /// Each is `{text, unsent}`: `unsent` names the vault whose changes it says
-/// can't be sent (you may only read it now), for `unsent_changes` and `discard_changes`.
+/// can't be sent (you may only read it now, or it isn't shared with you any
+/// more), for `unsent_changes` and `discard_changes`.
 pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<Value>, Error> {
     let r = s.sync_async().await;
     let unsent = |i| s.unsendable.iter().find(|(_, j)| *j == i).map(|(id, _)| id.to_string());
@@ -252,24 +249,20 @@ fn vault_id(vault: &str) -> Result<Hex, Error> {
 }
 
 /// This device's changes to a vault that haven't reached the server, to show
-/// before `discard_changes` drops them: `{name, changed: [title], deleted, renamed}`.
+/// before `discard_changes` drops them: `{name, unlisted, changed: [title],
+/// deleted, renamed}`. `unlisted`: it isn't shared with you any more, so this
+/// device has the only copy and the popup can't show its items.
 pub fn unsent_changes<T: AsyncTransport>(s: &Session<T>, vault: &str) -> Result<Value, Error> {
-    let v = s.vaults.get(&vault_id(vault)?).ok_or_else(|| Error::NotFound("that vault".into()))?;
-    if writable(s, v) {
-        return Err(writer_again());
-    }
-    Ok(json!({ "name": v.meta.name, "changed": v.changed().map(|(_, i)| &i.title).collect::<Vec<_>>(), "deleted": v.deleted(), "renamed": v.meta_changed() }))
+    let (v, unlisted) = s.unsendable_changes(&vault_id(vault)?)?;
+    let name = if v.meta.name.is_empty() { vault } else { &v.meta.name };
+    let changed: Vec<&str> = v.changed().map(|(_, i)| if i.title.is_empty() { "(untitled)" } else { &i.title }).collect();
+    Ok(json!({ "name": name, "unlisted": unlisted, "changed": changed, "deleted": v.deleted(), "renamed": v.meta_changed() }))
 }
 
 /// Drop them (the vault is downloaded again) and the sync problem about them. Returns how many.
 pub async fn discard_changes<T: AsyncTransport>(s: &mut Session<T>, vault: &str) -> Result<usize, Error> {
-    let id = vault_id(vault)?;
-    // The preview read the roster this device has: ask the server for today's.
-    match s.writable_async(&id).await {
-        Ok(()) => Err(writer_again()),
-        Err(Error::Core(core::Error::ReadOnly)) => s.discard_changes_async(&id).await,
-        Err(e) => Err(e),
-    }
+    // Only if the server still says they can't be sent.
+    s.discard_unsendable_async(&vault_id(vault)?).await
 }
 
 /// A short code JavaScript can branch on, next to the message for people.

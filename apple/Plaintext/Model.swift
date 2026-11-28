@@ -562,12 +562,16 @@ final class AppModel: ObservableObject {
     func discard(_ r: UnsentRequest) async {
         // Its banner goes at once, so it can't be confirmed twice.
         if let u = bannerUnsent, u.account == r.account, u.vault == r.vault, u.text == banner { banner = nil }
+        let gen = lockGen
         do {
             let n = try await call { try $0.discardChanges(account: r.account, vault: r.vault) }
+            // Locked meanwhile: nothing shows over the lock screen.
+            if lockedSince(gen) { return }
             reload()
             showProblems()
             flash(n == 0 ? "Nothing was left to drop" : "Dropped \(n) unsent change\(n == 1 ? "" : "s")")
         } catch {
+            if lockedSince(gen) { return }
             reload()
             show(error)
         }

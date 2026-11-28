@@ -208,6 +208,9 @@ pub const NONE: Option<&()> = None;
 /// How long a file no item refers to stays on the server (`Session::collect_files`).
 pub const FILE_GRACE: u64 = 7 * 24 * 3600;
 
+/// Why the apps can't drop changes a sync said it couldn't send: it can now.
+const WRITER_AGAIN: &str = "You can write to this vault again, so these changes go out with the next sync.";
+
 /// A vault by id prefix or name (case-insensitive). A full id wins over a vault
 /// someone named like it.
 fn find<'a>(name: &str, vaults: impl Iterator<Item = (&'a Hex, &'a Vault)> + Clone) -> Result<Hex> {
@@ -419,11 +422,6 @@ impl<T: AsyncTransport> Session<T> {
         Ok(pulled)
     }
 
-    /// Pull a vault and refuse if we may only read it (`check_async`).
-    pub async fn writable_async(&mut self, id: &Hex) -> Result<()> {
-        self.check_async(id).await.map(drop)
-    }
-
     fn may_write(&self, id: &Hex) -> Result<()> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         match v.role(self.username(), now()) {
@@ -466,10 +464,47 @@ impl<T: AsyncTransport> Session<T> {
     /// A vault the server no longer lists can't be downloaded: it keeps only its
     /// rollback guard, and is downloaded in full if it's listed again.
     pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
-        let n = if let Some(v) = self.hidden.get_mut(id) {
+        self.discard_async(id, false).await
+    }
+
+    /// The changes `discard_unsendable_async` would drop, and whether the server
+    /// stopped listing the vault. Refused if, by the roster this device has, we
+    /// may write to it: they go out with the next sync.
+    pub fn unsendable_changes(&self, id: &Hex) -> Result<(&Vault, bool)> {
+        if let Some(v) = self.hidden.get(id) {
+            return Ok((v, true));
+        }
+        match self.may_write(id) {
+            Ok(()) => Err(Error::Refused(WRITER_AGAIN.into())),
+            Err(Error::Core(plaintext_core::Error::ReadOnly)) => Ok((&self.vaults[id], false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `discard_changes_async` for the apps, which act on a warning from an
+    /// earlier sync: refused, with nothing dropped, unless the server still says
+    /// the changes can't be sent (we may only read the vault, or it isn't listed
+    /// for us). Offline it's refused too.
+    pub async fn discard_unsendable_async(&mut self, id: &Hex) -> Result<usize> {
+        self.discard_async(id, true).await
+    }
+
+    async fn discard_async(&mut self, id: &Hex, unsendable_only: bool) -> Result<usize> {
+        let n = if self.hidden.contains_key(id) {
+            if unsendable_only {
+                let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
+                if acct.vaults.contains(id) {
+                    return Err(Error::Refused("This vault is shared with you again. Sync to see whether these changes can be sent.".into()));
+                }
+            }
+            let v = self.hidden.get_mut(id).expect("checked above");
             if v.has_changes() { v.forget() } else { 0 }
         } else {
             self.pull_async(id).await?;
+            // Today's roster, not the one the warning came from.
+            if unsendable_only && self.may_write(id).is_ok() {
+                return Err(Error::Refused(WRITER_AGAIN.into()));
+            }
             let n = self.vaults[id].changes();
             if n > 0 {
                 // Edits overwrote, and deletes removed, the server's copies: fetch every item.
@@ -495,9 +530,9 @@ impl<T: AsyncTransport> Session<T> {
             let (_, i) = self.unsendable.remove(k);
             if i < self.problems.len() {
                 self.problems.remove(i);
-            }
-            for (_, j) in &mut self.unsendable {
-                *j -= usize::from(*j > i);
+                for (_, j) in &mut self.unsendable {
+                    *j -= usize::from(*j > i);
+                }
             }
         }
         Ok(n)
@@ -844,7 +879,7 @@ impl<T: Transport> Session<T> {
 
     /// Pull a vault and refuse if we may only read it (`check_async`).
     pub fn writable(&mut self, id: &Hex) -> Result<()> {
-        block_on(self.writable_async(id))
+        block_on(self.check_async(id)).map(drop)
     }
 
     fn pull(&mut self, id: &Hex) -> Result<()> {
@@ -854,6 +889,11 @@ impl<T: Transport> Session<T> {
     /// Drop this device's unsent changes to a vault (`discard_changes_async`).
     pub fn discard_changes(&mut self, id: &Hex) -> Result<usize> {
         block_on(self.discard_changes_async(id))
+    }
+
+    /// Drop them only if the server still says they can't be sent (`discard_unsendable_async`).
+    pub fn discard_unsendable(&mut self, id: &Hex) -> Result<usize> {
+        block_on(self.discard_unsendable_async(id))
     }
 
     fn remove_members(&mut self, id: &Hex, who: Option<&str>) -> Result<()> {

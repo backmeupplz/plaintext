@@ -494,15 +494,19 @@ class Model(val context: Context) {
         reviewing = null
         // Its banner goes at once, so it can't be confirmed twice.
         if (bannerUnsent.let { it != null && it.account == r.account && it.vault == r.vault && it.text == banner }) banner = null
+        val e = epoch
         scope.launch {
             try {
                 val n = call { it.discardChanges(r.account, r.vault) }.toInt()
+                // Locked meanwhile: nothing shows over the lock screen.
+                if (epoch != e) return@launch
                 reload()
                 if (banner == null) showProblems()
                 flash(if (n == 0) "Nothing was left to drop" else "Dropped $n unsent change${if (n == 1) "" else "s"}")
-            } catch (e: Exception) {
+            } catch (x: Exception) {
+                if (epoch != e) return@launch
                 reload()
-                show(e)
+                show(x)
             }
         }
     }

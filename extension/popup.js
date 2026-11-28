@@ -241,7 +241,12 @@ async function lockedAccounts(note) {
 
 function showProblems(note, problems) {
   for (const old of note.querySelectorAll('.problem')) old.remove()
-  note.append(...problems.map(problem))
+  // A review the person has open stays while its warning does.
+  const open = (p) => p.unsent && note.querySelector(`.unsent[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"]`)
+  for (const box of note.querySelectorAll('.unsent')) {
+    if (!problems.some((p) => p.key === box.dataset.key && p.unsent === box.dataset.vault)) box.remove()
+  }
+  note.append(...problems.filter((p) => !open(p)).map(problem))
 }
 
 /** One sync problem; one about changes that can't be sent offers to show and drop them. */
@@ -266,22 +271,29 @@ async function reviewUnsent(banner, p) {
     c.renamed && "The vault's name or description changed",
   ].filter(Boolean)
   const drop = el('button', { class: 'primary small', type: 'button', onclick: () => discard() }, 'Drop changes')
-  const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(banner) }, 'Keep')
+  const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(problem(p)) }, 'Keep')
   const box = el(
     'div',
-    { class: 'banner problem unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}` },
+    { class: 'banner unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}`, 'data-key': p.key, 'data-vault': p.unsent },
     icon('triangle-alert'),
     el(
       'div',
       { class: 'row-text' },
-      el('div', {}, `You can only read ${c.name} now, so these changes on this device can't be sent${lines.length ? ':' : '.'}`),
+      el('div', {}, `${c.unlisted ? `${c.name} isn't shared with you any more` : `You can only read ${c.name} now`}, so these changes on this device can't be sent${lines.length ? ':' : '.'}`),
       lines.length ? el('ul', {}, ...lines.map((l) => el('li', {}, l))) : null,
-      el('div', { class: 'muted small-text' }, 'Dropping them downloads the vault again from the server. Copy out anything you want to keep first.'),
+      el(
+        'div',
+        { class: 'muted small-text' },
+        c.unlisted
+          ? "This device has the only copy of these changes, so they can't be recovered once dropped."
+          : 'Dropping them downloads the vault again from the server. Copy out anything you want to keep first.',
+      ),
       el('div', { class: 'row-actions' }, keep, drop),
     ),
   )
   banner.replaceWith(box)
-  drop.focus()
+  // Not the button that drops them: Enter shouldn't.
+  keep.focus()
   async function discard() {
     drop.disabled = keep.disabled = true
     try {

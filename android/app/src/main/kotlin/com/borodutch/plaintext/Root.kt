@@ -142,7 +142,8 @@ private fun Banner() {
 }
 
 private fun unsentSummary(c: UnsentChanges): String {
-    val lines = mutableListOf("You can only read ${c.name} now, so these changes on this device can't be sent:")
+    val why = if (c.unlisted) "${c.name} isn't shared with you any more" else "You can only read ${c.name} now"
+    val lines = mutableListOf("$why, so these changes on this device can't be sent:")
     if (c.changed.isNotEmpty()) {
         val more = if (c.changed.size > 8) " and ${c.changed.size - 8} more" else ""
         lines += "Added or edited: ${c.changed.take(8).joinToString(", ")}$more"
@@ -151,7 +152,8 @@ private fun unsentSummary(c: UnsentChanges): String {
     if (deleted > 0) lines += if (deleted == 1) "1 item deleted" else "$deleted items deleted"
     if (c.renamed) lines += "The vault's name or description changed"
     if (lines.size == 1) lines[0] = lines[0].dropLast(1) + "."
-    lines += "Dropping them downloads the vault again from the server. Copy out anything you want to keep first."
+    lines += if (c.unlisted) "This device has the only copy of these changes, so they can't be recovered once dropped."
+    else "Dropping them downloads the vault again from the server. Copy out anything you want to keep first."
     return lines.joinToString("\n")
 }
 

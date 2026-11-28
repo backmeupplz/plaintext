@@ -1249,6 +1249,17 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
     bob.t.1.set(false);
     assert_eq!(bob.vaults[&fam].changes(), 3);
+    // The apps act on an earlier sync's warning: their drop asks the server
+    // first, so offline, or made a writer again since, it drops nothing.
+    assert!(!bob.unsendable_changes(&fam).unwrap().1);
+    bob.t.1.set(true);
+    assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Refused(_))));
+    assert!(matches!(bob.unsendable_changes(&fam), Err(Error::Refused(_))), "the drop's pull brought the new roster");
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
     // A problem reported after it (as the apps add their own) stays.
     bob.problems.push("later".into());
     let warnings = bob.problems.len();
@@ -1343,7 +1354,16 @@ fn a_vault_no_longer_listed_can_drop_its_unsent_changes() {
     assert_eq!(bob.vault_or_hidden(&fam.to_string()[..8]).unwrap(), fam);
     assert_eq!(bob.vault_or_hidden("family").unwrap(), fam);
     assert_eq!(bob.vault_or_hidden(&fam.to_string()).unwrap(), fam);
-    assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    // The apps' drop asks the server first: offline, or shared again since, it drops nothing.
+    assert!(bob.unsendable_changes(&fam).unwrap().1);
+    bob.t.1.set(true);
+    assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Refused(_))));
+    assert_eq!(bob.hidden[&fam].changes(), 3);
+    alice.revoke(&fam, "bob").unwrap();
+    assert_eq!(bob.discard_unsendable(&fam).unwrap(), 3);
     assert!(bob.unsendable.is_empty() && bob.problems.is_empty(), "{:?}", bob.problems);
     assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
     bob.sync().unwrap();

@@ -331,7 +331,7 @@ fn unsendable_changes() {
     want.sort();
     assert_eq!(ids, want);
     assert!(found.iter().all(|(p, _)| p.ends_with("can't be sent")), "{found:?}");
-    assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), UnsentChanges { name: "Family".into(), changed: vec!["Bank".into()], deleted: 1, renamed: false });
+    assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), UnsentChanges { name: "Family".into(), unlisted: false, changed: vec!["Bank".into()], deleted: 1, renamed: false });
 
     // Made a writer again after the preview: the drop asks the server and keeps them.
     alice.share_vault(a.clone(), fam.clone(), "bob".into(), Role::Writer, None).unwrap();
@@ -352,5 +352,47 @@ fn unsendable_changes() {
     bob.lock(false);
     bob.resume(url.clone(), r.unlock).unwrap();
     assert!(bob.accounts()[0].problems.is_empty() && bob.items(None, Some(work.clone()), "".into(), false).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An item added offline to a vault bob was then removed from: the app says
+/// this device has the only copy, and drops it only once the server confirms.
+#[test]
+fn unlisted_changes() {
+    let url = server();
+    let (alice, _) = app();
+    let a = alice.signup(url.clone(), "alice".into(), "alice pw".into(), Some("setup-code".into())).unwrap().account.id;
+    let (bob, dir) = app();
+    let r = bob.signup(url.clone(), "bob".into(), "bob pw".into(), Some(alice.invite(a.clone()).unwrap())).unwrap();
+    let b = r.account.id.clone();
+    alice.sync(a.clone()).unwrap();
+    let fam = alice.create_vault(a.clone(), "Family".into()).unwrap();
+    alice.share_vault(a.clone(), fam.clone(), "bob".into(), Role::Writer, None).unwrap();
+    bob.sync(b.clone()).unwrap();
+
+    bob.lock(false);
+    bob.resume("http://127.0.0.1:9".into(), r.unlock.clone()).unwrap();
+    let mut it = item_template("login".into());
+    it.title = "".into();
+    bob.put_item(b.clone(), fam.clone(), None, it).unwrap();
+    alice.revoke(a.clone(), fam.clone(), "bob".into()).unwrap();
+    bob.lock(false);
+    bob.resume(url.clone(), r.unlock.clone()).unwrap();
+    let info = &bob.accounts()[0];
+    assert_eq!(info.problem_unsent, [Some(fam.clone())], "{:?}", info.problems);
+    let want = UnsentChanges { name: "Family".into(), unlisted: true, changed: vec!["(untitled)".into()], deleted: 0, renamed: false };
+    assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), want);
+
+    // Shared again after the preview: the drop asks the server and keeps it.
+    alice.share_vault(a.clone(), fam.clone(), "bob".into(), Role::Reader, None).unwrap();
+    assert!(matches!(bob.discard_changes(b.clone(), fam.clone()), Err(PlaintextError::Invalid { .. })));
+    assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), want);
+    alice.revoke(a.clone(), fam.clone(), "bob".into()).unwrap();
+    assert_eq!(bob.discard_changes(b.clone(), fam.clone()).unwrap(), 1);
+    assert!(bob.accounts()[0].problems.is_empty());
+    // Kept that way after a restart.
+    bob.lock(false);
+    bob.resume(url.clone(), r.unlock).unwrap();
+    assert!(bob.accounts()[0].problems.is_empty(), "{:?}", bob.accounts()[0].problems);
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -278,7 +278,7 @@ fn changes_a_reader_cant_send_are_shown_and_dropped() {
 
     // The browser suspended the background meanwhile: picked up from this device's copy.
     let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
-    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), json!({ "name": "Family", "changed": ["Bank"], "deleted": 0, "renamed": false }));
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), json!({ "name": "Family", "unlisted": false, "changed": ["Bank"], "deleted": 0, "renamed": false }));
     // Made a writer again after the preview: the drop asks the server and keeps it.
     alice.share_vault(&fam, "hal", Role::Writer, None).unwrap();
     assert_eq!(code(&run(discard_changes(&mut back, &fam.to_string())).unwrap_err()), "refused");
@@ -288,4 +288,40 @@ fn changes_a_reader_cant_send_are_shown_and_dropped() {
     assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap()["changed"], json!([]));
     assert!(run(sync(&mut back)).unwrap().is_empty());
     assert_eq!(code(&run(discard_changes(&mut back, "nope")).unwrap_err()), "not_found");
+}
+
+#[test]
+fn changes_to_a_vault_no_longer_shared_are_dropped_once_the_server_agrees() {
+    let url = server();
+    let (_, alice) = Session::signup(Http::new(&url), "ida", "pw", None, "cli").unwrap();
+    let mut alice = alice.unwrap();
+    let invite = alice.invite().unwrap();
+    let (sk, bob) = Session::signup(Http::new(&url), "jon", "pw", Some(&invite), "cli").unwrap();
+    bob.unwrap().trust_inviter(&invite).unwrap();
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    alice.share_vault(&fam, "jon", Role::Writer, None).unwrap();
+    let (mut s, _) = run(add(Later(Http::new(&url)), "pw", &sk.encode(), "x")).unwrap();
+    run(sync(&mut s)).unwrap();
+
+    // Saved here, but not sent before she removed him.
+    let mut v = s.vaults.remove(&fam).unwrap();
+    v.put(core::new_item_id(), Item::default());
+    s.vaults.insert(fam, v);
+    alice.revoke(&fam, "jon").unwrap();
+    let problems = run(sync(&mut s)).unwrap();
+    assert!(problems.iter().any(|p| p["unsent"] == json!(fam.to_string()) && p["text"].as_str().unwrap().contains("isn't listed")), "{problems:?}");
+
+    // Picked up from this device's copy, it's still out of sight.
+    let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
+    let want = json!({ "name": "Family", "unlisted": true, "changed": ["(untitled)"], "deleted": 0, "renamed": false });
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), want);
+    // Shared again after the preview: the drop asks the server and keeps it.
+    alice.share_vault(&fam, "jon", Role::Reader, None).unwrap();
+    assert_eq!(code(&run(discard_changes(&mut back, &fam.to_string())).unwrap_err()), "refused");
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), want);
+    alice.revoke(&fam, "jon").unwrap();
+    assert_eq!(run(discard_changes(&mut back, &fam.to_string())).unwrap(), 1);
+    let back = restore(Later(Http::new(&url)), &session_state(&back), &local_state(&back)).unwrap();
+    assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap()["changed"], json!([]));
 }

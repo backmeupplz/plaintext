@@ -192,7 +192,8 @@ private struct UnsentDialog: ViewModifier {
     }
 
     private func summary(_ c: UnsentChanges) -> String {
-        var lines = ["You can only read \(c.name) now, so these changes on this device can't be sent:"]
+        let why = c.unlisted ? "\(c.name) isn't shared with you any more" : "You can only read \(c.name) now"
+        var lines = ["\(why), so these changes on this device can't be sent:"]
         if !c.changed.isEmpty {
             let more = c.changed.count > 8 ? " and \(c.changed.count - 8) more" : ""
             lines.append("Added or edited: \(c.changed.prefix(8).joined(separator: ", "))\(more)")
@@ -200,7 +201,9 @@ private struct UnsentDialog: ViewModifier {
         if c.deleted > 0 { lines.append(c.deleted == 1 ? "1 item deleted" : "\(c.deleted) items deleted") }
         if c.renamed { lines.append("The vault's name or description changed") }
         if lines.count == 1 { lines[0] = String(lines[0].dropLast()) + "." }
-        lines.append("Dropping them downloads the vault again from the server. Copy out anything you want to keep first.")
+        lines.append(c.unlisted
+            ? "This device has the only copy of these changes, so they can't be recovered once dropped."
+            : "Dropping them downloads the vault again from the server. Copy out anything you want to keep first.")
         return lines.joined(separator: "\n")
     }
 }
