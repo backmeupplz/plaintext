@@ -4,7 +4,8 @@
 //! the UniFFI bindings for iOS/Android/desktop) uses this, so sync rules exist once.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::future::Future;
+use std::path::Path;
 
 use plaintext_core::api::*;
 use plaintext_core::crypto::{Derived, SecretKey, derive};
@@ -16,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 pub use plaintext_core;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod import;
 
 #[derive(Debug)]
@@ -56,8 +58,16 @@ pub fn now() -> u64 {
     now_ms() / 1000
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_millis() as u64
+}
+
+/// `SystemTime` panics in the browser; ask JavaScript.
+#[cfg(target_arch = "wasm32")]
+pub fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 /// How requests reach the server. `Http` for real use; tests and embedders may plug in others.
@@ -67,11 +77,41 @@ pub trait Transport {
     fn host(&self) -> String;
 }
 
+/// The same, for callers that can't block: the browser extension sends through
+/// `fetch` (see `wasm/`). Every `Transport` is one, so `Session`'s logic is
+/// written once, async, and the blocking methods drive it to completion.
+pub trait AsyncTransport {
+    fn fetch(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> impl Future<Output = Result<(u16, Vec<u8>)>>;
+    /// As `Transport::host`.
+    fn login_host(&self) -> String;
+}
+
+impl<T: Transport> AsyncTransport for T {
+    fn fetch(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> impl Future<Output = Result<(u16, Vec<u8>)>> {
+        std::future::ready(self.send(method, path, token, body))
+    }
+    fn login_host(&self) -> String {
+        self.host()
+    }
+}
+
+/// Runs a future that a blocking `Transport` has already finished: its requests
+/// complete inside `fetch`, so the first poll is the last.
+fn block_on<F: Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(v) => v,
+        std::task::Poll::Pending => unreachable!("a blocking Transport never leaves a request pending"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Http {
     pub base: String,
     agent: ureq::Agent,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Http {
     pub fn new(base: &str) -> Http {
         use std::time::Duration;
@@ -89,6 +129,7 @@ impl Http {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Transport for Http {
     fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
         let url = format!("{}{}", self.base, path);
@@ -141,13 +182,21 @@ pub fn server_info<T: Transport>(t: &T) -> Result<ServerInfo> {
 }
 
 fn call<T: Transport, R: DeserializeOwned>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<&impl Serialize>) -> Result<R> {
-    let (status, bytes) = raw(t, method, path, token, body.map(|b| serde_json::to_vec(b).expect("serializable")))?;
+    block_on(call_async(t, method, path, token, body))
+}
+
+fn raw<T: Transport>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+    block_on(raw_async(t, method, path, token, body))
+}
+
+async fn call_async<T: AsyncTransport, R: DeserializeOwned>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<&impl Serialize>) -> Result<R> {
+    let (status, bytes) = raw_async(t, method, path, token, body.map(|b| serde_json::to_vec(b).expect("serializable"))).await?;
     let bytes = if status == 204 || bytes.is_empty() { b"null".to_vec() } else { bytes };
     serde_json::from_slice(&bytes).map_err(|e| Error::Server(status, format!("unexpected response: {e}")))
 }
 
-fn raw<T: Transport>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
-    let (status, bytes) = t.send(method, path, token, body)?;
+async fn raw_async<T: AsyncTransport>(t: &T, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+    let (status, bytes) = t.fetch(method, path, token, body).await?;
     if !(200..300).contains(&status) {
         return Err(Error::Server(status, String::from_utf8_lossy(&bytes).into_owned()));
     }
@@ -160,12 +209,13 @@ pub const NONE: Option<&()> = None;
 pub const FILE_GRACE: u64 = 7 * 24 * 3600;
 
 /// A signed-in, unlocked account.
-pub struct Session<T: Transport> {
+pub struct Session<T: AsyncTransport> {
     pub t: T,
     pub token: String,
     pub account: Account,
     pub keyring: Keyring,
-    keyring_counter: u64,
+    /// The server keyring's counter this copy last matched; `None` after `restore`.
+    keyring_counter: Option<u64>,
     keyring_dirty: bool,
     pub admin: bool,
     pub vaults: BTreeMap<Hex, Vault>,
@@ -178,6 +228,439 @@ pub struct Session<T: Transport> {
     /// verify (kept as last verified, or left out if never verified) and invite
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
+}
+
+/// The logic, written once. Browsers call these through an `AsyncTransport`;
+/// everything else uses the blocking methods below, which run the same code.
+impl<T: AsyncTransport> Session<T> {
+    /// Sign in with keys derived from (password, Secret Key) or an agent key.
+    pub async fn login_async(t: T, d: &Derived, device: &str) -> Result<Self> {
+        let req = plaintext_core::login_request(d, now_ms(), device, &t.login_host());
+        let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
+        let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&resp.token), NONE).await?;
+        let (account, keyring) = plaintext_core::unlock(d, &acct)?;
+        Ok(Session {
+            t,
+            token: resp.token,
+            account,
+            keyring,
+            keyring_counter: Some(acct.keyring_counter),
+            keyring_dirty: false,
+            admin: acct.admin,
+            vaults: BTreeMap::new(),
+            hidden: BTreeMap::new(),
+            gone: BTreeMap::new(),
+            problems: Vec::new(),
+        })
+    }
+
+    /// Pick up a stored session (token + Account Key, e.g. from the OS keychain)
+    /// without re-entering the password.
+    pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
+        let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
+        let keyring = Keyring::open(&account, &acct.keyring.0)?;
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+    }
+
+    /// Pick up a stored session with no network: the token and Account Key plus
+    /// this device's own keyring copy (`keyring_snapshot`). The next `sync`
+    /// checks the token and folds in whatever the server's keyring gained.
+    pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
+        let keyring = Keyring::open(&account, keyring_blob)?;
+        // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+    }
+
+    pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
+        call_async(&self.t, method, path, Some(&self.token), body).await
+    }
+
+    pub fn me(&self) -> Me {
+        self.keyring.me()
+    }
+
+    pub fn username(&self) -> &str {
+        &self.keyring.username
+    }
+
+    /// Pull every vault, verify, merge, push local changes, and sync the keyring.
+    pub async fn sync_async(&mut self) -> Result<()> {
+        let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
+        self.admin = acct.admin;
+        // Another device (or this one, restored offline) changed the keyring: fold it in.
+        if Some(acct.keyring_counter) != self.keyring_counter {
+            self.merge_server_keyring(&acct)?;
+        }
+        let unlisted: Vec<Hex> = self.vaults.keys().filter(|id| !acct.vaults.contains(id)).copied().collect();
+        for id in unlisted {
+            let v = self.vaults.remove(&id).expect("listed above");
+            self.hidden.insert(id, v);
+        }
+        self.problems.clear();
+        // A vault whose account is out of storage keeps its unpushed changes and
+        // reports the error at the end, without holding up the other vaults. So does
+        // a member removal another device raced, or one too big to send; the next sync retries.
+        let mut full = None;
+        for id in &acct.vaults {
+            let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
+            self.vaults.entry(*id).or_insert(v);
+            match self.sync_and_tidy(id).await {
+                // Best effort: an older server or a role that changed mid-run just means next time.
+                Ok(()) => drop(self.collect_files_async(id, 0).await),
+                // Every 409 and 413 comes after a pull, so collecting is still safe, and
+                // over quota it's what makes room for the refused change.
+                Err(e @ Error::Server(409 | 413, _)) => {
+                    drop(self.collect_files_async(id, 0).await);
+                    full = Some(e);
+                }
+                // Anyone can share a vault with you (or an agent); one that doesn't
+                // check out mustn't stop the others. Network and session errors still do.
+                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
+                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
+                    if known.is_none() {
+                        self.vaults.remove(id);
+                    }
+                    let name = known.unwrap_or_else(|| id.to_string());
+                    // Only pending changes make a reader's push fail: say how to drop them.
+                    // By id: anyone who may write can name a vault anything.
+                    let hint = match e {
+                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", &id.to_string()[..8]),
+                        _ => String::new(),
+                    };
+                    self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Users who joined with our invites get verified through their proof.
+        if !self.keyring.invites.is_empty() {
+            let users = self.users_async().await?;
+            let (done, conflicts) = self.keyring.verify_invitees(&users);
+            self.keyring_dirty |= !done.is_empty();
+            for n in conflicts {
+                self.problems.push(format!(
+                    "someone signed up with your invite as {n}, but you already had different keys for {n}; compare fingerprints in person (plaintext user verify {n} --fingerprint …)"
+                ));
+            }
+        }
+        self.save_keyring_async().await?;
+        full.map_or(Ok(()), Err)
+    }
+
+    async fn pull_async(&mut self, id: &Hex) -> Result<()> {
+        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE).await?;
+        let v = self.vaults.get_mut(id).expect("checked above");
+        self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
+        self.gone.insert(*id, resp.gone);
+        Ok(())
+    }
+
+    async fn sync_and_tidy(&mut self, id: &Hex) -> Result<()> {
+        self.sync_vault_async(id).await?;
+        self.remove_members_async(id, None).await
+    }
+
+    /// Pull, then push pending changes.
+    pub async fn sync_vault_async(&mut self, id: &Hex) -> Result<()> {
+        self.pull_async(id).await?;
+        self.push_async(id).await
+    }
+
+    /// Pull a vault and refuse if we may only read it. A reader's sync never
+    /// pushes, so a change made anyway would stay on this device without a word.
+    /// Offline it passes, so the change waits for the next sync, unless the
+    /// roster we already have says we only read. An offline pull's error comes
+    /// back inside (Ok(Err)) for the caller.
+    async fn check_async(&mut self, id: &Hex) -> Result<Result<()>> {
+        let pulled = self.pull_async(id).await;
+        if let Err(e) = &pulled
+            && !matches!(e, Error::Network(_) | Error::Server(500..=599, _))
+        {
+            return pulled.map(Ok);
+        }
+        // A vault never pulled has no roster yet: the pull's error says more.
+        if let Err(e) = self.may_write(id) {
+            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
+        }
+        Ok(pulled)
+    }
+
+    fn may_write(&self, id: &Hex) -> Result<()> {
+        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        match v.role(self.username(), now()) {
+            Some(r) if r >= Role::Writer => Ok(()),
+            _ => Err(plaintext_core::Error::ReadOnly.into()),
+        }
+    }
+
+    /// Make a change and push it; if we may only read the vault (see
+    /// `check_async`), undo it and refuse. The change goes in before the pull,
+    /// as with `sync_vault`, so the pull still sees another device's newer copy
+    /// of the item (an edit keeps it as a conflict, a delete gives way to it).
+    async fn change_async(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
+        let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
+        let before = v.snapshot(&self.account);
+        f(v);
+        match self.check_async(id).await {
+            Ok(pulled) => {
+                pulled?;
+                self.push_async(id).await
+            }
+            // Only the refusal is undone: after any other error the change waits
+            // for the next sync, as it did before this check.
+            Err(e @ Error::Core(plaintext_core::Error::ReadOnly)) => {
+                // The undo also undid the pull; pull again so the roster that
+                // refused us stays (best effort: offline the old one says so).
+                self.vaults.insert(*id, Vault::restore(&self.account, *id, &before)?);
+                drop(self.pull_async(id).await);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop this device's changes to a vault that haven't reached the server
+    /// (say, made before we became a reader) by downloading it again. The new copy
+    /// must be the version this device already verified; otherwise, or if the
+    /// download fails, nothing changes. Returns how many changes were dropped.
+    pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
+        self.pull_async(id).await?;
+        let n = self.vaults[id].changes();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Edits overwrote, and deletes removed, the server's copies: fetch every item.
+        let mut fresh = Vault::new(*id);
+        let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
+        let mut keyring = self.keyring.clone();
+        let changed = fresh.apply(&resp, &mut keyring, now())?;
+        let old = &self.vaults[id];
+        if !fresh.same_head(old) {
+            // Newer: another device pushed in between. Older, or a different copy
+            // of the same version: the server is lying.
+            return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+        }
+        // The next sync uploads the keyring, as after any pull.
+        self.keyring = keyring;
+        self.keyring_dirty |= changed;
+        self.vaults.insert(*id, fresh);
+        Ok(n)
+    }
+
+    /// Push pending changes (a pull came just before); on a conflict pull again and retry.
+    async fn push_async(&mut self, id: &Hex) -> Result<()> {
+        for _ in 0..5 {
+            let me = self.me();
+            let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
+            // Changes made while we could still write (offline, or just before a
+            // demotion) can't go to a reader's vault: `push` says ReadOnly, on every
+            // sync, rather than keep them without a word.
+            if !v.has_changes() {
+                return Ok(());
+            }
+            let put = v.push(&me, now())?;
+            match raw_async(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))).await {
+                Ok(_) => {
+                    self.vaults.get_mut(id).expect("exists").pushed(&put);
+                    return Ok(());
+                }
+                Err(Error::Server(409, _)) => self.pull_async(id).await?,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Server(409, "the vault kept changing; try again".into()))
+    }
+
+    /// Removes `who` (if given) with a new vault key. Members whose access expired,
+    /// or whose accounts were deleted, go in the same roster version (the server
+    /// refuses a roster naming a deleted account); without `who` that happens only
+    /// on an owner's device with nothing unpushed, whichever notices first.
+    async fn remove_members_async(&mut self, id: &Hex, who: Option<&str>) -> Result<()> {
+        let me = self.username().to_string();
+        let Some(v) = self.vaults.get(id) else { return Ok(()) };
+        if who.is_none() && (v.role(&me, now()) != Some(Role::Owner) || v.has_changes()) {
+            return Ok(());
+        }
+        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut out: Vec<&str> = v
+            .roster
+            .iter()
+            .flat_map(|r| &r.members)
+            .filter(|m| m.username != me && (m.expires.is_some_and(|e| now() >= e) || gone.contains(&m.username)))
+            .map(|m| m.username.as_str())
+            .collect();
+        out.extend(who.filter(|w| !out.contains(w)));
+        if out.is_empty() {
+            return Ok(());
+        }
+        let update = v.revoke(&self.me(), &out, now())?;
+        self.call_async::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update)).await?;
+        self.pull_async(id).await
+    }
+
+    /// Delete the vault's files that no item refers to once this device has seen
+    /// them so for `FILE_GRACE` (`Vault::collect_files`). They come from deleted
+    /// items, edits that dropped them, and uploads whose item never got pushed;
+    /// they count against the quota until then. Writers only, and only right
+    /// after a pull (`sync` does that). The grace runs on the server's clock;
+    /// tests move it forward by `skew` seconds.
+    async fn collect_files_async(&mut self, vault: &Hex, skew: u64) -> Result<()> {
+        let v = self.vaults.get(vault).ok_or(Error::NotFound("vault".into()))?;
+        if v.role(self.username(), now()).is_none_or(|r| r < Role::Writer) {
+            return Ok(());
+        }
+        let list: FileList = self.call_async("GET", &format!("/v1/vaults/{vault}/files"), NONE).await?;
+        let listed: Vec<Hex> = list.files.into_iter().map(|f| f.id).collect();
+        let due = self.vaults.get_mut(vault).expect("checked above").collect_files(&listed, list.now + skew, FILE_GRACE);
+        for f in &due {
+            self.call_async::<()>("DELETE", &format!("/v1/vaults/{vault}/files/{f}"), NONE).await?;
+        }
+        Ok(())
+    }
+
+    /// Fold in this device's own copy of the keyring (saved after the last run):
+    /// pins it holds can't be erased by a server serving an older keyring.
+    pub async fn merge_local_keyring_async(&mut self, local_blob: &[u8]) -> Result<()> {
+        let mut local = Keyring::open(&self.account, local_blob)?;
+        if local.username != self.keyring.username {
+            return Err(plaintext_core::Error::Tampered.into());
+        }
+        self.keyring_dirty |= local.merge_from(&self.keyring);
+        self.keyring = local;
+        self.save_keyring_async().await
+    }
+
+    /// This device's copy of the keyring, sealed with the Account Key. Persist it
+    /// and pass it to `merge_local_keyring` after signing in again.
+    pub fn keyring_snapshot(&self) -> Vec<u8> {
+        self.keyring.seal(&self.account)
+    }
+
+    /// Upload the keyring if pins changed. On a conflict, merge with the server's
+    /// copy: pins are only ever added, and a pin this device made wins.
+    pub async fn save_keyring_async(&mut self) -> Result<()> {
+        for _ in 0..5 {
+            if !self.keyring_dirty {
+                return Ok(());
+            }
+            // Restored and not yet merged: there's no counter to send, so fetch it (and fold the server's pins in) first.
+            let Some(counter) = self.keyring_counter else {
+                let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
+                self.merge_server_keyring(&acct)?;
+                continue;
+            };
+            let put = KeyringPut { expected_counter: counter, keyring: B64(self.keyring.seal(&self.account)) };
+            match raw_async(&self.t, "PUT", "/v1/account/keyring", Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))).await {
+                Ok(_) => {
+                    self.keyring_counter = Some(counter + 1);
+                    self.keyring_dirty = false;
+                }
+                Err(Error::Server(409, _)) => {
+                    let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
+                    self.merge_server_keyring(&acct)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold the server's keyring into ours and take its counter.
+    fn merge_server_keyring(&mut self, acct: &AccountResponse) -> Result<()> {
+        let server = Keyring::open(&self.account, &acct.keyring.0)?;
+        self.keyring_dirty |= self.keyring.merge_from(&server);
+        self.keyring_counter = Some(acct.keyring_counter);
+        Ok(())
+    }
+
+    pub fn fingerprint(&self, username: &str) -> Option<String> {
+        if username == self.username() {
+            return Some(self.me().fingerprint());
+        }
+        let c = self.keyring.contacts.get(username)?;
+        Some(plaintext_core::crypto::fingerprint(username, &c.sign_pk.0, &c.enc_pk.0))
+    }
+
+    /// Everyone on the server for admins and on invite-only servers; on open
+    /// (hosted) servers, only the people who joined with your invites.
+    async fn users_async(&self) -> Result<Vec<UserInfo>> {
+        self.call_async("GET", "/v1/users", NONE).await
+    }
+
+    /// Find a vault by id prefix or name (case-insensitive).
+    pub fn vault(&self, name: &str) -> Result<Hex> {
+        let n = name.to_lowercase();
+        let hits: Vec<Hex> = self
+            .vaults
+            .iter()
+            .filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n))
+            .map(|(id, _)| *id)
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(Error::NotFound(format!("vault {name}"))),
+            _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
+        }
+    }
+
+    /// The vault new items go to by default: the one this account made at signup.
+    /// Never a vault anyone else can read: if the server stops listing that one,
+    /// this fails rather than pick another (it might be shared), so nobody can
+    /// collect your new logins by hiding your vault or sharing you a "Personal".
+    /// Accounts with no default recorded fall back to a vault only they are in.
+    pub fn default_vault(&self) -> Result<Hex> {
+        let me = self.username().to_string();
+        let own = |v: &&Vault| v.creator == me && v.role(&me, now()).is_some_and(|r| r >= Role::Writer);
+        let found = match self.keyring.default_vault {
+            Some(id) => self.vaults.get(&id).filter(own),
+            None => self.vaults.values().filter(own).find(|v| v.roster.as_ref().is_some_and(|r| r.members.len() == 1)),
+        };
+        found.map(|v| v.id).ok_or(Error::NotFound("your default vault (the server isn't listing it); name a vault".into()))
+    }
+
+    /// One of our own vaults by name (for imports), never one shared with us.
+    pub fn own_vault(&self, name: &str) -> Option<Hex> {
+        let me = self.username();
+        self.vaults.values().find(|v| v.creator == me && v.meta.name.eq_ignore_ascii_case(name)).map(|v| v.id)
+    }
+
+    /// Items matching `query` (title, username, URL, tags, non-secret fields), or
+    /// an exact id / id prefix. `vault` narrows the search.
+    pub fn find(&self, query: &str, vault: Option<&Hex>) -> Vec<(Hex, Hex, &Item)> {
+        let q = query.to_lowercase();
+        let mut exact = Vec::new();
+        let mut loose = Vec::new();
+        for (vid, v) in self.vaults.iter().filter(|(id, _)| vault.is_none_or(|w| w == *id)) {
+            for (iid, item) in v.items() {
+                if iid.to_string().starts_with(&q) || item.title.to_lowercase() == q {
+                    exact.push((*vid, *iid, item));
+                } else if item.matches(query) {
+                    loose.push((*vid, *iid, item));
+                }
+            }
+        }
+        if exact.is_empty() { loose } else { exact }
+    }
+
+    /// Exactly one item for `query`, or an error naming the problem.
+    pub fn one(&self, query: &str, vault: Option<&Hex>) -> Result<(Hex, Hex, Item)> {
+        let hits = self.find(query, vault);
+        match hits.as_slice() {
+            [(v, i, item)] => Ok((*v, *i, (*item).clone())),
+            [] => Err(Error::NotFound(format!("item {query}"))),
+            _ => Err(Error::NotFound(format!("one item for {query} ({} match; be more specific)", hits.len()))),
+        }
+    }
+
+    /// Add or replace an item and push it.
+    pub async fn put_item_async(&mut self, vault: &Hex, id: Hex, item: Item) -> Result<()> {
+        self.change_async(vault, |v| v.put(id, item)).await
+    }
+
+    pub async fn logout_async(&self) -> Result<()> {
+        self.call_async("POST", "/v1/logout", NONE).await
+    }
 }
 
 impl<T: Transport> Session<T> {
@@ -231,272 +714,113 @@ impl<T: Transport> Session<T> {
 
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
     pub fn login(t: T, d: &Derived, device: &str) -> Result<Self> {
-        let req = plaintext_core::login_request(d, now_ms(), device, &t.host());
-        let resp: LoginResponse = call(&t, "POST", "/v1/login", None, Some(&req))?;
-        let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&resp.token), NONE)?;
-        let (account, keyring) = plaintext_core::unlock(d, &acct)?;
-        Ok(Session {
-            t,
-            token: resp.token,
-            account,
-            keyring,
-            keyring_counter: acct.keyring_counter,
-            keyring_dirty: false,
-            admin: acct.admin,
-            vaults: BTreeMap::new(),
-            hidden: BTreeMap::new(),
-            gone: BTreeMap::new(),
-            problems: Vec::new(),
-        })
+        block_on(Self::login_async(t, d, device))
     }
 
     /// Pick up a stored session (token + Account Key, e.g. from the OS keychain)
     /// without re-entering the password.
     pub fn resume(t: T, token: String, account: Account) -> Result<Self> {
-        let acct: AccountResponse = call(&t, "GET", "/v1/account", Some(&token), NONE)?;
-        let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+        block_on(Self::resume_async(t, token, account))
+    }
+
+    /// Open a stored session with no network: the token and Account Key from the
+    /// keychain plus this device's own sealed copies in `dir` (see `save_local`).
+    /// Items can be read and edited; `sync` sends the edits once the server is back.
+    pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
+        let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
+        let keyring = Keyring::open(&account, &blob)?;
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() };
+        s.load_vaults(dir);
+        Ok(s)
+    }
+
+    /// Load what this device saved in `dir`: its keyring copy (merged in, so pins
+    /// it holds survive a server serving an older keyring) and every vault
+    /// snapshot, which carries the rollback guard. Call after signing in.
+    pub fn load_local(&mut self, dir: &Path) -> Result<()> {
+        self.load_vaults(dir);
+        match std::fs::read(dir.join("keyring.bin")) {
+            Ok(blob) => self.merge_local_keyring(&blob),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn load_vaults(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for f in entries.flatten() {
+            let Some(name) = f.file_name().to_str().and_then(|n| n.strip_suffix(".bin")).map(str::to_owned) else { continue };
+            let (name, hidden) = name.strip_suffix(".hidden").map_or((name.as_str(), false), |n| (n, true));
+            let Ok(id) = name.parse::<Hex>() else { continue };
+            if let Ok(blob) = std::fs::read(f.path())
+                && let Ok(v) = Vault::restore(&self.account, id, &blob)
+            {
+                if hidden { &mut self.hidden } else { &mut self.vaults }.insert(id, v);
+            }
+        }
+    }
+
+    /// Save this device's state to `dir`, sealed with the Account Key: every vault
+    /// snapshot (hidden ones too, so they can't come back older, kept apart so
+    /// they stay hidden when opened offline) and the keyring.
+    pub fn save_local(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let write = |name: String, data: Vec<u8>| -> std::io::Result<()> {
+            let tmp = dir.join(format!("{name}.tmp"));
+            std::fs::write(&tmp, data)?;
+            std::fs::rename(tmp, dir.join(format!("{name}.bin")))
+        };
+        for (hidden, list) in [(false, &self.vaults), (true, &self.hidden)] {
+            for (id, v) in list {
+                let (name, other) = if hidden { (format!("{id}.hidden"), id.to_string()) } else { (id.to_string(), format!("{id}.hidden")) };
+                write(name, v.snapshot(&self.account))?;
+                let _ = std::fs::remove_file(dir.join(format!("{other}.bin")));
+            }
+        }
+        write("keyring".into(), self.keyring_snapshot())
     }
 
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
         call(&self.t, method, path, Some(&self.token), body)
     }
 
-    pub fn me(&self) -> Me {
-        self.keyring.me()
-    }
-
-    pub fn username(&self) -> &str {
-        &self.keyring.username
-    }
-
     /// Pull every vault, verify, merge, push local changes, and sync the keyring.
     pub fn sync(&mut self) -> Result<()> {
-        let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
-        self.admin = acct.admin;
-        let unlisted: Vec<Hex> = self.vaults.keys().filter(|id| !acct.vaults.contains(id)).copied().collect();
-        for id in unlisted {
-            let v = self.vaults.remove(&id).expect("listed above");
-            self.hidden.insert(id, v);
-        }
-        self.problems.clear();
-        // A vault whose account is out of storage keeps its unpushed changes and
-        // reports the error at the end, without holding up the other vaults. So does
-        // a member removal another device raced, or one too big to send; the next sync retries.
-        let mut full = None;
-        for id in &acct.vaults {
-            let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
-            self.vaults.entry(*id).or_insert(v);
-            match self.sync_vault(id).and_then(|_| self.remove_members(id, None)) {
-                // Best effort: an older server or a role that changed mid-run just means next time.
-                Ok(()) => drop(self.collect_files(id, 0)),
-                // Every 409 and 413 comes after a pull, so collecting is still safe, and
-                // over quota it's what makes room for the refused change.
-                Err(e @ Error::Server(409 | 413, _)) => {
-                    drop(self.collect_files(id, 0));
-                    full = Some(e);
-                }
-                // Anyone can share a vault with you (or an agent); one that doesn't
-                // check out mustn't stop the others. Network and session errors still do.
-                Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
-                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
-                    if known.is_none() {
-                        self.vaults.remove(id);
-                    }
-                    let name = known.unwrap_or_else(|| id.to_string());
-                    // Only pending changes make a reader's push fail: say how to drop them.
-                    // By id: anyone who may write can name a vault anything.
-                    let hint = match e {
-                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", &id.to_string()[..8]),
-                        _ => String::new(),
-                    };
-                    self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Users who joined with our invites get verified through their proof.
-        if !self.keyring.invites.is_empty() {
-            let users = self.users()?;
-            let (done, conflicts) = self.keyring.verify_invitees(&users);
-            self.keyring_dirty |= !done.is_empty();
-            for n in conflicts {
-                self.problems.push(format!(
-                    "someone signed up with your invite as {n}, but you already had different keys for {n}; compare fingerprints in person (plaintext user verify {n} --fingerprint …)"
-                ));
-            }
-        }
-        self.save_keyring()?;
-        full.map_or(Ok(()), Err)
-    }
-
-    fn pull(&mut self, id: &Hex) -> Result<()> {
-        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        let resp: VaultResponse = self.call("GET", &format!("/v1/vaults/{id}?{}", v.pull_query()), NONE)?;
-        let v = self.vaults.get_mut(id).expect("checked above");
-        self.keyring_dirty |= v.apply(&resp, &mut self.keyring, now())?;
-        self.gone.insert(*id, resp.gone);
-        Ok(())
+        block_on(self.sync_async())
     }
 
     /// Pull, then push pending changes.
     pub fn sync_vault(&mut self, id: &Hex) -> Result<()> {
-        self.pull(id)?;
-        self.push(id)
+        block_on(self.sync_vault_async(id))
     }
 
-    /// Pull a vault and refuse if we may only read it. A reader's sync never
-    /// pushes, so a change made anyway would stay on this device without a word.
+    /// Pull a vault and refuse if we may only read it (`check_async`).
     pub fn writable(&mut self, id: &Hex) -> Result<()> {
-        self.pull(id)?;
-        self.may_write(id)
+        block_on(self.check_async(id)).map(drop)
     }
 
-    fn may_write(&self, id: &Hex) -> Result<()> {
-        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
-        match v.role(self.username(), now()) {
-            Some(r) if r >= Role::Writer => Ok(()),
-            _ => Err(plaintext_core::Error::ReadOnly.into()),
-        }
+    fn pull(&mut self, id: &Hex) -> Result<()> {
+        block_on(self.pull_async(id))
     }
 
-    /// Make a change and push it, refusing first if we may only read the vault.
-    /// Offline, the change still goes in and waits for the next sync, unless the
-    /// roster we already have says we only read.
-    fn change(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
-        let pulled = self.pull(id);
-        if matches!(pulled, Err(ref e) if !matches!(e, Error::Network(_) | Error::Server(500..=599, _))) {
-            return pulled;
-        }
-        // A vault never pulled has no roster yet: the pull's error says more.
-        if let Err(e) = self.may_write(id) {
-            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
-        }
-        f(self.vaults.get_mut(id).expect("checked above"));
-        pulled?;
-        self.push(id)
-    }
-
-    /// Drop this device's changes to a vault that haven't reached the server
-    /// (say, made before we became a reader) by downloading it again. The new copy
-    /// must be the version this device already verified; otherwise, or if the
-    /// download fails, nothing changes. Returns how many changes were dropped.
+    /// Drop this device's unsent changes to a vault (`discard_changes_async`).
     pub fn discard_changes(&mut self, id: &Hex) -> Result<usize> {
-        self.pull(id)?;
-        let n = self.vaults[id].changes();
-        if n == 0 {
-            return Ok(0);
-        }
-        // Edits overwrote, and deletes removed, the server's copies: fetch every item.
-        let mut fresh = Vault::new(*id);
-        let resp: VaultResponse = self.call("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE)?;
-        let mut keyring = self.keyring.clone();
-        let changed = fresh.apply(&resp, &mut keyring, now())?;
-        let old = &self.vaults[id];
-        if !fresh.same_head(old) {
-            // Newer: another device pushed in between. Older, or a different copy
-            // of the same version: the server is lying.
-            return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
-        }
-        // The next sync uploads the keyring, as after any pull.
-        self.keyring = keyring;
-        self.keyring_dirty |= changed;
-        self.vaults.insert(*id, fresh);
-        Ok(n)
+        block_on(self.discard_changes_async(id))
     }
 
-    /// Push pending changes (a pull came just before); on a conflict pull again and retry.
-    fn push(&mut self, id: &Hex) -> Result<()> {
-        for _ in 0..5 {
-            let me = self.me();
-            let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
-            // Changes made while we could still write (offline, or just before a
-            // demotion) can't go to a reader's vault: `push` says ReadOnly, on every
-            // sync, rather than keep them without a word.
-            if !v.has_changes() {
-                return Ok(());
-            }
-            let put = v.push(&me, now())?;
-            match raw(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))) {
-                Ok(_) => {
-                    self.vaults.get_mut(id).expect("exists").pushed(&put);
-                    return Ok(());
-                }
-                Err(Error::Server(409, _)) => self.pull(id)?,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Server(409, "the vault kept changing; try again".into()))
-    }
-
-    /// Removes `who` (if given) with a new vault key. Members whose access expired,
-    /// or whose accounts were deleted, go in the same roster version (the server
-    /// refuses a roster naming a deleted account); without `who` that happens only
-    /// on an owner's device with nothing unpushed, whichever notices first.
     fn remove_members(&mut self, id: &Hex, who: Option<&str>) -> Result<()> {
-        let me = self.username().to_string();
-        let Some(v) = self.vaults.get(id) else { return Ok(()) };
-        if who.is_none() && (v.role(&me, now()) != Some(Role::Owner) || v.has_changes()) {
-            return Ok(());
-        }
-        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
-        let mut out: Vec<&str> = v
-            .roster
-            .iter()
-            .flat_map(|r| &r.members)
-            .filter(|m| m.username != me && (m.expires.is_some_and(|e| now() >= e) || gone.contains(&m.username)))
-            .map(|m| m.username.as_str())
-            .collect();
-        out.extend(who.filter(|w| !out.contains(w)));
-        if out.is_empty() {
-            return Ok(());
-        }
-        let update = v.revoke(&self.me(), &out, now())?;
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/roster"), Some(&update))?;
-        self.pull(id)
+        block_on(self.remove_members_async(id, who))
     }
 
     /// Fold in this device's own copy of the keyring (saved after the last run):
     /// pins it holds can't be erased by a server serving an older keyring.
     pub fn merge_local_keyring(&mut self, local_blob: &[u8]) -> Result<()> {
-        let mut local = Keyring::open(&self.account, local_blob)?;
-        if local.username != self.keyring.username {
-            return Err(plaintext_core::Error::Tampered.into());
-        }
-        self.keyring_dirty |= local.merge_from(&self.keyring);
-        self.keyring = local;
-        self.save_keyring()
-    }
-
-    /// This device's copy of the keyring, sealed with the Account Key. Persist it
-    /// and pass it to `merge_local_keyring` after signing in again.
-    pub fn keyring_snapshot(&self) -> Vec<u8> {
-        self.keyring.seal(&self.account)
+        block_on(self.merge_local_keyring_async(local_blob))
     }
 
     /// Upload the keyring if pins changed. On a conflict, merge with the server's
     /// copy: pins are only ever added, and a pin this device made wins.
     pub fn save_keyring(&mut self) -> Result<()> {
-        for _ in 0..5 {
-            if !self.keyring_dirty {
-                return Ok(());
-            }
-            let put = KeyringPut { expected_counter: self.keyring_counter, keyring: B64(self.keyring.seal(&self.account)) };
-            match raw(&self.t, "PUT", "/v1/account/keyring", Some(&self.token), Some(serde_json::to_vec(&put).expect("serializable"))) {
-                Ok(_) => {
-                    self.keyring_counter += 1;
-                    self.keyring_dirty = false;
-                }
-                Err(Error::Server(409, _)) => {
-                    let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
-                    let server = Keyring::open(&self.account, &acct.keyring.0)?;
-                    self.keyring.merge_from(&server);
-                    self.keyring_counter = acct.keyring_counter;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        block_on(self.save_keyring_async())
     }
 
     // ---------- Users ----------
@@ -504,7 +828,7 @@ impl<T: Transport> Session<T> {
     /// Everyone on the server for admins and on invite-only servers; on open
     /// (hosted) servers, only the people who joined with your invites.
     pub fn users(&self) -> Result<Vec<UserInfo>> {
-        self.call("GET", "/v1/users", NONE)
+        block_on(self.users_async())
     }
 
     /// Look a user up in the server directory and pin their keys (trust on first
@@ -531,14 +855,6 @@ impl<T: Transport> Session<T> {
             return Err(plaintext_core::Error::KeyChanged(username.into()).into());
         }
         Ok(u)
-    }
-
-    pub fn fingerprint(&self, username: &str) -> Option<String> {
-        if username == self.username() {
-            return Some(self.me().fingerprint());
-        }
-        let c = self.keyring.contacts.get(username)?;
-        Some(plaintext_core::crypto::fingerprint(username, &c.sign_pk.0, &c.enc_pk.0))
     }
 
     pub fn mark_verified(&mut self, username: &str) -> Result<()> {
@@ -623,7 +939,7 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn logout(&self) -> Result<()> {
-        self.call("POST", "/v1/logout", NONE)
+        block_on(self.logout_async())
     }
 
     // ---------- Vaults ----------
@@ -637,7 +953,7 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn rename_vault(&mut self, id: &Hex, meta: VaultMeta) -> Result<()> {
-        self.change(id, |v| v.set_meta(meta))
+        block_on(self.change_async(id, |v| v.set_meta(meta)))
     }
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
@@ -668,81 +984,58 @@ impl<T: Transport> Session<T> {
         self.call("GET", &format!("/v1/vaults/{id}/audit"), NONE)
     }
 
-    /// Find a vault by id prefix or name (case-insensitive).
-    pub fn vault(&self, name: &str) -> Result<Hex> {
-        let n = name.to_lowercase();
-        let hits: Vec<Hex> = self
-            .vaults
-            .iter()
-            .filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n))
-            .map(|(id, _)| *id)
-            .collect();
-        match hits.as_slice() {
-            [one] => Ok(*one),
-            [] => Err(Error::NotFound(format!("vault {name}"))),
-            _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
-        }
-    }
-
-    /// The vault new items go to by default: the one this account made at signup.
-    /// Never a vault anyone else can read: if the server stops listing that one,
-    /// this fails rather than pick another (it might be shared), so nobody can
-    /// collect your new logins by hiding your vault or sharing you a "Personal".
-    /// Accounts with no default recorded fall back to a vault only they are in.
-    pub fn default_vault(&self) -> Result<Hex> {
-        let me = self.username().to_string();
-        let own = |v: &&Vault| v.creator == me && v.role(&me, now()).is_some_and(|r| r >= Role::Writer);
-        let found = match self.keyring.default_vault {
-            Some(id) => self.vaults.get(&id).filter(own),
-            None => self.vaults.values().filter(own).find(|v| v.roster.as_ref().is_some_and(|r| r.members.len() == 1)),
-        };
-        found.map(|v| v.id).ok_or(Error::NotFound("your default vault (the server isn't listing it); name a vault".into()))
-    }
-
-    /// One of our own vaults by name (for imports), never one shared with us.
-    pub fn own_vault(&self, name: &str) -> Option<Hex> {
-        let me = self.username();
-        self.vaults.values().find(|v| v.creator == me && v.meta.name.eq_ignore_ascii_case(name)).map(|v| v.id)
-    }
-
-    /// Items matching `query` (title, username, URL, tags, non-secret fields), or
-    /// an exact id / id prefix. `vault` narrows the search.
-    pub fn find(&self, query: &str, vault: Option<&Hex>) -> Vec<(Hex, Hex, &Item)> {
-        let q = query.to_lowercase();
-        let mut exact = Vec::new();
-        let mut loose = Vec::new();
-        for (vid, v) in self.vaults.iter().filter(|(id, _)| vault.is_none_or(|w| w == *id)) {
-            for (iid, item) in v.items() {
-                if iid.to_string().starts_with(&q) || item.title.to_lowercase() == q {
-                    exact.push((*vid, *iid, item));
-                } else if item.matches(query) {
-                    loose.push((*vid, *iid, item));
-                }
-            }
-        }
-        if exact.is_empty() { loose } else { exact }
-    }
-
-    /// Exactly one item for `query`, or an error naming the problem.
-    pub fn one(&self, query: &str, vault: Option<&Hex>) -> Result<(Hex, Hex, Item)> {
-        let hits = self.find(query, vault);
-        match hits.as_slice() {
-            [(v, i, item)] => Ok((*v, *i, (*item).clone())),
-            [] => Err(Error::NotFound(format!("item {query}"))),
-            _ => Err(Error::NotFound(format!("one item for {query} ({} match; be more specific)", hits.len()))),
-        }
-    }
-
     /// Add or replace an item and push it.
     pub fn put_item(&mut self, vault: &Hex, id: Hex, item: Item) -> Result<()> {
-        self.change(vault, |v| v.put(id, item))
+        block_on(self.put_item_async(vault, id, item))
     }
 
     /// Delete an item and push. Its attachments stay on the server until a later
     /// sync collects them (`collect_files`), so another device that brings the item
     /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        self.change(vault, |v| v.delete(id))
+        block_on(self.change_async(vault, |v| v.delete(id)))
+    }
+
+    /// Save imported items: each source vault goes to our own vault of that name
+    /// (made if needed; "Personal" and unnamed ones to the default vault), or all
+    /// to `into`. Attachments are uploaded. Returns how many items were saved.
+    /// Refused before anything changes if we may only read an existing target
+    /// (see `writable`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<usize> {
+        let target = |s: &Self, v: &import::Imported| match into {
+            Some(id) => Ok(Some(id)),
+            None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => s.default_vault().map(Some),
+            None => Ok(s.own_vault(&v.name)),
+        };
+        // Kept, so a pull here that renames a vault can't send items to an unchecked one.
+        let mut targets = Vec::new();
+        for v in &imported {
+            let to = target(self, v)?;
+            if let Some(id) = to
+                && !targets.contains(&to)
+            {
+                self.writable(&id)?;
+            }
+            targets.push(to);
+        }
+        let mut n = 0;
+        for (v, to) in imported.into_iter().zip(targets) {
+            // A name not found above may be a vault made earlier in this import.
+            let vid = match to.or_else(|| self.own_vault(&v.name)) {
+                Some(id) => id,
+                None => self.create_vault(&v.name)?,
+            };
+            for (mut it, files) in v.items {
+                for (name, bytes) in files {
+                    it.files.push(self.upload_file(&vid, &name, &bytes)?);
+                }
+                self.vaults.get_mut(&vid).ok_or(Error::NotFound("vault".into()))?.put(plaintext_core::new_item_id(), it);
+                n += 1;
+            }
+            self.sync_vault(&vid)?;
+        }
+        Ok(n)
     }
 
     // ---------- Files ----------
@@ -766,24 +1059,10 @@ impl<T: Transport> Session<T> {
         self.call("GET", &format!("/v1/vaults/{vault}/files"), NONE)
     }
 
-    /// Delete the vault's files that no item refers to once this device has seen
-    /// them so for `FILE_GRACE` (`Vault::collect_files`). They come from deleted
-    /// items, edits that dropped them, and uploads whose item never got pushed;
-    /// they count against the quota until then. Writers only, and only right
-    /// after a pull (`sync` does that). The grace runs on the server's clock;
-    /// tests move it forward by `skew` seconds.
+    /// `collect_files_async`, for tests that move the clock.
+    #[cfg(test)]
     pub(crate) fn collect_files(&mut self, vault: &Hex, skew: u64) -> Result<()> {
-        let v = self.vaults.get(vault).ok_or(Error::NotFound("vault".into()))?;
-        if v.role(self.username(), now()).is_none_or(|r| r < Role::Writer) {
-            return Ok(());
-        }
-        let list = self.files(vault)?;
-        let listed: Vec<Hex> = list.files.into_iter().map(|f| f.id).collect();
-        let due = self.vaults.get_mut(vault).expect("checked above").collect_files(&listed, list.now + skew, FILE_GRACE);
-        for f in &due {
-            self.delete_file(vault, f)?;
-        }
-        Ok(())
+        block_on(self.collect_files_async(vault, skew))
     }
 
     /// Delete an uploaded file from the server (items that list it can no longer fetch it).

@@ -264,6 +264,13 @@ fn lying_server_and_hostile_users() {
     a3.t.hide.set(Some(mine));
     a3.sync().unwrap();
     assert!(!a3.vaults.contains_key(&mine) && a3.hidden.contains_key(&mine));
+    // ...and it stays hidden (not editable) when this device opens offline.
+    let dir = std::env::temp_dir().join(format!("plaintext-hidden-{}", hex::encode(plaintext_core::crypto::random::<8>())));
+    a3.save_local(&dir).unwrap();
+    let acct = plaintext_core::Account { id: a3.account.id, account_key: a3.account.account_key.clone() };
+    let off = Session::offline(Http::new("http://127.0.0.1:9"), a3.token.clone(), acct, &dir).unwrap();
+    assert!(!off.vaults.contains_key(&mine) && off.hidden.contains_key(&mine));
+    let _ = std::fs::remove_dir_all(&dir);
     a3.t.hide.set(None);
     *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
     // Caught and reported; the vault keeps its last verified state.
@@ -287,6 +294,8 @@ fn hosted_server_and_several_servers() {
     assert!(!carol.admin);
     assert_eq!(admin.users().unwrap().len(), 3);
     assert!(carol.users().unwrap().is_empty(), "no customer list on an open server");
+    carol.create_agent("carol-bot").unwrap();
+    assert_eq!(carol.users().unwrap().len(), 1, "but your own agents are listed");
     carol.pin_user("dave").unwrap();
     assert!(matches!(carol.pin_user("nobody"), Err(Error::NotFound(_))));
     // Anyone may invite there; the invitee is visible to (and verified by) the inviter.
@@ -294,7 +303,7 @@ fn hosted_server_and_several_servers() {
     let (_, erin) = join(Http::new(&url), "erin", "erin pw", Some(&code), "t");
     assert!(erin.keyring.contacts["carol"].verified);
     carol.sync().unwrap();
-    assert_eq!(carol.users().unwrap().len(), 1);
+    assert_eq!(carol.users().unwrap().len(), 2);
     assert!(carol.keyring.contacts["erin"].verified);
     assert_eq!(status(Session::signup(Http::new(&url), "frank", "pw", Some(&code), "t")), 403, "a used invite is still refused");
     drop(dave);
@@ -1141,15 +1150,32 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Disney", "d1sney"))));
     assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "changed"))));
     assert!(read_only(bob.delete_item(&fam, nid)));
+    // The roster that refused him stays: offline, he's still told so.
+    bob.t.1.set(true);
+    assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "offline"))));
+    bob.t.1.set(false);
     let mut meta = bob.vaults[&fam].meta.clone();
     meta.name = "Bob's now".into();
     assert!(read_only(bob.rename_vault(&fam, meta)));
+    let imp = |name: &str| import::Imported { name: name.into(), items: vec![(item("Imported", "i"), vec![])] };
+    assert!(read_only(bob.import(vec![imp("")], Some(fam)).map(drop)));
     let v = &bob.vaults[&fam];
     assert!(!v.has_changes(), "nothing is left waiting on bob's device");
     assert_eq!(v.items().count(), 2);
     assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
     assert_eq!(v.meta.name, "Family");
     assert!(read_only(bob.writable(&fam)));
+
+    // A vault he made counts as his for imports, even once he only reads it:
+    // the whole import is refused before any vault is made or filled.
+    let his = bob.create_vault("Bob's").unwrap();
+    bob.share_vault(&his, "alice", Role::Owner, None).unwrap();
+    alice.sync().unwrap();
+    alice.share_vault(&his, "bob", Role::Reader, None).unwrap();
+    let before = bob.vaults.len();
+    assert!(read_only(bob.import(vec![imp("New one"), imp("bob's")], None).map(drop)));
+    assert_eq!(bob.vaults.len(), before, "no vault was made");
+    assert!(!bob.vaults[&his].has_changes() && bob.vaults[&his].items().count() == 0);
 
     // A writer again, he can.
     alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
@@ -1176,11 +1202,16 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     // Offline as a known reader, he's told so, not that his edit is waiting.
     bob.t.1.set(true);
     assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Refused", "r"))));
+    assert!(read_only(bob.writable(&fam)));
+    // An offline writer may go ahead (import saves for the next sync).
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    bob.t.1.set(true);
+    bob.writable(&fam).unwrap();
     bob.t.1.set(false);
 
     // He can drop what he can't send: an edit, a delete and a rename.
-    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
-    bob.sync().unwrap();
     let (keep, gone) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
     bob.put_item(&fam, keep, item("Keep", "k")).unwrap();
     bob.put_item(&fam, gone, item("Gone?", "g")).unwrap();
@@ -1228,6 +1259,34 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(v.items().any(|(_, i)| i.title == "Later"));
 }
 
+#[test]
+fn an_edit_or_delete_keeps_another_device_s_newer_change() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let (n, d) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    alice.put_item(&fam, n, item("Netflix", "v1")).unwrap();
+    alice.put_item(&fam, d, item("Disney", "v1")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+
+    // Alice edits an item; bob, who hasn't seen that, edits it too...
+    alice.put_item(&fam, n, item("Netflix", "alice-v2")).unwrap();
+    bob.put_item(&fam, n, item("Netflix", "bob-v2")).unwrap();
+    // ...and deletes one she has just edited.
+    alice.put_item(&fam, d, item("Disney", "alice-v2")).unwrap();
+    bob.delete_item(&fam, d).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    let mut netflix: Vec<_> = v.items().filter(|(_, i)| i.title.starts_with("Netflix")).map(|(_, i)| i.password.as_str()).collect();
+    netflix.sort();
+    assert_eq!(v.get(&d).map(|i| i.password.as_str()), Some("alice-v2"), "alice's edit brings Disney back");
+    assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
+}
+
 /// A transport whose network can be switched off, or a GET answered with an old reply.
 struct Flaky(Http, std::cell::Cell<bool>, std::cell::RefCell<Option<(String, Vec<u8>)>>);
 
@@ -1247,4 +1306,98 @@ impl Transport for Flaky {
     fn host(&self) -> String {
         self.0.host()
     }
+}
+
+#[test]
+fn restored_session_catches_up_with_the_keyring() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, a) = join(Http::new(&url), "alice", "pw", None, "a");
+    let old = a.keyring_snapshot();
+    // Another device changes the keyring meanwhile.
+    login(&url, "pw", &sk).invite().unwrap();
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &old).unwrap();
+    assert!(r.keyring.invites.is_empty(), "opened from this device's copy, offline");
+    r.sync().unwrap();
+    assert_eq!(r.keyring.invites.len(), 1);
+    let bad = Account { id: a.account.id, account_key: zeroize::Zeroizing::new([7; 32]) };
+    assert!(Session::restore(Http::new(&url), a.token.clone(), bad, &old).is_err());
+}
+
+#[test]
+fn restored_session_pushes_pins_it_never_sent() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, a) = join(Http::new(&url), "alice", "pw", None, "a");
+    // This device pulled its vault and made a pin, and neither reached the server: its keyring counter is still 0.
+    let id = a.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().vaults[0];
+    let mut a = a;
+    a.vaults.insert(id, Vault::new(id));
+    block_on(a.pull_async(&id)).unwrap();
+    a.keyring.new_invite();
+    assert_eq!(a.call::<AccountResponse>("GET", "/v1/account", NONE).unwrap().keyring_counter, 0);
+    // Picked up again as the browser extension does: the keyring and the vault from this device.
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &a.keyring_snapshot()).unwrap();
+    r.vaults.insert(id, Vault::restore(&r.account, id, &a.vaults[&id].snapshot(&a.account)).unwrap());
+    r.sync().unwrap();
+    assert_eq!(login(&url, "pw", &sk).keyring.invites.len(), 1, "the restored pin reached the server");
+}
+
+#[test]
+fn restored_session_saves_its_keyring_before_any_sync() {
+    let (url, _db) = server_with(Default::default());
+    let (sk, mut a) = join(Http::new(&url), "alice", "pw", None, "a");
+    // A pin this device never sent, and another device's pin the restored copy doesn't have.
+    a.keyring.new_invite();
+    login(&url, "pw", &sk).invite().unwrap();
+    let account = Account { id: a.account.id, account_key: a.account.account_key.clone() };
+    let mut r = Session::restore(Http::new(&url), a.token.clone(), account, &a.keyring_snapshot()).unwrap();
+    r.invite().unwrap();
+    assert_eq!(r.keyring.invites.len(), 3);
+    assert_eq!(login(&url, "pw", &sk).keyring.invites.len(), 3, "all three pins are on the server");
+}
+
+/// What an app keeps on the device: snapshots that survive a restart (with the
+/// rollback guard), an offline open that queues edits, and imports.
+#[test]
+fn device_state_offline_and_import() {
+    let (url, path) = server();
+    let dir = std::env::temp_dir().join(format!("plaintext-local-{}", hex::encode(plaintext_core::crypto::random::<8>())));
+    let (sk, alice) = Session::signup(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "phone").unwrap();
+    let mut alice = alice.unwrap();
+    alice.sync().unwrap();
+    let mine = alice.default_vault().unwrap();
+    assert_eq!(alice.import(import::onepux(&import::tests::onepux_fixture()).unwrap(), None).unwrap(), 8);
+    let shared = alice.own_vault("Shared").expect("the 1PUX vault named Shared was made");
+    let (vid, logo_id, logo) = alice.one("KeePassXC Logo", None).unwrap();
+    assert_eq!(vid, mine);
+    assert_eq!(alice.download_file(&vid, &logo.files[0]).unwrap(), b"\x89PNG logo");
+    let old: Vec<u8> = alice.t.send("GET", &format!("/v1/vaults/{mine}?since=0"), Some(&alice.token), None).unwrap().1;
+    alice.put_item(&mine, plaintext_core::new_item_id(), item("Later", "added-later")).unwrap();
+    alice.save_local(&dir).unwrap();
+
+    // Restart: the snapshots carry the rollback guard, so a replayed old vault is caught.
+    let mut again = Session::login(evil(&url), &derive("alice pw", &sk), "phone").unwrap();
+    again.load_local(&dir).unwrap();
+    assert!(again.vaults[&mine].counter > 0 && again.vaults.contains_key(&shared));
+    *again.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
+    again.sync().unwrap();
+    assert!(again.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", again.problems);
+
+    // Offline: open from the device's copies with a dead server, edit, sync later.
+    let token = alice.token.clone();
+    let (aid, akey) = (alice.account.id, alice.account.account_key.clone());
+    let account = || plaintext_core::Account { id: aid, account_key: akey.clone() };
+    let mut off = Session::offline(Http::new("http://127.0.0.1:9"), token.clone(), account(), &dir).unwrap();
+    assert_eq!(off.one("later", None).unwrap().2.password, "added-later");
+    assert!(matches!(off.put_item(&mine, logo_id, item("Edited offline", "offline-pw")), Err(Error::Network(_))));
+    off.save_local(&dir).unwrap();
+    let mut back = Session::offline(Http::new(&url), token, account(), &dir).unwrap();
+    back.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.vaults[&mine].get(&logo_id).unwrap().title, "Edited offline", "the queued edit reached the server");
+    assert!(back.admin && back.keyring.default_vault == Some(mine));
+    assert!(Session::offline(Http::new(&url), alice.token.clone(), account(), Path::new("/nonexistent")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
 }

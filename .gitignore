@@ -1,3 +1,10 @@
 target/
 *.db
 *.db-*
+
+# Apple app: built by apple/build-rust.sh
+/apple/Generated/
+/apple/PlaintextFFI.xcframework/
+/apple/build/
+xcuserdata/
+*.xcuserstate

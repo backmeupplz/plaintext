@@ -825,26 +825,8 @@ fn run(cli: Cli) -> Res<()> {
                 "bitwarden" => import::bitwarden(&data)?,
                 _ => import::csv(&String::from_utf8_lossy(&data))?,
             };
-            let n = imported.iter().map(|v| v.items.len()).sum::<usize>();
-            for v in imported {
-                let vid = match (&vault, v.name.is_empty()) {
-                    (Some(name), _) => s.vault(name)?,
-                    (None, true) => s.default_vault()?,
-                    (None, false) if v.name.eq_ignore_ascii_case("personal") => s.default_vault()?,
-                    (None, false) => match s.own_vault(&v.name) {
-                        Some(id) => id,
-                        None => s.create_vault(&v.name)?,
-                    },
-                };
-                for (it, files) in v.items {
-                    let mut it = it;
-                    for (name, bytes) in files {
-                        it.files.push(s.upload_file(&vid, &name, &bytes)?);
-                    }
-                    s.vaults.get_mut(&vid).ok_or("vault vanished")?.put(new_item_id(), it);
-                }
-                s.sync_vault(&vid)?;
-            }
+            let into = vault.as_deref().map(|v| s.vault(v)).transpose()?;
+            let n = s.import(imported, into)?;
             state::save(&s)?;
             say!("Imported {n} items. Delete {file} now: it holds your passwords unencrypted.");
         }

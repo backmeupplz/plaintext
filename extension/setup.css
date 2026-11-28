@@ -1,0 +1,10 @@
+main { max-width: 520px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 24px; margin: 0 0 24px; }
+h2 { font-size: 17px; margin: 32px 0 8px; }
+section > p { margin: 8px 0; }
+form button { margin-top: 16px; }
+#add-msg:empty { display: none; }
+#add-msg { margin: 12px 0 0; }
+.accounts { list-style: none; padding: 0; margin: 0; }
+.accounts li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.accounts .who { min-width: 0; overflow-wrap: anywhere; }

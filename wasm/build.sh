@@ -1,6 +1,10 @@
 #!/bin/sh
-# Rebuild the browser core into docs/s/ (the share-link viewer). CI runs this and
-# fails if the committed files differ, so every tool version is pinned here.
+# Rebuild the browser core:
+#   wasm/build.sh            into docs/s/, the share-link viewer. CI runs this and
+#                            fails if the committed files differ, so every tool
+#                            version is pinned here.
+#   wasm/build.sh extension  into extension/pkg/, the browser extension's core
+#                            (with the `extension` feature; built, not committed).
 #
 # The committed build comes from linux/amd64, like CI: Cargo mixes the host
 # triple into symbol hashes, so other hosts produce different (equally valid)
@@ -12,17 +16,22 @@ BINDGEN=0.2.130 # same as the wasm-bindgen crate in wasm/Cargo.toml
 BINARYEN=133
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+mode=${1:-viewer}
+case $mode in
+viewer) out="$root/docs/s" features=--no-default-features ;;
+extension) out="$root/extension/pkg" features= ;;
+*) echo "usage: wasm/build.sh [extension]" >&2 && exit 2 ;;
+esac
 
 if [ "$(uname -s)-$(uname -m)" != Linux-x86_64 ]; then
   mkdir -p "$root/target/linux-amd64"
   exec docker run --rm --platform linux/amd64 -v "$root:/src" -w /src \
     -v "$root/target/linux-amd64:/src/target" -v plaintext-wasm-cargo:/usr/local/cargo/registry \
-    "rust:$RUST-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd" sh -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -qq -y curl; } >/dev/null; wasm/build.sh'
+    "rust:$RUST-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd" sh -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -qq -y curl; } >/dev/null; wasm/build.sh "$0"' "$mode"
 fi
 
 tools="$root/target/wasm-tools"
-out="$root/docs/s"
-mkdir -p "$tools"
+mkdir -p "$tools" "$out"
 
 fetch() { # url sha256 -> unpacked into $tools
   f="$tools/$(basename "$1")"
@@ -44,7 +53,7 @@ rustup toolchain install "$RUST" --profile minimal --target wasm32-unknown-unkno
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 RUSTC=$(rustup which --toolchain "$RUST" rustc) \
 RUSTFLAGS="--remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$root=/src" \
-  "$(rustup which --toolchain "$RUST" cargo)" build --locked -p plaintext-wasm --profile wasm --target wasm32-unknown-unknown
+  "$(rustup which --toolchain "$RUST" cargo)" build --locked -p plaintext-wasm $features --profile wasm --target wasm32-unknown-unknown
 
 "$bindgen" --target web --no-typescript --out-dir "$out" "$root/target/wasm32-unknown-unknown/wasm/plaintext_wasm.wasm"
 "$wasm_opt" -Oz --strip-debug --strip-producers "$out/plaintext_wasm_bg.wasm" -o "$out/plaintext_wasm_bg.wasm"

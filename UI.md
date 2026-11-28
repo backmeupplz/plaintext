@@ -59,6 +59,8 @@ Plain, warm, specific. Full sentences in explanations; short labels on buttons (
 
 Biometric prompt immediately on launch; a password field below it as the fallback. Auto-lock after a user-chosen idle time (default 10 minutes) and on device lock. The app switcher snapshot is blurred.
 
+*Sign in with your Emergency Kit* on the unlock screen adds an account (or re-adds one whose Secret Key the device lost), so it first asks for Face ID / Touch ID or the device passcode: whoever opens one account reaches the app-wide settings. Without a device passcode it isn't offered. A lock closes that sheet.
+
 ### Home (item list)
 
 - A search field always at the top, focused on desktop and in the extension. Search matches title, username, URL, tags and non-secret fields, instantly, as you type.
@@ -105,7 +107,7 @@ A section under Settings (and the sidebar on desktop): list of your agents with 
 
 ### Watchtower
 
-A summary card (counts of weak, reused, breached, unsecured, missing 2FA) and a list per finding with one-tap fixes ("Change password" opens the site and the item in edit mode with a fresh generated password). The breach check is opt-in on first use, with a sentence explaining that only 5 characters of a hash leave the device.
+A summary card (counts of weak, reused, breached, unsecured, missing 2FA) and a list per finding with one-tap fixes ("Change password" opens the site and the item in edit mode with a fresh generated password, which is first kept in the item's history so leaving for the site can't lose it). The breach check is opt-in on first use, with a sentence explaining that only 5 characters of a hash leave the device.
 
 ### Settings
 
