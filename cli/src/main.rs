@@ -340,6 +340,8 @@ enum VaultCmd {
     Revoke { vault: String, user: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
+    /// Drop this device's changes to a vault that haven't reached the server
+    Reset { vault: String },
 }
 
 #[derive(Subcommand)]
@@ -983,6 +985,14 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
                 let t = e.ts as i64;
                 let date = plaintext_client::import::days_to_date(t.div_euclid(86400));
                 say!("{date} {:02}:{:02} UTC  {:<20} {}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60, e.username, e.action);
+            }
+        }
+        VaultCmd::Reset { vault } => {
+            let id = s.vault(&vault)?;
+            match s.discard_changes(&id)? {
+                0 => say!("{vault} has no unsent changes on this device."),
+                1 => say!("Dropped 1 unsent change to {vault}."),
+                n => say!("Dropped {n} unsent changes to {vault}."),
             }
         }
     }

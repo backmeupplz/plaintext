@@ -241,7 +241,17 @@ impl Vault {
     }
 
     pub fn has_changes(&self) -> bool {
-        !self.dirty.is_empty() || !self.deleted.is_empty() || self.meta_dirty
+        self.changes() > 0
+    }
+
+    /// How many changes wait to be pushed: items added, edited or deleted, and the vault's name.
+    pub fn changes(&self) -> usize {
+        self.dirty.len() + self.deleted.len() + usize::from(self.meta_dirty)
+    }
+
+    /// Whether both copies verified the same latest manifest.
+    pub fn same_head(&self, other: &Vault) -> bool {
+        self.counter == other.counter && self.last == other.last
     }
 
     fn item_ad(&self, id: &Hex) -> Vec<u8> {

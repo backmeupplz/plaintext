@@ -303,7 +303,13 @@ impl<T: Transport> Session<T> {
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
-                    self.problems.push(format!("vault {} wasn't updated: {e}", known.unwrap_or_else(|| id.to_string())));
+                    let name = known.unwrap_or_else(|| id.to_string());
+                    // Only pending changes make a reader's push fail: say how to drop them.
+                    let hint = match e {
+                        Error::Core(plaintext_core::Error::ReadOnly) => format!(", so this device's changes to it can't be sent; to drop them, run plaintext vault reset {}", if name.contains(char::is_whitespace) { format!("\"{name}\"") } else { name.clone() }),
+                        _ => String::new(),
+                    };
+                    self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"));
                 }
                 Err(e) => return Err(e),
             }
@@ -368,6 +374,32 @@ impl<T: Transport> Session<T> {
         f(self.vaults.get_mut(id).expect("checked above"));
         pulled?;
         self.push(id)
+    }
+
+    /// Drop this device's changes to a vault that haven't reached the server
+    /// (say, made before we became a reader) by downloading it again. The new copy
+    /// must be the version this device already verified; otherwise, or if the
+    /// download fails, nothing changes. Returns how many changes were dropped.
+    pub fn discard_changes(&mut self, id: &Hex) -> Result<usize> {
+        self.pull(id)?;
+        let n = self.vaults[id].changes();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Edits overwrote, and deletes removed, the server's copies: fetch every item.
+        let mut fresh = Vault::new(*id);
+        let resp: VaultResponse = self.call("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE)?;
+        let mut keyring = self.keyring.clone();
+        let changed = fresh.apply(&resp, &mut keyring, now())?;
+        let old = &self.vaults[id];
+        if !fresh.same_head(old) {
+            return Err(if fresh.counter < old.counter { plaintext_core::Error::Rollback.into() } else { Error::Refused("the vault changed meanwhile; try again".into()) });
+        }
+        self.keyring = keyring;
+        self.keyring_dirty |= changed;
+        self.vaults.insert(*id, fresh);
+        self.save_keyring()?;
+        Ok(n)
     }
 
     /// Push pending changes (a pull came just before); on a conflict pull again and retry.

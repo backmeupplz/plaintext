@@ -1177,6 +1177,46 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(true);
     assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Refused", "r"))));
     bob.t.1.set(false);
+
+    // He can drop what he can't send: an edit, a delete and a rename.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    let (keep, gone) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    bob.put_item(&fam, keep, item("Keep", "k")).unwrap();
+    bob.put_item(&fam, gone, item("Gone?", "g")).unwrap();
+    bob.t.1.set(true);
+    assert!(matches!(bob.put_item(&fam, keep, item("Keep", "edited offline")), Err(Error::Network(_))));
+    assert!(matches!(bob.delete_item(&fam, gone), Err(Error::Network(_))));
+    let mut meta = bob.vaults[&fam].meta.clone();
+    meta.name = "Renamed offline".into();
+    assert!(matches!(bob.rename_vault(&fam, meta), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.ends_with("vault reset \"Renamed offline\"")), "{:?}", bob.problems);
+    // A download that fails drops nothing.
+    bob.t.1.set(true);
+    assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert_eq!(v.meta.name, "Family");
+    assert_eq!(v.items().count(), alice.vaults[&fam].items().count());
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
+
+    // Made a writer again, what he pushes keeps every item as the server has it.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Later", "l")).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert!(v.items().any(|(_, i)| i.title == "Later"));
 }
 
 /// A transport whose network can be switched off.
