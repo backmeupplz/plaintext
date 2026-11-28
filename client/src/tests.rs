@@ -1236,8 +1236,8 @@ fn an_edit_or_delete_keeps_another_device_s_newer_change() {
     let v = &alice.vaults[&fam];
     let mut netflix: Vec<_> = v.items().filter(|(_, i)| i.title.starts_with("Netflix")).map(|(_, i)| i.password.as_str()).collect();
     netflix.sort();
-    assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
     assert_eq!(v.get(&d).map(|i| i.password.as_str()), Some("alice-v2"), "alice's edit brings Disney back");
+    assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
 }
 
 /// A transport whose network can be switched off.

@@ -400,13 +400,16 @@ impl<T: AsyncTransport> Session<T> {
                 pulled?;
                 self.push_async(id).await
             }
-            Err(e) => {
+            // Only the refusal is undone: after any other error the change waits
+            // for the next sync, as it did before this check.
+            Err(e @ Error::Core(plaintext_core::Error::ReadOnly)) => {
                 // The undo also undid the pull; pull again so the roster that
                 // refused us stays (best effort: offline the old one says so).
                 self.vaults.insert(*id, Vault::restore(&self.account, *id, &before)?);
                 drop(self.pull_async(id).await);
                 Err(e)
             }
+            Err(e) => Err(e),
         }
     }
 
