@@ -76,7 +76,7 @@ pub struct ImportReport {
 const STAGE_PAST: usize = 16 << 20;
 
 /// Why a pull gave up: the vault kept changing between its pages (`pull_pages_async`).
-const BUSY: &str = "it kept changing while it was pulled; the next sync tries again";
+const BUSY: &str = "it kept changing while it was pulled (someone kept writing to it); try again in a moment";
 
 /// An inbox message as opened, or why it couldn't be.
 pub type Received = std::result::Result<(Message, Content), plaintext_core::Error>;
