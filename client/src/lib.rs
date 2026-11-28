@@ -467,8 +467,9 @@ impl<T: AsyncTransport> Session<T> {
         // Someone can make you an owner and leave, and the vault counts against you
         // from then on (DESIGN "Leaving"). Name every vault you pay for: one you aren't a
         // current member of always (your own without how to leave it), one you can open
-        // but don't own as its creator only while storage is limited (or a vault you took over on
-        // purpose would be named on every sync for nothing). One that failed is named above.
+        // but didn't create, or aren't an owner of any more, only while storage is limited
+        // (or a vault you took over on purpose would be named on every sync for nothing).
+        // One that failed is named above.
         for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
             let text = match self.vaults.get(id).filter(|v| v.roster.is_some()) {
                 Some(_) if self.is_own(id) || acct.quota.is_none() => continue,
