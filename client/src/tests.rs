@@ -114,7 +114,8 @@ fn family_agent_and_sharing() {
     assert!(agent.find("netflix", None).is_empty());
     // Read-only: the client refuses, and so does the server if the client misbehaves.
     agent.vaults.get_mut(&ci).unwrap().put(plaintext_core::new_item_id(), item("x", "y"));
-    agent.sync().unwrap(); // a reader's sync never pushes
+    agent.sync().unwrap(); // a reader's sync never pushes, and says why
+    assert!(agent.problems.iter().any(|p| p.contains("only read")), "{:?}", agent.problems);
     let agent_me = agent.me();
     let av = agent.vaults.get_mut(&ci).unwrap();
     assert_eq!(av.push(&agent_me, now()).err(), Some(plaintext_core::Error::ReadOnly));
@@ -1481,6 +1482,192 @@ fn server_hardening() {
     bob.delete_message(&serde_json::from_slice::<Message>(&msg.body.0).unwrap().id).unwrap();
     ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None).unwrap();
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default(), Default::default()), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let nid = plaintext_core::new_item_id();
+    alice.put_item(&fam, nid, item("Netflix", "n3tfl1x-pass")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Bob's", "while-a-writer")).unwrap();
+
+    // Alice makes bob a reader; his device still thinks he's a writer.
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    let read_only = |r: Result<()>| matches!(r, Err(Error::Core(plaintext_core::Error::ReadOnly)));
+    assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Disney", "d1sney"))));
+    assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "changed"))));
+    assert!(read_only(bob.delete_item(&fam, nid)));
+    // The roster that refused him stays: offline, he's still told so.
+    bob.t.1.set(true);
+    assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "offline"))));
+    bob.t.1.set(false);
+    let mut meta = bob.vaults[&fam].meta.clone();
+    meta.name = "Bob's now".into();
+    assert!(read_only(bob.rename_vault(&fam, meta)));
+    let imp = |name: &str| import::Imported { name: name.into(), items: vec![(item("Imported", "i"), vec![])] };
+    assert!(read_only(bob.import(vec![imp("")], Some(fam)).map(drop)));
+    let v = &bob.vaults[&fam];
+    assert!(!v.has_changes(), "nothing is left waiting on bob's device");
+    assert_eq!(v.items().count(), 2);
+    assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
+    assert_eq!(v.meta.name, "Family");
+    assert!(read_only(bob.writable(&fam)));
+
+    // A vault he made counts as his for imports, even once he only reads it:
+    // the whole import is refused before any vault is made or filled.
+    let his = bob.create_vault("Bob's").unwrap();
+    bob.share_vault(&his, "alice", Role::Owner, None).unwrap();
+    alice.sync().unwrap();
+    alice.share_vault(&his, "bob", Role::Reader, None).unwrap();
+    let before = bob.vaults.len();
+    assert!(read_only(bob.import(vec![imp("New one"), imp("bob's")], None).map(drop)));
+    assert_eq!(bob.vaults.len(), before, "no vault was made");
+    assert!(!bob.vaults[&his].has_changes() && bob.vaults[&his].items().count() == 0);
+
+    // A writer again, he can.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.delete_item(&fam, nid).unwrap();
+    alice.sync().unwrap();
+    assert!(alice.vaults[&fam].get(&nid).is_none());
+
+    // Offline, an edit waits on the device and goes out with the next sync...
+    let offline = |bob: &mut Session<Flaky>, title: &str| {
+        bob.t.1.set(true);
+        assert!(matches!(bob.put_item(&fam, plaintext_core::new_item_id(), item(title, "o")), Err(Error::Network(_))));
+        bob.t.1.set(false);
+        assert!(bob.vaults[&fam].has_changes());
+    };
+    offline(&mut bob, "Offline");
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.vaults[&fam].items().filter(|(_, i)| i.title == "Offline").count(), 1);
+    // ...but if he's made a reader meanwhile, every sync says it can't be sent.
+    offline(&mut bob, "Too late");
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.contains("only read")), "{:?}", bob.problems);
+    // Offline as a known reader, he's told so, not that his edit is waiting.
+    bob.t.1.set(true);
+    assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Refused", "r"))));
+    assert!(read_only(bob.writable(&fam)));
+    // An offline writer may go ahead (import saves for the next sync).
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    bob.t.1.set(true);
+    bob.writable(&fam).unwrap();
+    bob.t.1.set(false);
+
+    // He can drop what he can't send: an edit, a delete and a rename.
+    let (keep, gone) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    bob.put_item(&fam, keep, item("Keep", "k")).unwrap();
+    bob.put_item(&fam, gone, item("Gone?", "g")).unwrap();
+    bob.t.1.set(true);
+    assert!(matches!(bob.put_item(&fam, keep, item("Keep", "edited offline")), Err(Error::Network(_))));
+    assert!(matches!(bob.delete_item(&fam, gone), Err(Error::Network(_))));
+    let mut meta = bob.vaults[&fam].meta.clone();
+    meta.name = "Renamed offline".into();
+    assert!(matches!(bob.rename_vault(&fam, meta), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    // The apps show problems as they are: no CLI command in them, the id goes in a list.
+    assert!(bob.problems.iter().any(|p| p.ends_with("this device's changes to it can't be sent")), "{:?}", bob.problems);
+    assert_eq!(bob.unsendable, [fam]);
+    // What `vault reset` lists before dropping anything.
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.changed().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Keep"]);
+    assert_eq!((v.deleted(), v.meta_changed()), (1, true));
+    assert_eq!(bob.vault(&fam.to_string()).unwrap(), fam);
+    // The fresh download must be the version his device verified, not an older one.
+    let from_scratch = format!("/v1/vaults/{fam}?since=0&latest=true");
+    let old = bob.t.0.send("GET", &from_scratch, Some(&bob.token), None).unwrap().1;
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Newer", "n")).unwrap();
+    *bob.t.2.borrow_mut() = Some((from_scratch, old));
+    let rollback = bob.discard_changes(&fam);
+    assert!(matches!(rollback, Err(Error::Core(plaintext_core::Error::Rollback))), "{rollback:?}");
+    *bob.t.2.borrow_mut() = None;
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    // A download that fails drops nothing.
+    bob.t.1.set(true);
+    assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert!(bob.unsendable.is_empty());
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert_eq!(v.meta.name, "Family");
+    assert_eq!(v.items().count(), alice.vaults[&fam].items().count());
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
+
+    // Made a writer again, what he pushes keeps every item as the server has it.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Later", "l")).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert!(v.items().any(|(_, i)| i.title == "Later"));
+}
+
+#[test]
+fn an_edit_or_delete_keeps_another_device_s_newer_change() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let (n, d) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    alice.put_item(&fam, n, item("Netflix", "v1")).unwrap();
+    alice.put_item(&fam, d, item("Disney", "v1")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+
+    // Alice edits an item; bob, who hasn't seen that, edits it too...
+    alice.put_item(&fam, n, item("Netflix", "alice-v2")).unwrap();
+    bob.put_item(&fam, n, item("Netflix", "bob-v2")).unwrap();
+    // ...and deletes one she has just edited.
+    alice.put_item(&fam, d, item("Disney", "alice-v2")).unwrap();
+    bob.delete_item(&fam, d).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    let mut netflix: Vec<_> = v.items().filter(|(_, i)| i.title.starts_with("Netflix")).map(|(_, i)| i.password.as_str()).collect();
+    netflix.sort();
+    assert_eq!(v.get(&d).map(|i| i.password.as_str()), Some("alice-v2"), "alice's edit brings Disney back");
+    assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
+}
+
+/// A transport whose network can be switched off, or a GET answered with an old reply.
+struct Flaky(Http, std::cell::Cell<bool>, std::cell::RefCell<Option<(String, Vec<u8>)>>);
+
+impl Transport for Flaky {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        if self.1.get() {
+            return Err(Error::Network("offline".into()));
+        }
+        if let Some((p, bytes)) = &*self.2.borrow()
+            && method == "GET"
+            && path == p
+        {
+            return Ok((200, bytes.clone()));
+        }
+        self.0.send(method, path, token, body)
+    }
+    fn host(&self) -> String {
+        self.0.host()
+    }
 }
 
 #[test]

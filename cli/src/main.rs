@@ -342,6 +342,13 @@ enum VaultCmd {
     Leave { vault: String },
     /// Who read or wrote what (owners)
     Audit { vault: String },
+    /// Show this device's changes to a vault that haven't reached the server;
+    /// with --yes, drop them and download the vault again
+    Reset {
+        vault: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1011,6 +1018,33 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
                 let t = e.ts as i64;
                 let date = plaintext_client::import::days_to_date(t.div_euclid(86400));
                 say!("{date} {:02}:{:02} UTC  {:<20} {}", t.rem_euclid(86400) / 3600, t.rem_euclid(3600) / 60, e.username, e.action);
+            }
+        }
+        VaultCmd::Reset { vault, yes } => {
+            let id = s.vault(&vault)?;
+            let v = &s.vaults[&id];
+            if v.changes() == 0 {
+                say!("{vault} has no unsent changes on this device.");
+            } else if yes {
+                match s.discard_changes(&id)? {
+                    1 => say!("Dropped 1 unsent change to {vault}."),
+                    n => say!("Dropped {n} unsent changes to {vault}."),
+                }
+            } else {
+                // They may exist nowhere else: show them before anything is dropped.
+                say!("Unsent changes to {vault} on this device:");
+                for (_, i) in v.changed() {
+                    say!("  added or edited: {}", i.title);
+                }
+                match v.deleted() {
+                    0 => {}
+                    1 => say!("  1 item deleted"),
+                    n => say!("  {n} items deleted"),
+                }
+                if v.meta_changed() {
+                    say!("  the vault's name or description changed");
+                }
+                say!("Copy out anything you want to keep (`plaintext get ITEM`), then run again with --yes to drop these changes.");
             }
         }
     }
