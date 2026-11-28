@@ -334,10 +334,12 @@ impl<T: Transport> Session<T> {
             }
         }
         // Someone can make you an owner and leave, and the vault counts against you
-        // from then on (DESIGN "Leaving"): name every vault you pay for but didn't create.
+        // from then on (DESIGN "Leaving"): name every vault you pay for but didn't create
+        // (one you can open only while storage is limited, or a vault you took over on
+        // purpose would be named on every sync for nothing).
         for id in &acct.paid {
             match self.vaults.get(id).filter(|v| v.roster.is_some()) {
-                Some(v) if v.creator == self.keyring.username => {}
+                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
                 Some(v) => self.problems.push(format!(
                     "vault {} counts against your storage, though {} created it (to stop that: plaintext vault leave {id})",
                     v.meta.name, v.creator

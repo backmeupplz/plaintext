@@ -999,7 +999,7 @@ fn exec(path: &std::path::Path, sql: &str) {
 /// when only an agent of theirs is in it.
 #[test]
 fn nobody_is_stuck_paying_for_a_vault() {
-    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, quota: Some(4 << 20), ..Default::default() });
     let (_, mut mallory) = join(Http::new(&url), "mallory", "mallory pw", None, "t");
     let (_, mut mallory2) = join(Http::new(&url), "mallory2", "mallory2 pw", None, "t");
     let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
@@ -1032,7 +1032,8 @@ fn nobody_is_stuck_paying_for_a_vault() {
     // Bob's sync names the vault by id and how to leave it, and he can, as its only owner.
     bob.sync().unwrap();
     assert!(!bob.vaults.contains_key(&trap));
-    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {trap}; it counts against your storage"))), "{:?}", bob.problems);
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&trap.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {trap}; it counts against your storage")), "{named:?}");
     bob.leave_vault(&trap).unwrap();
     assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
     // The last one out deletes it.

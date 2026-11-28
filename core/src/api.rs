@@ -280,7 +280,8 @@ pub struct AccountResponse {
     /// Storage this account may use, in bytes (`None`: unlimited).
     #[serde(default)]
     pub quota: Option<u64>,
-    /// Bytes of items and files in the vaults this account created.
+    /// Bytes counted against the quota: the vaults in `paid` and the share links and
+    /// messages this account and its agents sent (DESIGN "Servers and accounts").
     #[serde(default)]
     pub usage: u64,
     /// Every vault that counts against this account (`usage`): the ones it created,
