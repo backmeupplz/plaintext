@@ -1388,10 +1388,13 @@ impl PlaintextApp {
             let r = s.import(imported, into)?;
             let mut warning = Vec::new();
             if let Some(e) = r.sync_error {
-                warning.push(format!("{} The items are saved on this device and go to the server with the next sync, so don't import this file again.", PlaintextError::from(e)));
+                warning.push(format!("{} The items are saved on this device and go to the server with the next sync.", PlaintextError::from(e)));
             }
             if let Some(e) = r.upload_error {
                 warning.push(format!("{} These attachments weren't uploaded; add them to their items: {}.", PlaintextError::from(e), r.skipped.join(", ")));
+            }
+            if !warning.is_empty() {
+                warning.push("Don't import this file again: it would add the items twice.".into());
             }
             Ok(ImportResult { items: r.items as u32, warning: (!warning.is_empty()).then(|| warning.join("\n")) })
         })
