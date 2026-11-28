@@ -369,3 +369,40 @@ fn leaving_a_vault() {
     bob.resume(url.clone(), unlock).unwrap();
     assert!(bob.vaults().iter().all(|v| v.id != gift && v.id != team));
 }
+
+/// DESIGN "Signing in with a security key": the app opens the approval page,
+/// then finishes; the device isn't asked again.
+#[test]
+fn security_key_sign_in() {
+    use plaintext_client::plaintext_core::api::{B64, SigninKeyAction};
+    let url = server();
+    let (laptop, _dir) = app();
+    let r = laptop.signup(url.clone(), "alice".into(), "pw".into(), Some("setup-code".into())).unwrap();
+    let sk = SecretKey::parse(&r.secret_key).unwrap();
+    let d = derive("pw", &sk);
+    let cli = Session::login(Http::new(&url), &d, "cli").unwrap();
+    let rp = core::crypto::rp_id(&Http::new(&url).host());
+    let mut key = plaintext_server::SoftKey::new();
+    let ts = now_ms();
+    let proof = key.assert(&rp, &core::crypto::signin_key_add_challenge(&d.account_id, ts), &url);
+    let codes = cli.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof }).unwrap();
+
+    let (phone, _pdir) = app();
+    assert!(matches!(phone.login(url.clone(), r.secret_key.clone(), "pw".into()), Err(PlaintextError::KeyNeeded)));
+    let page = phone.pending_key_page().unwrap();
+    let c = page.rsplit_once('#').unwrap().1.to_string();
+    assert!(page.starts_with(&format!("{url}/v1/login/key#")));
+    assert!(matches!(phone.finish_login(None), Err(PlaintextError::KeyNeeded)), "not approved yet");
+    assert!(matches!(phone.finish_login(Some("nope".into())), Err(PlaintextError::Invalid { .. })));
+    let challenge = hex::decode(&c).unwrap();
+    let a = serde_json::to_vec(&key.assert(&rp, &challenge, &url)).unwrap();
+    assert_eq!(Http::new(&url).send("POST", &format!("/v1/login/approve/{c}"), None, Some(a)).unwrap().0, 204);
+    assert_eq!(phone.finish_login(None).unwrap().account.username, "alice");
+    assert!(phone.pending_key_page().is_none());
+    // Remembered: the next sign-in here needs no key.
+    phone.login(url.clone(), r.secret_key.clone(), "pw".into()).unwrap();
+    // Another device uses a recovery code.
+    let (tablet, _tdir) = app();
+    assert!(matches!(tablet.login(url.clone(), r.secret_key.clone(), "pw".into()), Err(PlaintextError::KeyNeeded)));
+    tablet.finish_login(Some(codes[0].clone())).unwrap();
+}

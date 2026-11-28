@@ -10,7 +10,7 @@ use plaintext_client::plaintext_core::api::{Hex, Identity, Kind, Role as CoreRol
 use plaintext_client::plaintext_core::crypto::{SecretKey, derive};
 use plaintext_client::plaintext_core::item::{Field, Item, Section};
 use plaintext_client::plaintext_core::{self as core, Account, Content, tools};
-use plaintext_client::{Error as ClientError, Http, Session, Transport, import, now, now_ms};
+use plaintext_client::{Error as ClientError, Http, Pending, Session, SignIn, Transport, import, now, now_ms};
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
@@ -44,6 +44,9 @@ pub enum PlaintextError {
     Invalid { message: String },
     /// Nobody is signed in on this device right now.
     Locked,
+    /// The account needs its security key to sign in on this device: open
+    /// `pending_key_page` in the browser, then `finish_login` (or a recovery code).
+    KeyNeeded,
 }
 
 impl std::fmt::Display for PlaintextError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for PlaintextError {
             NotFound { message } => write!(f, "Couldn't find {message}."),
             Invalid { message } => f.write_str(&capitalize(message)),
             Locked => f.write_str("Plaintext is locked."),
+            KeyNeeded => f.write_str("This account needs your security key to sign in on this device."),
         }
     }
 }
@@ -965,6 +969,8 @@ pub struct PlaintextApp {
     /// wait on a sync.
     rows: RwLock<Vec<Row>>,
     vaults: RwLock<Vec<VaultInfo>>,
+    /// A sign-in waiting for its security key (`KeyNeeded`), with its server.
+    pending: Mutex<Option<(String, Pending<Http>)>>,
 }
 
 fn not_found(what: &str) -> PlaintextError {
@@ -1002,7 +1008,7 @@ impl PlaintextApp {
     /// names this device in the session list.
     #[uniffi::constructor]
     pub fn new(dir: String, device: String) -> Self {
-        PlaintextApp { dir: dir.into(), device, accounts: RwLock::default(), rows: RwLock::default(), vaults: RwLock::default() }
+        PlaintextApp { dir: dir.into(), device, accounts: RwLock::default(), rows: RwLock::default(), vaults: RwLock::default(), pending: Mutex::default() }
     }
 
     // ----- Accounts -----
@@ -1044,19 +1050,58 @@ impl PlaintextApp {
 
     /// Sign in with the password and Secret Key (a new device, another account,
     /// or after the server ended this device's session).
+    /// If the account needs a security key and this device hasn't used one for
+    /// it yet, this fails with `KeyNeeded`: see `pending_key_page`.
     pub fn login(&self, server: String, secret_key: String, password: String) -> Res<LoginResult> {
         let server = normalize_server(&server)?;
         let sk = SecretKey::parse(&secret_key)?;
         let password = Zeroizing::new(password);
-        let mut s = Session::login(Http::new(&server), &derive(&password, &sk), &self.device).map_err(password_error)?;
-        let loaded = s.load_local(&self.dir_for(&s.account));
-        // Signed in either way: what this sync couldn't do (a full account, a
-        // server error) shows on the next one instead of locking the device out.
-        let _ = s.sync();
-        local_warning(&mut s, loaded);
-        let unlock = unlock_of(&s);
-        let account = self.start(s, server)?;
-        Ok(LoginResult { account, unlock })
+        let d = derive(&password, &sk);
+        let trust = std::fs::read_to_string(self.trust_file(&d.account_id)).ok();
+        match Session::sign_in(Http::new(&server), &d, &self.device, trust.as_deref()).map_err(password_error)? {
+            SignIn::Done(s) => self.logged_in(s, server),
+            SignIn::Key(p) => {
+                *self.pending.lock().expect("lock") = Some((server, p));
+                Err(PlaintextError::KeyNeeded)
+            }
+        }
+    }
+
+    /// After `KeyNeeded`: the server's approval page, to open in the browser,
+    /// which asks the security key (over NFC or USB) and tells the server.
+    pub fn pending_key_page(&self) -> Option<String> {
+        self.pending.lock().expect("lock").as_ref().map(|(server, p)| format!("{server}{}", p.page()))
+    }
+
+    /// Finish a sign-in that needed the security key, once the approval page
+    /// has its answer (until then this fails with `KeyNeeded`), or with a
+    /// recovery code. This device isn't asked for the key again.
+    pub fn finish_login(&self, recovery: Option<String>) -> Res<LoginResult> {
+        let (server, mut p) = self.pending.lock().expect("lock").take().ok_or(PlaintextError::Invalid { message: "this sign-in took too long; sign in again".into() })?;
+        let code = recovery.filter(|c| !c.trim().is_empty());
+        match p.finish(None, code.as_deref()) {
+            Ok((s, trust)) => {
+                // Best effort: without it, the next sign-in here asks for the key again.
+                let f = self.trust_file(&s.account.id);
+                let _ = std::fs::create_dir_all(f.parent().expect("in a folder")).and_then(|_| std::fs::write(&f, trust));
+                self.logged_in(s, server)
+            }
+            Err(e) => {
+                let err = match &e {
+                    ClientError::Server(409, _) => PlaintextError::KeyNeeded,
+                    ClientError::Server(401, m) if m.contains("recovery code") => PlaintextError::Invalid { message: "that recovery code is wrong or already used".into() },
+                    ClientError::Server(401, m) if m.contains("too long") => return Err(PlaintextError::Invalid { message: "this sign-in took too long; sign in again".into() }),
+                    _ => e.into(),
+                };
+                *self.pending.lock().expect("lock") = Some((server, p));
+                Err(err)
+            }
+        }
+    }
+
+    /// Drop a sign-in waiting for its security key.
+    pub fn cancel_login(&self) {
+        self.pending.lock().expect("lock").take();
     }
 
     /// Unlock an account with what the keychain released. Works offline from
@@ -1740,6 +1785,23 @@ fn summary(r: &Row) -> ItemSummary {
 }
 
 impl PlaintextApp {
+    fn logged_in(&self, mut s: S, server: String) -> Res<LoginResult> {
+        let loaded = s.load_local(&self.dir_for(&s.account));
+        // Signed in either way: what this sync couldn't do (a full account, a
+        // server error) shows on the next one instead of locking the device out.
+        let _ = s.sync();
+        local_warning(&mut s, loaded);
+        let unlock = unlock_of(&s);
+        let account = self.start(s, server)?;
+        Ok(LoginResult { account, unlock })
+    }
+
+    /// The token that spares this device an account's security key at sign-in
+    /// (DESIGN "Signing in with a security key"), in the app's private folder.
+    fn trust_file(&self, id: &core::crypto::Id) -> PathBuf {
+        self.dir.join("trust").join(hex::encode(&id[..8]))
+    }
+
     fn acct(&self, id: &str) -> Res<Arc<Acct>> {
         self.accounts.read().expect("lock").iter().find(|a| a.id == id).cloned().ok_or(PlaintextError::Locked)
     }
