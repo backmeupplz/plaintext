@@ -541,8 +541,9 @@ final class AppModel: ObservableObject {
 
     /// What the last sync or sign-in couldn't do (vaults that didn't verify, a damaged copy).
     private func showProblems() {
-        // Sent after all (made a writer again) or dropped elsewhere: its banner goes.
-        if let u = bannerUnsent, u.text == banner, !accounts.contains(where: { $0.id == u.account && $0.problemUnsent.contains(u.vault) }) {
+        // Sent after all (made a writer again), dropped elsewhere, or its warning now reads
+        // differently (no longer shared, say): its banner goes, so the current one shows.
+        if let u = bannerUnsent, u.text == banner, warning(account: u.account, vault: u.vault).map(bannerText) != u.text {
             banner = nil
         }
         let all = accounts.flatMap { a in zip(a.problems, a.problemUnsent).map { (account: a.id, text: $0, unsent: $1) } }
@@ -551,8 +552,7 @@ final class AppModel: ObservableObject {
         guard banner == nil, !all.isEmpty else { return }
         let p = all[problemTurn % all.count]
         problemTurn += 1
-        // The client's text can end with a CLI hint; the app has its own Verify screen.
-        let text = capitalized(p.text.components(separatedBy: " (plaintext ").first ?? p.text)
+        let text = bannerText(p.text)
         banner = text
         bannerUnsent = p.unsent.map { (text, p.account, $0) }
     }
@@ -595,6 +595,9 @@ final class AppModel: ObservableObject {
             show(error)
         }
     }
+
+    /// The client's text can end with a CLI hint; the app has its own Verify screen.
+    private func bannerText(_ s: String) -> String { capitalized(s.components(separatedBy: " (plaintext ").first ?? s) }
 
     private func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 
