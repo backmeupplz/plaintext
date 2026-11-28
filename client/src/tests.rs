@@ -1222,6 +1222,12 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(named.len() == 1 && named[0].contains("vault Big counts against your storage, though mallory created it") && named[0].leave == Some(big), "{named:?}");
     let personal = bob.default_vault().unwrap();
     assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal") || p.leave == Some(personal)), "{:?}", bob.problems);
+    // A chain mallory signed, served to a fresh device under bob's signup vault id (#1001),
+    // looks just like this: it's still his own, so sync doesn't offer to leave (delete) it.
+    bob.keyring.default_vault = Some(big);
+    bob.sync().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains(&big.to_string()) || p.leave == Some(big)), "{:?}", bob.problems);
+    bob.keyring.default_vault = Some(personal);
     bob.leave_vault(&big).unwrap();
     assert_eq!(creator(&big), None);
 
