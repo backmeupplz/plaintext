@@ -417,18 +417,19 @@ impl<T: AsyncTransport> Session<T> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         'pull: for _ in 0..5 {
             let mut all: Option<VaultResponse> = None;
+            // A server that sends pages that don't move the pull on would keep a device asking forever.
+            let mut asked = std::collections::HashSet::new();
             loop {
                 let q = v.pull_query(all.as_ref())?;
+                if !asked.insert(q.clone()) {
+                    return Err(plaintext_core::Error::Tampered.into());
+                }
                 let page: VaultResponse = match self.call_async("GET", &format!("/v1/vaults/{id}?{q}"), NONE).await {
                     // Waiting won't make it smaller: report this vault, sync the others.
                     Err(Error::Server(413, m)) => return Err(Error::Refused(format!("too big to pull ({m})"))),
                     Err(Error::Server(409, _)) if all.is_some() => continue 'pull,
                     r => r?,
                 };
-                // Each page brings something, or a server could keep a device asking forever.
-                if page.more && page.rosters.is_empty() && page.manifests.is_empty() && page.items.is_empty() {
-                    return Err(plaintext_core::Error::Tampered.into());
-                }
                 let a = match &mut all {
                     None => all.insert(page),
                     Some(a) if a.counter != page.counter => continue 'pull,
@@ -446,7 +447,8 @@ impl<T: AsyncTransport> Session<T> {
                 }
             }
         }
-        Err(Error::Server(409, "the vault kept changing while it was pulled; try again".into()))
+        // Not a held-back change: nothing was pulled, so nothing may be collected on its strength.
+        Err(Error::Refused("it kept changing while it was pulled; the next sync tries again".into()))
     }
 
     async fn sync_and_tidy(&mut self, id: &Hex) -> Result<()> {

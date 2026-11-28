@@ -111,6 +111,11 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     if !has_col(&c, "manifests", "sealed")? {
         c.execute_batch("ALTER TABLE manifests ADD COLUMN sealed BLOB;")?;
     }
+    // Roster versions count against the quota from then on; earlier ones only while
+    // they're the latest (as for manifests: nobody can delete them).
+    if !has_col(&c, "rosters", "counted")? {
+        c.execute_batch("ALTER TABLE rosters ADD COLUMN counted INTEGER NOT NULL DEFAULT 0;")?;
+    }
     // A disabled person's agents are disabled with them (databases from before that rule).
     c.execute("UPDATE accounts SET disabled = 1 WHERE disabled = 0 AND owner IN (SELECT username FROM accounts WHERE disabled = 1)", [])?;
     Ok(c)
@@ -462,7 +467,7 @@ fn max_body(domain: &str) -> usize {
         "message" => MAX_BLOB / 3 * 4 + (4 << 10),
         // Only the envelope, which signs the sealed part's hash (that part is kept
         // only for the latest manifest; envelopes are kept for good).
-        "manifest" => 1 << 10,
+        "manifest" => 512,
         _ => 0,
     }
 }
@@ -934,15 +939,18 @@ async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extensi
 
 /// Bytes `account` stores: items, files, staged items, every roster version and
 /// manifest (with the latest one's sealed part) of the vaults it pays for, and the
-/// share links and messages it and its agents sent. Manifests from before envelopes
-/// signed a hash count only while they're the latest: they can't shrink.
+/// share links and messages it and its agents sent. Rosters and manifests stored
+/// before history counted (`rosters.counted`, `manifests.sealed` NULL) count only
+/// while they're the latest: nobody can delete them.
+// ponytail: sums the whole history on most writes; keep a running total per vault if that gets slow.
 fn usage(db: &Connection, account: Option<&str>) -> R<u64> {
     db.query_row(
         &format!(
             "SELECT (SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM files WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
-                  + (SELECT COALESCE(SUM(octet_length(r.signed)), 0) FROM rosters r JOIN vaults v ON v.id = r.vault_id WHERE v.creator = ?1)
+                  + (SELECT COALESCE(SUM(octet_length(r.signed)), 0) FROM rosters r JOIN vaults v ON v.id = r.vault_id
+                     WHERE v.creator = ?1 AND (r.counted OR r.version = v.roster_version))
                   + (SELECT COALESCE(SUM(octet_length(m.signed) + COALESCE(length(m.sealed), 0)), 0) FROM manifests m JOIN vaults v ON v.id = m.vault_id
                      WHERE v.creator = ?1 AND (m.sealed IS NOT NULL OR m.counter = v.counter))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM links WHERE {})
@@ -1038,6 +1046,16 @@ fn padding<T: serde::Serialize>(s: &Signed, doc: &T) -> usize {
     s.body.0.len().saturating_sub(serde_json::to_vec(doc).map_or(0, |b| b.len()))
 }
 
+/// Whether roster `next` only takes access away from `prev`: it removes or demotes
+/// someone, and adds, promotes or extends nobody. Over the quota only these go
+/// through, and a vault has only so many of them before it's empty.
+fn narrows(prev: &Roster, next: &Roster) -> bool {
+    let was = |m: &Member| prev.members.iter().find(|p| p.username == m.username);
+    let no_later = |m: &Member, p: &Member| p.expires.is_none_or(|pe| m.expires.is_some_and(|e| e <= pe));
+    next.members.iter().all(|m| was(m).is_some_and(|p| m.role <= p.role && no_later(m, p)))
+        && (next.members.len() < prev.members.len() || next.members.iter().any(|m| was(m).is_some_and(|p| m.role < p.role)))
+}
+
 /// Store a roster version and refresh the members table from it.
 fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()> {
     let names: std::collections::HashSet<&str> = r.members.iter().map(|m| m.username.as_str()).collect();
@@ -1060,7 +1078,7 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
             return Err((BAD, "a member's keys don't match their identity"));
         }
     }
-    tx.execute("INSERT INTO rosters(vault_id, version, signed) VALUES(?,?,?)", params![vault, r.version, json(s)])
+    tx.execute("INSERT INTO rosters(vault_id, version, signed, counted) VALUES(?,?,?,1)", params![vault, r.version, json(s)])
         .map_err(|_| (StatusCode::CONFLICT, "roster changed, pull first"))?;
     tx.execute("DELETE FROM members WHERE vault_id = ?", [vault]).map_err(db_err)?;
     for m in &r.members {
@@ -1129,6 +1147,11 @@ fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
 
 /// Check a manifest against the vault's chain and append it with its items.
 fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> R<()> {
+    // Old clients' envelopes held the sealed part itself, and the history keeps them for good.
+    const OLD: (StatusCode, &str) = (BAD, "a manifest's envelope signs the hash of its sealed part, sent beside it (update the app)");
+    if put.sealed.0.is_empty() {
+        return Err(OLD);
+    }
     verify_signed(tx, &put.manifest, "manifest", username)?;
     let env: ManifestEnvelope = parse(&put.manifest)?;
     let (counter, epoch, last, roster): (u64, u64, Option<Vec<u8>>, u64) = tx
@@ -1142,11 +1165,10 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     if env.vault_id.0[..] != *vault || env.counter != counter + 1 || env.epoch != epoch || env.roster > roster || env.prev.0 != last.unwrap_or_default() {
         return Err((BAD, "manifest doesn't extend the chain"));
     }
-    // Old clients' envelopes held the sealed part itself, and the history keeps them for good.
     if env.sealed.is_some() || env.sealed_hash.as_ref().is_none_or(|h| h.0[..] != sha256(&put.sealed.0)[..]) {
-        return Err((BAD, "a manifest's envelope signs the hash of its sealed part, sent beside it (update the app)"));
+        return Err(OLD);
     }
-    if put.sealed.0.is_empty() || put.sealed.0.len() > MAX_MANIFEST {
+    if put.sealed.0.len() > MAX_MANIFEST {
         return Err((BAD, "manifest size"));
     }
     for u in &put.upserts {
@@ -1175,7 +1197,7 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
         tx.execute("DELETE FROM items WHERE vault_id = ? AND id = ?", params![vault, &d.0[..]]).map_err(db_err)?;
     }
     // Only the latest manifest's sealed part is ever served.
-    tx.execute("UPDATE manifests SET sealed = x'' WHERE vault_id = ? AND length(sealed) > 0", [vault]).map_err(db_err)?;
+    tx.execute("UPDATE manifests SET sealed = x'' WHERE vault_id = ? AND counter = ? AND sealed IS NOT NULL", params![vault, counter]).map_err(db_err)?;
     tx.execute("INSERT INTO manifests(vault_id, counter, signed, sealed) VALUES(?,?,?,?)", params![vault, env.counter, json(&put.manifest), put.sealed.0])
         .map_err(db_err)?;
     tx.execute(
@@ -1267,8 +1289,19 @@ async fn get_vault(
     if q.at.is_some_and(|at| at != counter) {
         return Err((StatusCode::CONFLICT, "vault changed, pull again"));
     }
-    if !c.human && q.at.is_none() {
-        audit_log(&db, &vault, &c.username, "read")?;
+    // Every agent read is audited: once per pull, since its pages follow within a
+    // minute of each other (any page may be the first, as far as the server can tell).
+    if !c.human {
+        let recent: bool = db
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE rowid = (SELECT MAX(rowid) FROM audit WHERE vault_id = ?1) AND username = ?2 AND action = 'read' AND ts > ?3",
+                params![&vault[..], c.username, now().saturating_sub(60)],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if !recent {
+            audit_log(&db, &vault, &c.username, "read")?;
+        }
     }
     let mut page = Page { budget: cfg.pull_page.unwrap_or(PULL_PAGE), used: 0, full: false };
     let mut rosters = Vec::new();
@@ -1532,10 +1565,7 @@ async fn update_roster(
             }
             Ok(())
         };
-        let was = |m: &Member| prev.members.iter().find(|p| p.username == m.username).map(|p| p.role);
-        let narrows = r.members.iter().all(|m| was(m).is_some_and(|o| m.role <= o))
-            && (r.members.len() < prev.members.len() || r.members.iter().any(|m| was(m).is_some_and(|o| m.role < o)));
-        if narrows {
+        if narrows(&prev, &r) {
             store()?;
         } else {
             roster_within_quota(&tx, &cfg, &vault, &c.username, store)?;
@@ -1783,6 +1813,23 @@ mod tests {
         assert!(run(&mut db, 0).is_ok(), "a re-seal that takes no more room");
     }
 
+    /// Over the quota, a roster change goes through only if it takes access away.
+    #[test]
+    fn narrowing_roster_changes() {
+        use plaintext_core::api::{B64, Hex, Member, Role, Roster};
+        let m = |name: &str, role, expires| Member { username: name.into(), sign_pk: B64::default(), enc_pk: B64::default(), role, expires };
+        let r = |members| Roster { vault_id: Hex([0; 16]), version: 0, prev: B64::default(), epoch: 0, key_check: B64::default(), members };
+        let prev = r(vec![m("alice", Role::Owner, None), m("bob", Role::Writer, Some(100)), m("carol", Role::Reader, None)]);
+        let narrows = |members| super::narrows(&prev, &r(members));
+        assert!(narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Writer, Some(100))]), "a removal");
+        assert!(narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Reader, Some(50)), m("carol", Role::Reader, Some(9))]), "a demotion, expiries brought forward");
+        assert!(!narrows(prev.members.clone()), "no change");
+        assert!(!narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Reader, None), m("carol", Role::Reader, None)]), "a demotion that drops an expiry");
+        assert!(!narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Reader, Some(101)), m("carol", Role::Reader, None)]), "or extends one");
+        assert!(!narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Writer, Some(100)), m("carol", Role::Writer, None)]), "a promotion");
+        assert!(!narrows(vec![m("alice", Role::Owner, None), m("bob", Role::Reader, Some(100)), m("dave", Role::Reader, None)]), "someone new");
+    }
+
     /// A vault's audit log keeps the newest 1000 rows, which is all owners see.
     #[test]
     fn audit_keeps_the_newest_1000() {
@@ -1796,8 +1843,9 @@ mod tests {
         assert_eq!((n, oldest.as_str()), (1000, "write 5"));
     }
 
-    /// A database from before `vaults.creator`, `sessions.expires`, `messages.sender`
-    /// and `manifests.sealed` gets them; its manifests count only while they're the latest. The creator is filled from roster
+    /// A database from before `vaults.creator`, `sessions.expires`, `messages.sender`,
+    /// `manifests.sealed` and `rosters.counted` gets them; its manifests and rosters
+    /// count only while they're the latest. The creator is filled from roster
     /// v0's signer while they're still a current member (else an enabled owner), and opening it again changes nothing.
     #[test]
     fn creator_migration() {
@@ -1835,12 +1883,12 @@ mod tests {
             let disabled: bool = db.query_row("SELECT disabled FROM accounts WHERE username = 'aaron-ci'", [], |r| r.get(0)).unwrap();
             assert!(disabled, "a disabled person's agent");
             let (old, rosters): (i64, u64) = db
-                .query_row("SELECT COUNT(*), (SELECT SUM(octet_length(signed)) FROM rosters WHERE vault_id = x'01') FROM manifests WHERE sealed IS NULL", [], |r| {
+                .query_row("SELECT COUNT(*), (SELECT octet_length(signed) FROM rosters WHERE vault_id = x'01' AND version = 1) FROM manifests WHERE sealed IS NULL", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .unwrap();
             assert_eq!(old, 2);
-            assert_eq!(super::usage(&db, Some("alice")).unwrap(), rosters + 10, "every roster, and the latest manifest only");
+            assert_eq!(super::usage(&db, Some("alice")).unwrap(), rosters + 10, "the latest roster and manifest only");
         }
         let _ = std::fs::remove_file(&path);
     }

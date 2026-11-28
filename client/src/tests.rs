@@ -1582,22 +1582,33 @@ fn device_state_offline_and_import() {
 #[test]
 fn paged_pulls() {
     use std::cell::{Cell, RefCell};
-    /// Counts later pages of pulls of `vault`, and runs `hook` before the first one.
+    use std::rc::Rc;
+    /// Counts later pages of pulls of `vault`, and runs one of `hooks` before each.
+    /// With `replay`, every later page is the first page again (a hostile server).
     struct Pages {
         inner: Http,
         vault: Hex,
         later: Cell<usize>,
-        hook: RefCell<Option<Box<dyn FnOnce()>>>,
+        hooks: RefCell<Vec<Box<dyn FnOnce()>>>,
+        replay: Option<RefCell<Vec<u8>>>,
     }
     impl Transport for Pages {
         fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
-            if method == "GET" && path.starts_with(&format!("/v1/vaults/{}?", self.vault)) && path.contains("&at=") {
+            let pull = method == "GET" && path.starts_with(&format!("/v1/vaults/{}?", self.vault));
+            if pull && path.contains("&at=") {
                 self.later.set(self.later.get() + 1);
-                if let Some(f) = self.hook.borrow_mut().take() {
+                if let Some(f) = self.hooks.borrow_mut().pop() {
                     f();
                 }
+                if let Some(first) = &self.replay {
+                    return Ok((200, first.borrow().clone()));
+                }
             }
-            self.inner.send(method, path, token, body)
+            let resp = self.inner.send(method, path, token, body)?;
+            if let Some(first) = self.replay.as_ref().filter(|_| pull) {
+                *first.borrow_mut() = resp.1.clone();
+            }
+            Ok(resp)
         }
         fn host(&self) -> String {
             self.inner.host()
@@ -1609,7 +1620,7 @@ fn paged_pulls() {
     join(Http::new(&url), "carol", "carol pw", None, "t");
     alice.sync().unwrap();
     let personal = alice.default_vault().unwrap();
-    let pages = |vault: Hex| Pages { inner: Http::new(&url), vault, later: Cell::new(0), hook: RefCell::new(None) };
+    let pages = |vault: Hex| Pages { inner: Http::new(&url), vault, later: Cell::new(0), hooks: RefCell::new(vec![]), replay: None };
     let mut behind = Session::login(pages(personal), &derive("alice pw", &ask), "t").unwrap();
     behind.sync().unwrap();
     // 40 items (about 12 KB sealed), three pushes and four roster versions: many 4 KB pages.
@@ -1633,14 +1644,46 @@ fn paged_pulls() {
     assert!(behind.t.later.get() >= 3, "{} later pages", behind.t.later.get());
 
     // A new device's pull, with bob pushing between its first and second page.
+    let bob = Rc::new(RefCell::new(bob));
+    let push = |title: &'static str| -> Box<dyn FnOnce()> {
+        let bob = bob.clone();
+        Box::new(move || bob.borrow_mut().put_item(&personal, plaintext_core::new_item_id(), item(title, "b0b")).unwrap())
+    };
     let fresh = pages(personal);
-    *fresh.hook.borrow_mut() = Some(Box::new(move || bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "b0b")).unwrap()));
+    fresh.hooks.borrow_mut().push(push("Bob's"));
     let mut fresh = Session::login(fresh, &derive("alice pw", &ask), "t").unwrap();
     fresh.sync().unwrap();
     assert!(fresh.problems.is_empty(), "{:?}", fresh.problems);
-    assert!(fresh.t.hook.borrow().is_none(), "bob pushed midway");
+    assert!(fresh.t.hooks.borrow().is_empty(), "bob pushed midway");
     assert_eq!(fresh.vaults[&personal].items().count(), 41);
     assert!(fresh.vaults[&personal].items().any(|(_, i)| i.title == "Bob's"));
+    // A vault that changes during every try is reported, not taken as a change the
+    // server held back, and the next sync gets it.
+    let busy = pages(personal);
+    busy.hooks.borrow_mut().extend((0..5).map(|_| push("Busy")));
+    let mut busy = Session::login(busy, &derive("alice pw", &ask), "t").unwrap();
+    busy.sync().unwrap();
+    assert!(busy.problems.iter().any(|p| p.contains("kept changing")), "{:?}", busy.problems);
+    assert!(!busy.vaults.contains_key(&personal));
+    busy.sync().unwrap();
+    assert_eq!(busy.vaults[&personal].items().count(), 46);
+    // A server whose later pages don't move the pull on doesn't keep a device asking.
+    let stuck = Pages { replay: Some(RefCell::new(vec![])), ..pages(personal) };
+    let mut stuck = Session::login(stuck, &derive("alice pw", &ask), "t").unwrap();
+    stuck.sync().unwrap();
+    assert!(!stuck.vaults.contains_key(&personal) && !stuck.problems.is_empty(), "{:?}", stuck.problems);
+    assert!(stuck.t.later.get() <= 2);
+    // An agent's read is audited once per pull, whichever page the server is asked for.
+    let key = alice.create_agent("bot").unwrap();
+    alice.share_vault(&personal, "bot", Role::Reader, None).unwrap();
+    let mut bot = Session::login(Http::new(&url), &derive_agent(&key), "t").unwrap();
+    bot.sync().unwrap();
+    let reads = "SELECT COUNT(*) FROM audit WHERE username = 'bot' AND action = 'read'";
+    assert_eq!(count(&path, reads), 1, "one pull of many pages");
+    exec(&path, "UPDATE audit SET ts = ts - 120 WHERE username = 'bot'");
+    let counter = bot.vaults[&personal].counter;
+    bot.call::<VaultResponse>("GET", &format!("/v1/vaults/{personal}?since=0&latest=true&at={counter}"), NONE).unwrap();
+    assert_eq!(count(&path, reads), 2);
     // The 409 is a later page's only: a first page always answers.
     let q = format!("/v1/vaults/{personal}?since=0&latest=true&at=1");
     assert_eq!(status(alice.call::<VaultResponse>("GET", &q, NONE)), 409);
@@ -1688,5 +1731,51 @@ fn manifest_history_stays_small() {
     assert_eq!(resigned(&|e| drop(e.as_object_mut().unwrap().remove("sealed_hash"))), 400);
     assert_eq!(resigned(&|e| e["pad"] = "A".repeat(1000).into()), 400);
     assert_eq!(resigned(&|_| ()), 200);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A database from before hashed envelopes: its latest manifest carries the sealed
+/// part itself. Devices catch up through it and start from it, and new manifests
+/// (here a delete over the quota) go on top.
+#[test]
+fn manifests_from_older_apps() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    let one = plaintext_core::new_item_id();
+    alice.put_item(&personal, one, item("One", "1")).unwrap();
+    let mut behind = login(&url, "alice pw", &ask);
+    behind.sync().unwrap();
+    // An older app's push, written straight into the database (the server refuses those now).
+    let me = alice.me();
+    let mut copy = Vault::restore(&alice.account, personal, &alice.vaults[&personal].snapshot(&alice.account)).unwrap();
+    let two = plaintext_core::new_item_id();
+    copy.put(two, item("Two", "2"));
+    let put = copy.push(&me, now()).unwrap();
+    let mut env: ManifestEnvelope = serde_json::from_slice(&put.manifest.body.0).unwrap();
+    (env.sealed, env.sealed_hash) = (Some(put.sealed.clone()), None);
+    let signed = me.sign_doc("manifest", &env);
+    let c = env.counter;
+    exec(&path, &format!("INSERT INTO items(vault_id, id, blob, counter) VALUES (x'{personal}', x'{two}', x'{}', {c})", hex::encode(&put.upserts[0].blob.0)));
+    exec(&path, &format!("INSERT INTO manifests(vault_id, counter, signed) VALUES (x'{personal}', {c}, '{}')", serde_json::to_string(&signed).unwrap()));
+    exec(&path, &format!("UPDATE manifests SET sealed = NULL WHERE vault_id = x'{personal}'"));
+    exec(&path, &format!("UPDATE vaults SET counter = {c}, manifest_hash = x'{}' WHERE id = x'{personal}'", hex::encode(plaintext_core::crypto::sha256(&signed.body.0))));
+    behind.sync().unwrap();
+    assert!(behind.problems.is_empty(), "{:?}", behind.problems);
+    assert_eq!(behind.vaults[&personal].items().count(), 2, "caught up through it");
+
+    // Restarted with a quota alice is over: a new device starts from that manifest,
+    // and a delete still goes through on top of it, though an addition doesn't.
+    let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut fresh = login(&url, "alice pw", &ask);
+    fresh.sync().unwrap();
+    assert!(fresh.problems.is_empty(), "{:?}", fresh.problems);
+    assert_eq!(fresh.vaults[&personal].items().count(), 2, "started from it");
+    fresh.delete_item(&personal, one).unwrap();
+    assert_eq!(status(fresh.put_item(&personal, plaintext_core::new_item_id(), item("Three", "3"))), 507);
+    behind.sync().unwrap();
+    assert!(behind.problems.is_empty(), "{:?}", behind.problems);
+    assert_eq!(behind.vaults[&personal].items().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Two"]);
     let _ = std::fs::remove_file(&path);
 }
