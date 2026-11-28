@@ -42,6 +42,7 @@ jobs:
       - name: Clippy and tests
         working-directory: ${{ env.SRC }}
         run: |
+          ulimit -n 4096 # the runners start with launchd's 256 open files; the tests run dozens of servers at once
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
       - name: The landing page shows the release key docs/install checks
@@ -104,6 +105,7 @@ jobs:
         working-directory: ${{ env.SRC }}
         run: |
           wasm/build.sh extension
+          ulimit -n 4096 # launchd's 256 open files is tight for a server under test
           PLAINTEXT_REQUIRE_PKG=1 cargo test --locked --test extension # the workspace's features: reuses what check built
           python3 extension/package.py
           npx --yes web-ext@10.8.0 lint --source-dir extension/dist/firefox --self-hosted
