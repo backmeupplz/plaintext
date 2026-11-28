@@ -330,10 +330,21 @@ impl<T: Transport> Session<T> {
                 Err(e) => return Err(e),
             }
         }
-        for id in &acct.paid_unlisted {
-            self.problems.push(format!(
-                "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"
-            ));
+        // Someone can make you an owner and leave, and the vault counts against you
+        // from then on (DESIGN "Leaving"): name every vault you pay for but didn't create.
+        for id in &acct.paid {
+            match self.vaults.get(id).filter(|v| v.roster.is_some()) {
+                Some(v) if v.creator == self.keyring.username => {}
+                Some(v) => self.problems.push(format!(
+                    "vault {} counts against your storage, though {} created it (to stop that: plaintext vault leave {id})",
+                    v.meta.name, v.creator
+                )),
+                // Named above, with the error that kept it from opening.
+                None if acct.vaults.contains(id) => {}
+                None => self.problems.push(format!(
+                    "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"
+                )),
+            }
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {

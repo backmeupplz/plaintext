@@ -215,7 +215,7 @@ pub struct LeaveVault {
 
 /// `POST /v1/vaults/{id}/stage`: part of the items of a push (or a key rotation)
 /// too big for one request. The server holds them, uncommitted, until the push
-/// that names `stage`, or a day after the last part. Staging under a new id drops
+/// that names `stage`, or a day after the first part. Staging under a new id drops
 /// what the member staged before in that vault, and so does a refused part or push.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StageRequest {
@@ -283,11 +283,12 @@ pub struct AccountResponse {
     /// Bytes of items and files in the vaults this account created.
     #[serde(default)]
     pub usage: u64,
-    /// Vaults that count against this account although it isn't a current member
-    /// (only an agent of its is, or its membership expired): `POST
-    /// /v1/vaults/{id}/leave` still takes it and its agents out.
+    /// Every vault that counts against this account (`usage`): the ones it created,
+    /// and ones handed to it when their creator left, including ones it isn't a
+    /// current member of (only an agent of its is, or its membership expired).
+    /// `POST /v1/vaults/{id}/leave` takes it and its agents out of any of them.
     #[serde(default)]
-    pub paid_unlisted: Vec<Hex>,
+    pub paid: Vec<Hex>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

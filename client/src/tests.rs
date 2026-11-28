@@ -1049,6 +1049,21 @@ fn nobody_is_stuck_paying_for_a_vault() {
     carol.leave_vault(&old).unwrap();
     assert_eq!(creator(&old).as_deref(), Some("bob"));
 
+    // Mallory makes bob an owner of a vault he can open and leaves: it counts against
+    // him, and his sync names it and how to leave it (his own vaults it doesn't name).
+    let big = mallory.create_vault("Big").unwrap();
+    mallory.share_vault(&big, "bob", Role::Owner, None).unwrap();
+    mallory.leave_vault(&big).unwrap();
+    assert_eq!(creator(&big).as_deref(), Some("bob"));
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&big));
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains("counts against your storage")).collect();
+    assert!(named.iter().any(|p| p.contains("vault Big") && p.contains("mallory") && p.contains(&format!("plaintext vault leave {big}"))), "{named:?}");
+    let personal = bob.default_vault().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal")), "{:?}", bob.problems);
+    bob.leave_vault(&big).unwrap();
+    assert_eq!(creator(&big), None);
+
     // Mallory makes bob's agent the owner of a vault and leaves: it counts against
     // bob, his sync says so, and he takes the agent out, which deletes it.
     bob.create_agent("bob-bot").unwrap();
@@ -1057,7 +1072,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     mallory.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift).as_deref(), Some("bob"));
     let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
-    assert_eq!(acct.paid_unlisted, vec![gift]);
+    assert!(acct.paid.contains(&gift) && !acct.vaults.contains(&gift), "{acct:?}");
     bob.sync().unwrap();
     assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
     bob.leave_vault(&gift).unwrap();
