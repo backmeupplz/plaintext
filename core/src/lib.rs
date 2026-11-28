@@ -6,6 +6,7 @@ pub mod api;
 pub mod crypto;
 pub mod identity;
 pub mod item;
+pub mod site;
 pub mod tools;
 pub mod vault;
 

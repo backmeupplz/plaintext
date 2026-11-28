@@ -25,6 +25,16 @@ fn secret_key_roundtrip_and_typos() {
 }
 
 #[test]
+fn secret_key_sealed_for_the_browser() {
+    let sk = SecretKey::generate();
+    let blob = seal_secret_key("correct horse", &sk);
+    assert_eq!(open_secret_key("correct horse", &blob).unwrap().0, sk.0);
+    assert_eq!(open_secret_key("wrong horse", &blob).err(), Some(Error::Tampered));
+    assert_eq!(open_secret_key("correct horse", &blob[..10]).err(), Some(Error::Tampered));
+    assert_ne!(seal_secret_key("correct horse", &sk)[..16], blob[..16], "a fresh salt each time");
+}
+
+#[test]
 fn agent_key_roundtrip() {
     let k = AgentKey::generate();
     assert_eq!(AgentKey::parse(&k.encode()).unwrap().0, k.0);
