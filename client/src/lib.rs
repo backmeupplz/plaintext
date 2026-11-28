@@ -4,6 +4,7 @@
 //! the UniFFI bindings for iOS/Android/desktop) uses this, so sync rules exist once.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plaintext_core::api::*;
@@ -258,6 +259,62 @@ impl<T: Transport> Session<T> {
         Ok(Session { t, token, account, keyring, keyring_counter: acct.keyring_counter, keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
     }
 
+    /// Open a stored session with no network: the token and Account Key from the
+    /// keychain plus this device's own sealed copies in `dir` (see `save_local`).
+    /// Items can be read and edited; `sync` sends the edits once the server is back.
+    pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
+        let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
+        let keyring = Keyring::open(&account, &blob)?;
+        let mut s = Session { t, token, account, keyring, keyring_counter: 0, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() };
+        s.load_vaults(dir);
+        Ok(s)
+    }
+
+    /// Load what this device saved in `dir`: its keyring copy (merged in, so pins
+    /// it holds survive a server serving an older keyring) and every vault
+    /// snapshot, which carries the rollback guard. Call after signing in.
+    pub fn load_local(&mut self, dir: &Path) -> Result<()> {
+        self.load_vaults(dir);
+        match std::fs::read(dir.join("keyring.bin")) {
+            Ok(blob) => self.merge_local_keyring(&blob),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn load_vaults(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for f in entries.flatten() {
+            let Some(name) = f.file_name().to_str().and_then(|n| n.strip_suffix(".bin")).map(str::to_owned) else { continue };
+            let (name, hidden) = name.strip_suffix(".hidden").map_or((name.as_str(), false), |n| (n, true));
+            let Ok(id) = name.parse::<Hex>() else { continue };
+            if let Ok(blob) = std::fs::read(f.path())
+                && let Ok(v) = Vault::restore(&self.account, id, &blob)
+            {
+                if hidden { &mut self.hidden } else { &mut self.vaults }.insert(id, v);
+            }
+        }
+    }
+
+    /// Save this device's state to `dir`, sealed with the Account Key: every vault
+    /// snapshot (hidden ones too, so they can't come back older, kept apart so
+    /// they stay hidden when opened offline) and the keyring.
+    pub fn save_local(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let write = |name: String, data: Vec<u8>| -> std::io::Result<()> {
+            let tmp = dir.join(format!("{name}.tmp"));
+            std::fs::write(&tmp, data)?;
+            std::fs::rename(tmp, dir.join(format!("{name}.bin")))
+        };
+        for (hidden, list) in [(false, &self.vaults), (true, &self.hidden)] {
+            for (id, v) in list {
+                let (name, other) = if hidden { (format!("{id}.hidden"), id.to_string()) } else { (id.to_string(), format!("{id}.hidden")) };
+                write(name, v.snapshot(&self.account))?;
+                let _ = std::fs::remove_file(dir.join(format!("{other}.bin")));
+            }
+        }
+        write("keyring".into(), self.keyring_snapshot())
+    }
+
     pub fn call<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
         call(&self.t, method, path, Some(&self.token), body)
     }
@@ -274,6 +331,12 @@ impl<T: Transport> Session<T> {
     pub fn sync(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call("GET", "/v1/account", NONE)?;
         self.admin = acct.admin;
+        // Another device (or this one, opened offline) changed the keyring: fold it in.
+        if acct.keyring_counter != self.keyring_counter {
+            let server = Keyring::open(&self.account, &acct.keyring.0)?;
+            self.keyring_dirty |= self.keyring.merge_from(&server);
+            self.keyring_counter = acct.keyring_counter;
+        }
         let unlisted: Vec<Hex> = self.vaults.keys().filter(|id| !acct.vaults.contains(id)).copied().collect();
         for id in unlisted {
             let v = self.vaults.remove(&id).expect("listed above");
@@ -716,6 +779,44 @@ impl<T: Transport> Session<T> {
     /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
         self.change(vault, |v| v.delete(id))
+    }
+
+    /// Save imported items: each source vault goes to our own vault of that name
+    /// (made if needed; "Personal" and unnamed ones to the default vault), or all
+    /// to `into`. Attachments are uploaded. Returns how many items were saved.
+    /// Refused before anything changes if we may only read an existing target
+    /// (see `writable`).
+    pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<usize> {
+        let target = |s: &Self, v: &import::Imported| match into {
+            Some(id) => Ok(Some(id)),
+            None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => s.default_vault().map(Some),
+            None => Ok(s.own_vault(&v.name)),
+        };
+        let mut checked = Vec::new();
+        for v in &imported {
+            if let Some(id) = target(self, v)?
+                && !checked.contains(&id)
+            {
+                self.writable(&id)?;
+                checked.push(id);
+            }
+        }
+        let mut n = 0;
+        for v in imported {
+            let vid = match target(self, &v)? {
+                Some(id) => id,
+                None => self.create_vault(&v.name)?,
+            };
+            for (mut it, files) in v.items {
+                for (name, bytes) in files {
+                    it.files.push(self.upload_file(&vid, &name, &bytes)?);
+                }
+                self.vaults.get_mut(&vid).ok_or(Error::NotFound("vault".into()))?.put(plaintext_core::new_item_id(), it);
+                n += 1;
+            }
+            self.sync_vault(&vid)?;
+        }
+        Ok(n)
     }
 
     // ---------- Files ----------

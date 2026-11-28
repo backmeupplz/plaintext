@@ -1,0 +1,43 @@
+name: Apple
+# The iPhone/iPad + Mac app: builds the Rust XCFramework (dev profile, Apple-silicon slices only) and compiles the app
+# and its test bundles for the Mac and the iOS Simulator. The runner's user has no test manager (XCTest can't start
+# there) and the Mac is shared, so tests run locally: `xcodebuild test -scheme Plaintext -destination platform=macOS`
+# and apple/screenshots.sh for the UI journey. The FFI itself is tested by `cargo test` in CI.yml.
+on:
+  pull_request:
+    paths: ['apple/**', 'ffi/**', 'client/**', 'core/**', 'Cargo.lock', '.forgejo/workflows/apple.yml']
+  push:
+    branches: [main]
+    paths: ['apple/**', 'ffi/**', 'client/**', 'core/**', 'Cargo.lock', '.forgejo/workflows/apple.yml']
+permissions:
+  contents: read
+concurrency:
+  group: apple-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  apple:
+    name: Apple
+    runs-on: macos-26
+    # Mac only, and only for our own PRs: outsiders' PRs (bridged from GitHub by the `github` user) never run on it.
+    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)
+    timeout-minutes: 20
+    steps:
+      # A per-runner checkout and Rust toolchain that persist between runs, so cargo and Xcode only rebuild what changed.
+      - name: Build and test
+        run: |
+          stage="${PWD%%/work/*}/ci/plaintext-apple"
+          mkdir -p "$stage" && cd "$stage"
+          rm -f src/.git/index.lock src/.git/shallow.lock # left by a cancelled run
+          [ -d src/.git ] || git init -q src
+          git -C src fetch -q --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git -C src checkout -q -f FETCH_HEAD
+          export CARGO_HOME="$stage/cargo" RUSTUP_HOME="$stage/rustup" CARGO_TARGET_DIR="$stage/target"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+          rustup update stable --no-self-update >/dev/null
+          cd src
+          PROFILE=dev TARGETS="aarch64-apple-darwin aarch64-apple-ios-sim" sh apple/build-rust.sh
+          # xcodebuild reads every environment variable as a build setting: give it a clean one.
+          x() { env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="${TMPDIR:-/tmp}" xcodebuild -quiet -project apple/Plaintext.xcodeproj -scheme Plaintext -derivedDataPath "$stage/DerivedData" COMPILER_INDEX_STORE_ENABLE=NO "$@"; }
+          x -destination 'platform=macOS,arch=arm64' build-for-testing
+          x -destination 'generic/platform=iOS Simulator' ARCHS=arm64 build-for-testing
