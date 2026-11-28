@@ -1058,12 +1058,31 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert_eq!(creator(&big).as_deref(), Some("bob"));
     bob.sync().unwrap();
     assert!(bob.vaults.contains_key(&big));
-    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains("counts against your storage")).collect();
-    assert!(named.iter().any(|p| p.contains("vault Big") && p.contains("mallory") && p.contains(&format!("plaintext vault leave {big}"))), "{named:?}");
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&big.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains("vault Big counts against your storage, though mallory created it"), "{named:?}");
     let personal = bob.default_vault().unwrap();
     assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal")), "{:?}", bob.problems);
     bob.leave_vault(&big).unwrap();
     assert_eq!(creator(&big), None);
+
+    // A vault bob opened before that no longer checks out is still named with how
+    // to leave it and that it counts against him, once.
+    let stale = mallory.create_vault("Stale").unwrap();
+    mallory.share_vault(&stale, "bob", Role::Owner, None).unwrap();
+    bob.sync().unwrap();
+    mallory.put_item(&stale, plaintext_core::new_item_id(), item("Later", "x")).unwrap();
+    mallory.sync().unwrap();
+    mallory.leave_vault(&stale).unwrap();
+    exec(&path, &format!("UPDATE manifests SET signed = replace(signed, '\"signer\":\"mallory\"', '\"signer\":\"bob\"') WHERE vault_id = x'{stale}'"));
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&stale));
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&stale.to_string())).collect();
+    assert!(
+        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("plaintext vault leave {stale}; it counts against your storage")),
+        "{named:?}"
+    );
+    bob.leave_vault(&stale).unwrap();
+    assert_eq!(creator(&stale), None);
 
     // Mallory makes bob's agent the owner of a vault and leaves: it counts against
     // bob, his sync says so, and he takes the agent out, which deletes it.
@@ -1078,6 +1097,25 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
     bob.leave_vault(&gift).unwrap();
     assert_eq!(creator(&gift), None);
+    let _ = std::fs::remove_file(&path);
+
+    // Without a quota, an openable vault someone handed you costs nothing and isn't
+    // named, but one only an agent of yours is in still is.
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut mallory) = join(Http::new(&url), "mallory", "mallory pw", None, "t");
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    bob.create_agent("bob-bot").unwrap();
+    let open = mallory.create_vault("Open").unwrap();
+    mallory.share_vault(&open, "bob", Role::Owner, None).unwrap();
+    mallory.leave_vault(&open).unwrap();
+    let gift = mallory.create_vault("Gift").unwrap();
+    mallory.share_vault(&gift, "bob-bot", Role::Owner, None).unwrap();
+    mallory.leave_vault(&gift).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&open));
+    assert!(!bob.problems.iter().any(|p| p.contains("vault Open") || p.contains(&open.to_string())), "{:?}", bob.problems);
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&gift.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {gift}")), "{named:?}");
     let _ = std::fs::remove_file(&path);
 }
 

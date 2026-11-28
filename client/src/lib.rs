@@ -302,6 +302,7 @@ impl<T: Transport> Session<T> {
         // reports the error at the end, without holding up the other vaults. So does
         // a member removal another device raced, or one too big to send (413); the next sync retries.
         let mut full = None;
+        let mut failed = vec![];
         for id in &acct.vaults {
             let v = self.hidden.remove(id).unwrap_or_else(|| Vault::new(*id));
             self.vaults.entry(*id).or_insert(v);
@@ -318,17 +319,15 @@ impl<T: Transport> Session<T> {
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
+                    // A vault opened before keeps its name, though it may never open again.
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
-                    match known {
-                        Some(name) => self.problems.push(format!("vault {name} wasn't updated: {e}")),
-                        None => {
-                            let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
-                            self.problems.push(format!("vault {id} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"))
-                        }
-                    }
+                    let name = known.unwrap_or_else(|| id.to_string());
+                    let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
+                    self.problems.push(format!("vault {name} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"));
+                    failed.push(*id);
                 }
                 Err(e) => return Err(e),
             }
@@ -336,16 +335,14 @@ impl<T: Transport> Session<T> {
         // Someone can make you an owner and leave, and the vault counts against you
         // from then on (DESIGN "Leaving"): name every vault you pay for but didn't create
         // (one you can open only while storage is limited, or a vault you took over on
-        // purpose would be named on every sync for nothing).
-        for id in &acct.paid {
+        // purpose would be named on every sync for nothing). One that failed is named above.
+        for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
             match self.vaults.get(id).filter(|v| v.roster.is_some()) {
                 Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
                 Some(v) => self.problems.push(format!(
                     "vault {} counts against your storage, though {} created it (to stop that: plaintext vault leave {id})",
                     v.meta.name, v.creator
                 )),
-                // Named above, with the error that kept it from opening and that it counts against you.
-                None if acct.vaults.contains(id) => {}
                 None => self.problems.push(format!(
                     "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"
                 )),
