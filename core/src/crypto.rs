@@ -307,6 +307,7 @@ pub fn seal_to(recipient: &[u8], kem: &[u8], ad: &[u8], pt: &[u8]) -> Result<Vec
     }
     let m = Zeroizing::new(random::<32>());
     let (ct, ss) = ek.encapsulate_deterministic(&(*m).into());
+    let ss = Zeroizing::new(ss);
     let k = seal_to_key(&ss, shared.as_bytes(), epk.as_bytes(), &rpk);
     Ok([epk.as_bytes(), &ct[..], &seal(&k, ad, pt)].concat())
 }
@@ -321,7 +322,7 @@ pub fn open_from(sk: &x25519_dalek::StaticSecret, kem: &KemKey, ad: &[u8], blob:
     if !shared.was_contributory() {
         return Err(Error::Tampered);
     }
-    let ss = kem.decapsulate_slice(&blob[32..32 + KEM_CT_LEN]).expect("ciphertext size");
+    let ss = Zeroizing::new(kem.decapsulate_slice(&blob[32..32 + KEM_CT_LEN]).expect("ciphertext size"));
     let rpk = x25519_dalek::PublicKey::from(sk);
     open(&seal_to_key(&ss, shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[32 + KEM_CT_LEN..])
 }

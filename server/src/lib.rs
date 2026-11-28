@@ -41,6 +41,9 @@ const LOGIN_SKEW_MS: u64 = 120_000;
 const SESSION_TTL: u64 = 30 * 86400;
 /// A manifest lists every item (~90 bytes each), so it gets more room than an item.
 const MAX_MANIFEST: usize = 16 * MAX_BLOB;
+/// The keyring pins every contact with their ML-KEM key (~1.7 KB each), so
+/// being in a few big vaults outgrows MAX_BLOB.
+const MAX_KEYRING: usize = 16 * MAX_BLOB;
 const MAX_MEMBERS: usize = 1000;
 /// Largest inbox response; the rest waits until these are deleted.
 const INBOX_BYTES: usize = 32 << 20;
@@ -206,7 +209,7 @@ fn app(db: Connection, cfg: Config) -> Router {
         .route("/v1/login", post(login).layer(limits))
         .route("/v1/logout", post(logout))
         .route("/v1/account", get(account).delete(delete_account))
-        .route("/v1/account/keyring", put(put_keyring.layer(big(BLOB_BODY))))
+        .route("/v1/account/keyring", put(put_keyring.layer(big(VAULT_BODY))))
         .route("/v1/account/password", post(change_password))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", axum::routing::delete(end_session))
@@ -380,7 +383,11 @@ fn db_err<E>(_: E) -> (StatusCode, &'static str) {
 }
 
 fn check_blob(b: &B64) -> R<()> {
-    if b.0.is_empty() || b.0.len() > MAX_BLOB {
+    check_size(b, MAX_BLOB)
+}
+
+fn check_size(b: &B64, max: usize) -> R<()> {
+    if b.0.is_empty() || b.0.len() > max {
         return Err((BAD, "blob size"));
     }
     Ok(())
@@ -666,7 +673,7 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
 }
 
 async fn put_keyring(State(db): State<Db>, h: HeaderMap, Json(req): Json<KeyringPut>) -> R<StatusCode> {
-    check_blob(&req.keyring)?;
+    check_size(&req.keyring, MAX_KEYRING)?;
     let db = lock(&db);
     let c = caller(&db, &h)?;
     let n = db

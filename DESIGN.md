@@ -200,7 +200,7 @@ Types are in `core/src/api.rs`; ids are hex, blobs base64.
 
 Signed documents are limited as a whole, before anything in them is parsed: identities 4 KiB, rosters 2 MiB and 1000 members (each listed once), messages and manifests their sealed part in base64 plus 4 KiB. `GET /v1/messages` returns the oldest messages up to 32 MiB (at least one); the rest come once those are deleted. `HEAD` on a share link gets 405, so checking a link doesn't use up a view, and every response carries `Cache-Control: no-store`, plus `Strict-Transport-Security: max-age=31536000` when a `PLAINTEXT_URL` address is `https://`. Expired links, messages and sessions are never served, and are deleted every ten minutes.
 
-Request bodies are limited to 64 KiB, except: the keyring, inbox messages and share links take 2 MiB; vault create, push, stage and roster changes take 32 MiB; files take 64 MB. Those larger requests need a valid session, which the server checks before it reads the body. A push or key rotation with more items than that stages them first (see "Sync"). A body over its limit gets 413, which clients tell apart from a full account (507).
+Request bodies are limited to 64 KiB, except: inbox messages and share links take 2 MiB; vault create, push, stage and roster changes and the keyring take 32 MiB (the sealed keyring itself up to 16 MiB, since every pinned contact carries a 1184-byte ML-KEM key); files take 64 MB. Those larger requests need a valid session, which the server checks before it reads the body. A push or key rotation with more items than that stages them first (see "Sync"). A body over its limit gets 413, which clients tell apart from a full account (507).
 
 ## Code layout
 

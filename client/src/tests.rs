@@ -1570,6 +1570,16 @@ fn server_hardening() {
     let id = serde_json::json!({ "username": "carol-bot", "kind": "agent", "owner": "carol", "sign_pk": am.sign_pk(), "enc_pk": am.enc_pk(), "kem_pk": am.kem_pk(), "pad": "A".repeat(6000) });
     agent.request.identity = am.sign_doc("identity", &id);
     assert_eq!(status(carol.call::<()>("POST", "/v1/agents", Some(&agent.request))), 400, "identity too large");
+    // A keyring pinning 1000 contacts, each with an ML-KEM key, still saves.
+    let cm = carol.me();
+    let c = plaintext_core::identity::Contact { sign_pk: cm.sign_pk(), enc_pk: cm.enc_pk(), kem_pk: cm.kem_pk(), verified: false };
+    (0..1000).for_each(|i| drop(carol.keyring.contacts.insert(format!("pad{i}"), c.clone())));
+    carol.keyring_dirty = true;
+    carol.save_keyring().unwrap();
+    assert!(count(&path, "SELECT length(keyring) FROM accounts WHERE username = 'carol'") > 1 << 20);
+    carol.keyring.contacts.retain(|n, _| !n.starts_with("pad"));
+    carol.keyring_dirty = true;
+    carol.save_keyring().unwrap();
     // Rosters: no duplicates, at most 1000 members.
     for n in [2, 1001] {
         let (_, mut nv) = plaintext_core::Vault::create(&bob.me(), "x").unwrap();
