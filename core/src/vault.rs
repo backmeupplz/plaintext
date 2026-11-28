@@ -101,8 +101,11 @@ fn key_check(vk: &Key, vault: &Hex, epoch: u64) -> B64 {
     B64(hmac(&vk[..], &[b"plaintext/v1/key-check".as_slice(), &vault.0, &epoch.to_be_bytes()].concat()).to_vec())
 }
 
+/// Seal the vault key to a member: post-quantum when the roster lists their
+/// `KemPub`, which the writer took from its own pins (`with_kems`).
 fn wrap(vk: &Key, vault: &Hex, epoch: u64, m: &Member) -> Result<WrappedKey, Error> {
-    Ok(WrappedKey { username: m.username.clone(), epoch, key: B64(seal_to(&m.enc_pk.0, &key_ad(vault, epoch, &m.username), &vk[..])?) })
+    let kem = m.kem.as_ref().and_then(crate::identity::kem_pk_of);
+    Ok(WrappedKey { username: m.username.clone(), epoch, key: B64(seal_to(&m.enc_pk.0, kem.as_deref(), &key_ad(vault, epoch, &m.username), &vk[..])?) })
 }
 
 fn active(m: &Member, now: u64) -> bool {
@@ -341,6 +344,9 @@ impl Vault {
             }
             for m in &r.members {
                 kr_changed |= keyring.pin(&m.username, &m.sign_pk, &m.enc_pk)?;
+                if let Some(k) = &m.kem {
+                    kr_changed |= keyring.pin_kem(k)?;
+                }
             }
             owner_signed |= keyring.owner.as_deref() == Some(s.signer.as_str());
             if r.version == 0 {
@@ -351,6 +357,11 @@ impl Vault {
             roster = Some(r);
         }
         let roster = roster.ok_or(Error::NotMember)?;
+        // Keys members published that the roster doesn't list yet, for the next
+        // vault key. Each must be signed by the member's pinned key; others are ignored.
+        for k in &resp.kems {
+            kr_changed |= keyring.pin_kem(k).unwrap_or(false);
+        }
         if !roster.members.iter().any(|m| m.username == me.username && active(m, now)) {
             return Err(Error::NotMember);
         }
@@ -374,7 +385,7 @@ impl Vault {
             (Some(k), Some(old)) if old.epoch == roster.epoch => k.clone(),
             _ => {
                 let wrapped = resp.key.as_ref().ok_or(Error::NotMember)?;
-                let raw = open_from(&me.enc, &key_ad(&self.id, roster.epoch, &me.username), &wrapped.0)?;
+                let raw = open_from(&me.enc, &me.kem, &key_ad(&self.id, roster.epoch, &me.username), &wrapped.0)?;
                 let vk: Key = Zeroizing::new(raw[..].try_into().map_err(|_| Error::Tampered)?);
                 if key_check(&vk, &self.id, roster.epoch) != roster.key_check {
                     return Err(Error::Tampered);
@@ -610,14 +621,20 @@ impl Vault {
             return Err(Error::OwnerExpiry);
         }
         let c = keyring.contacts.get(username).ok_or(Error::UnknownUser(username.into()))?;
-        let member = Member { username: username.into(), sign_pk: c.sign_pk.clone(), enc_pk: c.enc_pk.clone(), role, expires };
         let mut r = self.next_roster(me, now)?;
-        let old = r.members.iter().find(|m| m.username == username).map(|m| m.role);
+        let old = r.members.iter().find(|m| m.username == username).cloned();
+        // A member keeps the `KemPub` their key was sealed to (none if X25519 only)
+        // until the next key, so `needs_pq` still sees what that key was sealed to.
+        let kem = match &old {
+            Some(o) => o.kem.clone(),
+            None => c.kem.clone(),
+        };
+        let member = Member { username: username.into(), sign_pk: c.sign_pk.clone(), enc_pk: c.enc_pk.clone(), role, expires, kem };
         r.members.retain(|m| m.username != username);
         r.members.push(member.clone());
         // A demoted member still holds the key, so demotion replaces it, like removal.
-        if old.is_some_and(|o| role < o) {
-            return self.rotate(me, r);
+        if old.as_ref().is_some_and(|o| role < o.role) {
+            return self.rotate(me, keyring, r);
         }
         let keys = if old.is_none() { vec![wrap(&self.key()?, &self.id, r.epoch, &member)?] } else { vec![] };
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: None })
@@ -625,19 +642,31 @@ impl Vault {
 
     /// Remove people: a new vault key, every item re-sealed, so nothing written
     /// from now on is readable with the old key. Push pending changes first.
-    pub fn revoke(&self, me: &Me, usernames: &[&str], now: u64) -> Result<RosterUpdate, Error> {
+    /// With nobody to remove, it only replaces the key (see `needs_pq`).
+    pub fn revoke(&self, me: &Me, keyring: &Keyring, usernames: &[&str], now: u64) -> Result<RosterUpdate, Error> {
         if self.has_changes() {
             return Err(Error::PendingChanges);
         }
         let mut r = self.next_roster(me, now)?;
         r.members.retain(|m| !usernames.contains(&m.username.as_str()));
-        self.rotate(me, r)
+        self.rotate(me, keyring, r)
     }
 
-    /// A new epoch: fresh key for the members of `r`, every item re-sealed.
-    fn rotate(&self, me: &Me, mut r: Roster) -> Result<RosterUpdate, Error> {
+    /// Whether the current vault key was sealed to some current member with
+    /// X25519 alone although we now have their ML-KEM key pinned. The server
+    /// already stores that wrap, so only a new key protects what's written next.
+    pub fn needs_pq(&self, keyring: &Keyring, now: u64) -> bool {
+        self.roster.iter().flat_map(|r| &r.members).any(|m| active(m, now) && m.kem.is_none() && keyring.kem_doc(&m.username).is_some())
+    }
+
+    /// A new epoch: fresh key for the members of `r`, every item re-sealed. The
+    /// key is sealed to every `KemPub` pinned in `keyring`, which the roster lists.
+    fn rotate(&self, me: &Me, keyring: &Keyring, mut r: Roster) -> Result<RosterUpdate, Error> {
         if self.has_changes() {
             return Err(Error::PendingChanges);
+        }
+        for m in &mut r.members {
+            m.kem = keyring.kem_doc(&m.username);
         }
         r.epoch += 1;
         let vk = random_key();

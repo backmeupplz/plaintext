@@ -174,6 +174,7 @@ fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<&Me>, invi
         keyring: B64(keyring.seal(&account)),
         vault: new_vault,
         invite,
+        kem: Some(keyring.me().kem_doc()),
         setup: None,
     };
     Ok(Signup { request, account, keyring, vault })
@@ -194,6 +195,9 @@ pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup
     let key = AgentKey::generate();
     let s = new_account(&derive_agent(&key), name, Kind::Agent, Some(&owner.me()), None)?;
     owner.pin_identity(&s.request.identity)?;
+    if let Some(k) = &s.request.kem {
+        owner.pin_kem(k)?;
+    }
     owner.mark_verified(name);
     Ok((key, s))
 }
@@ -257,7 +261,8 @@ pub fn send(me: &Me, keyring: &Keyring, to: &str, content: &Content, expires: Op
     };
     let mut json = Zeroizing::new(serde_json::to_vec(&content).expect("serializable"));
     pad(&mut json);
-    let sealed = seal_to(&c.enc_pk.0, &message_ad(&id, &me.username, to), &json)?;
+    let kem = c.kem.as_ref().and_then(identity::kem_pk_of);
+    let sealed = seal_to(&c.enc_pk.0, kem.as_deref(), &message_ad(&id, &me.username, to), &json)?;
     Ok(me.sign_doc("message", &Message { id, to: to.into(), kind, expires, sealed: B64(sealed) }))
 }
 
@@ -272,7 +277,7 @@ pub fn receive(keyring: &Keyring, s: &Signed, now: u64) -> Result<(Message, Cont
         return Err(Error::Expired);
     }
     let me = keyring.me();
-    let raw = open_from(&me.enc, &message_ad(&m.id, &s.signer, &m.to), &m.sealed.0)?;
+    let raw = open_from(&me.enc, &me.kem, &message_ad(&m.id, &s.signer, &m.to), &m.sealed.0)?;
     let content = serde_json::from_slice(&raw).map_err(|_| Error::BadJson)?;
     Ok((m, content))
 }

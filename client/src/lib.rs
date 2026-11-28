@@ -374,6 +374,12 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn sync_async(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
         self.admin = acct.admin;
+        // Accounts made before post-quantum sealing publish their ML-KEM key, so
+        // others seal to it. Best effort: an older server just doesn't have it yet.
+        let kem = self.me().kem_doc();
+        if acct.kem.as_ref() != Some(&kem) {
+            drop(self.call_async::<()>("PUT", "/v1/account/kem", Some(&kem)).await);
+        }
         // Another device (or this one, restored offline) changed the keyring: fold it in.
         if Some(acct.keyring_counter) != self.keyring_counter {
             self.merge_server_keyring(&acct)?;
@@ -739,10 +745,12 @@ impl<T: AsyncTransport> Session<T> {
             .map(|m| m.username.as_str())
             .collect();
         out.extend(who.filter(|w| !out.contains(w)));
-        if out.is_empty() {
+        // Nobody to remove, but the current key was sealed to someone with X25519
+        // alone and we now have their ML-KEM key: a new key, post-quantum for all.
+        if out.is_empty() && !v.needs_pq(&self.keyring, now()) {
             return Ok(());
         }
-        let update = v.revoke(&self.me(), &out, now())?;
+        let update = v.revoke(&self.me(), &self.keyring, &out, now())?;
         self.post_roster_async(id, update).await?;
         self.pull_async(id).await
     }
@@ -990,6 +998,9 @@ impl<T: Transport> Session<T> {
         }
         let replaced = self.keyring.contacts.contains_key(username);
         self.keyring.repin_verified(&u.identity)?;
+        if let Some(k) = &u.kem {
+            drop(self.keyring.pin_kem(k));
+        }
         self.keyring_dirty = true;
         self.save_keyring()?;
         Ok(replaced)
@@ -1125,8 +1136,24 @@ impl<T: Transport> Session<T> {
         let before = self.keyring.contacts.contains_key(username);
         let id = self.keyring.pin_identity(&u.identity)?;
         self.keyring_dirty |= !before;
+        // Only one their pinned key signed; a different one than pinned is refused.
+        if let Some(k) = &u.kem {
+            self.keyring_dirty |= self.keyring.pin_kem(k)?;
+        }
         self.save_keyring()?;
         Ok(id)
+    }
+
+    /// Pin someone before sealing to them: from the directory if they're new, and
+    /// again if we don't have their ML-KEM key yet, so what we seal is post-quantum
+    /// once they published one (best effort then: their pinned keys still work).
+    fn pin_for_sealing(&mut self, username: &str) -> Result<()> {
+        if !self.keyring.contacts.contains_key(username) {
+            self.pin_user(username)?;
+        } else if self.keyring.kem_doc(username).is_none() {
+            drop(self.pin_user(username));
+        }
+        Ok(())
     }
 
     /// A user's directory entry, by exact username.
@@ -1234,9 +1261,7 @@ impl<T: Transport> Session<T> {
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
     pub fn share_vault(&mut self, id: &Hex, username: &str, role: Role, expires: Option<u64>) -> Result<()> {
-        if !self.keyring.contacts.contains_key(username) {
-            self.pin_user(username)?;
-        }
+        self.pin_for_sealing(username)?;
         // A change the server holds back (the account is full) waits; promoting
         // someone doesn't need it sent first.
         match self.sync_vault(id) {
@@ -1429,9 +1454,7 @@ impl<T: Transport> Session<T> {
 
     /// Send an item (or an access request) to one user's inbox, sealed to their pinned key.
     pub fn send(&mut self, to: &str, content: &Content, expires: Option<u64>) -> Result<()> {
-        if !self.keyring.contacts.contains_key(to) {
-            self.pin_user(to)?;
-        }
+        self.pin_for_sealing(to)?;
         let msg = plaintext_core::send(&self.me(), &self.keyring, to, content, expires)?;
         self.call("POST", "/v1/messages", Some(&msg))
     }

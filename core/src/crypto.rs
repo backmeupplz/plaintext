@@ -268,10 +268,39 @@ pub fn verify(pk: &[u8], domain: &str, msg: &[u8], sig: &[u8]) -> Result<(), Err
         .map_err(|_| Error::BadSignature)
 }
 
-/// Seal to an X25519 public key: `ephemeral_pk(32) ‖ seal(k, ad, pt)` where k comes
-/// from ECDH with a fresh ephemeral key. Anyone can seal, so authenticity comes
-/// from whatever signs or commits to the result.
-pub fn seal_to(recipient: &[u8], ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
+/// The ML-KEM-768 half of an account's encryption key.
+pub type KemKey = ml_kem::DecapsulationKey<ml_kem::MlKem768>;
+type KemPk = ml_kem::EncapsulationKey<ml_kem::MlKem768>;
+pub const KEM_PK_LEN: usize = 1184;
+const KEM_CT_LEN: usize = 1088;
+/// First byte of a hybrid sealed blob. Classical ones start with the ephemeral X25519 key.
+const PQ: u8 = 2;
+
+/// An account's ML-KEM-768 key, derived from the same random 32 bytes as its
+/// X25519 key, so accounts made before post-quantum sealing have one too.
+pub fn kem_key(enc_sk: &[u8; 32]) -> KemKey {
+    let mut seed = Zeroizing::new([0u8; 64]);
+    Hkdf::<Sha256>::new(None, enc_sk).expand(b"plaintext/v1/ml-kem", &mut seed[..]).expect("valid length");
+    KemKey::from_seed((*seed).into())
+}
+
+pub fn kem_pk(k: &KemKey) -> Vec<u8> {
+    use ml_kem::KeyExport;
+    k.encapsulation_key().to_bytes().to_vec()
+}
+
+/// A well-formed ML-KEM-768 public key.
+pub fn valid_kem_pk(pk: &[u8]) -> bool {
+    pk.try_into().ok().is_some_and(|k| KemPk::new(k).is_ok())
+}
+
+/// Seal to someone's public keys. With their ML-KEM-768 key it's hybrid:
+/// `0x02 ‖ ephemeral_pk(32) ‖ ML-KEM ciphertext(1088) ‖ seal(k, ad, pt)`, with k
+/// from X-Wing's combiner over both shared secrets, so it stays sealed unless
+/// both X25519 and ML-KEM are broken. Without it (someone whose ML-KEM key we
+/// haven't seen yet), X25519 only: `ephemeral_pk(32) ‖ seal(k, ad, pt)`. Anyone
+/// can seal, so authenticity comes from whatever signs or commits to the result.
+pub fn seal_to(recipient: &[u8], kem: Option<&[u8]>, ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
     let rpk: [u8; 32] = recipient.try_into().map_err(|_| Error::Tampered)?;
     let eph = x25519_dalek::StaticSecret::from(random::<32>());
     let epk = x25519_dalek::PublicKey::from(&eph);
@@ -279,11 +308,32 @@ pub fn seal_to(recipient: &[u8], ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error>
     if !shared.was_contributory() {
         return Err(Error::Tampered);
     }
-    let k = seal_to_key(shared.as_bytes(), epk.as_bytes(), &rpk);
-    Ok([&epk.as_bytes()[..], &seal(&k, ad, pt)].concat())
+    let Some(kem) = kem else {
+        let k = seal_to_key(shared.as_bytes(), epk.as_bytes(), &rpk);
+        return Ok([&epk.as_bytes()[..], &seal(&k, ad, pt)].concat());
+    };
+    let ek = KemPk::new(kem.try_into().map_err(|_| Error::Tampered)?).map_err(|_| Error::Tampered)?;
+    let m = Zeroizing::new(random::<32>());
+    let (ct, ss) = ek.encapsulate_deterministic(&(*m).into());
+    let k = xwing_key(&ss, shared.as_bytes(), epk.as_bytes(), &rpk);
+    Ok([&[PQ][..], epk.as_bytes(), &ct, &seal(&k, ad, pt)].concat())
 }
 
-pub fn open_from(sk: &x25519_dalek::StaticSecret, ad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+/// Opens either form `seal_to` makes. A classical blob's first byte is random,
+/// so one starting with 0x02 that doesn't open as hybrid is tried as classical.
+pub fn open_from(sk: &x25519_dalek::StaticSecret, kem: &KemKey, ad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let rpk = x25519_dalek::PublicKey::from(sk);
+    if blob.first() == Some(&PQ) && blob.len() > 1 + 32 + KEM_CT_LEN {
+        use ml_kem::Decapsulate;
+        let epk: [u8; 32] = blob[1..33].try_into().expect("32 bytes");
+        let shared = sk.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
+        let ss = kem.decapsulate_slice(&blob[33..33 + KEM_CT_LEN]).expect("ciphertext size");
+        if shared.was_contributory()
+            && let Ok(pt) = open(&xwing_key(&ss, shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[33 + KEM_CT_LEN..])
+        {
+            return Ok(pt);
+        }
+    }
     if blob.len() < 32 {
         return Err(Error::Tampered);
     }
@@ -292,7 +342,6 @@ pub fn open_from(sk: &x25519_dalek::StaticSecret, ad: &[u8], blob: &[u8]) -> Res
     if !shared.was_contributory() {
         return Err(Error::Tampered);
     }
-    let rpk = x25519_dalek::PublicKey::from(sk);
     open(&seal_to_key(shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[32..])
 }
 
@@ -301,6 +350,16 @@ fn seal_to_key(shared: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
     Hkdf::<Sha256>::new(Some(&[&epk[..], &rpk[..]].concat()), shared)
         .expand(b"plaintext/v1/seal-to", &mut k[..])
         .expect("valid length");
+    k
+}
+
+/// X-Wing's combiner (draft-connolly-cfrg-xwing-kem):
+/// SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label), then HKDF for our own domain.
+fn xwing_key(ss_m: &[u8], ss_x: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
+    use sha3::Digest as _;
+    let ss = Zeroizing::new(<[u8; 32]>::from(sha3::Sha3_256::new().chain_update(ss_m).chain_update(ss_x).chain_update(epk).chain_update(rpk).chain_update(b"\\.//^\\").finalize()));
+    let mut k = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, &ss[..]).expand(b"plaintext/v1/seal-to-pq", &mut k[..]).expect("valid length");
     k
 }
 

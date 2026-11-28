@@ -637,9 +637,9 @@ fn storage_quota() {
     alice.sync().unwrap();
     let carol = alice.pin_user("carol").unwrap();
     let take_over = |s: &mut Session<Http>| {
-        let u = s.vaults[&mine].revoke(&s.me(), &["bob"], now()).unwrap();
+        let u = s.vaults[&mine].revoke(&s.me(), &s.keyring, &["bob"], now()).unwrap();
         let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
-        r.members.push(Member { username: "carol".into(), sign_pk: carol.sign_pk.clone(), enc_pk: carol.enc_pk.clone(), role: Role::Reader, expires: None });
+        r.members.push(Member { username: "carol".into(), sign_pk: carol.sign_pk.clone(), enc_pk: carol.enc_pk.clone(), role: Role::Reader, expires: None, kem: None });
         let u = RosterUpdate { roster: s.me().sign_doc("roster", &r), ..u };
         status(s.call::<()>("POST", &format!("/v1/vaults/{mine}/roster"), Some(&u)))
     };
@@ -1358,6 +1358,7 @@ fn audit_agent_session_trusts_a_vault_the_server_made() {
         key: Some(g.keys[0].key.clone()),
         items: p.upserts.clone(),
         gone: vec![],
+        kems: vec![],
     };
     let forge = Forge { inner: Http::new(&url), id: fv.id, first, pushed: Default::default() };
 
@@ -1398,7 +1399,7 @@ struct Lookup(Http, &'static str, plaintext_core::api::Signed);
 impl Transport for Lookup {
     fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
         if method == "GET" && path == format!("/v1/users/{}", self.1) {
-            let u = UserInfo { identity: self.2.clone(), admin: true, disabled: false, invite: None };
+            let u = UserInfo { identity: self.2.clone(), admin: true, disabled: false, invite: None, kem: None };
             return Ok((200, serde_json::to_vec(&u).unwrap()));
         }
         self.0.send(method, path, token, body)
@@ -1994,4 +1995,48 @@ fn leaving_an_unlisted_vault_drops_its_unsent_changes() {
     bob.sync().unwrap();
     assert!(bob.problems.is_empty(), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
+}
+
+/// Accounts from before post-quantum sealing: the vault key went to bob with
+/// X25519 alone. Once bob publishes his ML-KEM key, alice's next sync replaces
+/// the key, sealed post-quantum to both, and neither loses anything.
+#[test]
+fn vault_keys_turn_post_quantum() {
+    let (url, path) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    // As before: nobody published an ML-KEM key, and nobody has one pinned.
+    plaintext_server::open_db(path.to_str().unwrap()).unwrap().execute("UPDATE accounts SET kem = NULL", []).unwrap();
+    alice.keyring.contacts.get_mut("bob").unwrap().kem = None;
+    bob.keyring.contacts.get_mut("alice").unwrap().kem = None;
+
+    let fam = alice.create_vault("Family").unwrap();
+    let id = plaintext_core::new_item_id();
+    alice.put_item(&fam, id, item("Netflix", "n3tfl1x")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    let keys = |min_or_max: &str| count(&path, &format!("SELECT {min_or_max}(length(key)) FROM vault_keys WHERE vault_id = x'{fam}'"));
+    assert!(keys("MIN") < 200, "bob's copy is X25519 only");
+    let epoch = count(&path, &format!("SELECT epoch FROM vaults WHERE id = x'{fam}'"));
+
+    // Bob's next sync publishes his key; alice's next sync picks it up and replaces the vault key.
+    bob.sync().unwrap();
+    assert_eq!(bob.one("Netflix", None).unwrap().2.password, "n3tfl1x");
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM accounts WHERE username = 'bob' AND kem IS NOT NULL"), 1);
+    alice.sync().unwrap();
+    assert!(alice.keyring.kem_doc("bob").is_some());
+    assert_eq!(count(&path, &format!("SELECT epoch FROM vaults WHERE id = x'{fam}'")), epoch + 1);
+    assert!(keys("MIN") > 1100, "every copy of the new key is post-quantum");
+    // Once done, it stays done.
+    alice.sync().unwrap();
+    assert_eq!(count(&path, &format!("SELECT epoch FROM vaults WHERE id = x'{fam}'")), epoch + 1);
+    bob.sync().unwrap();
+    assert_eq!(bob.one("Netflix", None).unwrap().2.password, "n3tfl1x");
+    assert!(bob.keyring.kem_doc("alice").is_some(), "bob learns alice's key from the roster she signed");
+
+    // A message to someone whose key is pinned is post-quantum too.
+    alice.send("bob", &Content::Request("hi".into()), None).unwrap();
+    assert!(count(&path, "SELECT MIN(length(signed)) FROM messages") > 1500);
+    std::fs::remove_file(&path).ok();
 }

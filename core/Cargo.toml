@@ -17,10 +17,14 @@ idna = "1"
 # The unicode-rs backend (1.1), not ICU4X (1.2+): it reuses the
 # unicode-normalization crate we already ship. Turn down Renovate's PRs that bump it.
 idna_adapter = "=1.1.0"
+# ML-KEM-768, the post-quantum half of sealing to someone (crypto::seal_to).
+ml-kem = { version = "0.3.4", default-features = false, features = ["zeroize"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 serde_json = "1"
 sha2 = "0.10"
+# SHA3-256 for the X-Wing combiner; the version ml-kem already uses.
+sha3 = { version = "0.12", default-features = false }
 unicode-normalization = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = "1"

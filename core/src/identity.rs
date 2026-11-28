@@ -20,6 +20,10 @@ pub struct Contact {
     /// Confirmed out of band: by fingerprint, QR, or an invite this account sent.
     #[serde(default)]
     pub verified: bool,
+    /// Their signed `KemPub`, checked against `sign_pk`. Once pinned, what we
+    /// seal to them is post-quantum, and it is never replaced or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<Signed>,
 }
 
 /// Sealed with the Account Key and synced, so pins follow the user to new devices.
@@ -62,6 +66,7 @@ pub struct Me {
     pub username: String,
     pub sign: SigningKey,
     pub enc: StaticSecret,
+    pub kem: KemKey,
 }
 
 impl Me {
@@ -71,8 +76,12 @@ impl Me {
     pub fn enc_pk(&self) -> B64 {
         B64(x25519_dalek::PublicKey::from(&self.enc).as_bytes().to_vec())
     }
+    /// Our signed `KemPub`. The same bytes every time (Ed25519 is deterministic).
+    pub fn kem_doc(&self) -> Signed {
+        self.sign_doc("kem", &KemPub { username: self.username.clone(), kem_pk: B64(kem_pk(&self.kem)) })
+    }
     pub fn member(&self, role: Role) -> Member {
-        Member { username: self.username.clone(), sign_pk: self.sign_pk(), enc_pk: self.enc_pk(), role, expires: None }
+        Member { username: self.username.clone(), sign_pk: self.sign_pk(), enc_pk: self.enc_pk(), role, expires: None, kem: Some(self.kem_doc()) }
     }
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.username, &self.sign_pk().0, &self.enc_pk().0)
@@ -115,7 +124,7 @@ impl Keyring {
     pub fn me(&self) -> Me {
         let s: [u8; 32] = self.sign_sk.0.as_slice().try_into().expect("32-byte key");
         let e: [u8; 32] = self.enc_sk.0.as_slice().try_into().expect("32-byte key");
-        Me { username: self.username.clone(), sign: SigningKey::from_bytes(&s), enc: StaticSecret::from(e) }
+        Me { username: self.username.clone(), sign: SigningKey::from_bytes(&s), enc: StaticSecret::from(e), kem: kem_key(&e) }
     }
 
     pub fn seal(&self, account: &crate::Account) -> Vec<u8> {
@@ -152,10 +161,39 @@ impl Keyring {
             Some(c) if c.sign_pk == *sign_pk && c.enc_pk == *enc_pk => Ok(false),
             Some(_) => Err(Error::KeyChanged(username.into())),
             None => {
-                self.contacts.insert(username.into(), Contact { sign_pk: sign_pk.clone(), enc_pk: enc_pk.clone(), verified: false });
+                self.contacts.insert(username.into(), Contact { sign_pk: sign_pk.clone(), enc_pk: enc_pk.clone(), verified: false, kem: None });
                 Ok(true)
             }
         }
+    }
+
+    /// Pin a user's signed `KemPub` next to their pinned keys. It must be signed
+    /// by the pinned identity key, so whoever relays it (the server, a roster's
+    /// owner) can't swap it; a different one than pinned is `KeyChanged`.
+    /// Nothing happens for someone not pinned yet. Returns true if it was new.
+    pub fn pin_kem(&mut self, doc: &Signed) -> Result<bool, Error> {
+        let name = doc.signer.as_str();
+        if name == self.username {
+            return if *doc == self.me().kem_doc() { Ok(false) } else { Err(Error::KeyChanged(name.into())) };
+        }
+        let Some(c) = self.contacts.get_mut(name) else { return Ok(false) };
+        let pk = check_kem(doc, &c.sign_pk.0)?;
+        match &c.kem {
+            Some(old) if kem_body(old).is_ok_and(|k| k.kem_pk.0 == pk) => Ok(false),
+            Some(_) => Err(Error::KeyChanged(name.into())),
+            None => {
+                c.kem = Some(doc.clone());
+                Ok(true)
+            }
+        }
+    }
+
+    /// The signed `KemPub` pinned for `username` (ourselves included).
+    pub fn kem_doc(&self, username: &str) -> Option<Signed> {
+        if username == self.username {
+            return Some(self.me().kem_doc());
+        }
+        self.contacts.get(username)?.kem.clone()
     }
 
     /// Check a user's self-signed identity and pin it.
@@ -173,7 +211,7 @@ impl Keyring {
         if id.username == self.username {
             return Err(Error::KeyChanged(id.username));
         }
-        self.contacts.insert(id.username.clone(), Contact { sign_pk: id.sign_pk.clone(), enc_pk: id.enc_pk.clone(), verified: true });
+        self.contacts.insert(id.username.clone(), Contact { sign_pk: id.sign_pk.clone(), enc_pk: id.enc_pk.clone(), verified: true, kem: None });
         Ok(id)
     }
 
@@ -186,6 +224,9 @@ impl Keyring {
             let mine = self.contacts.entry(name.clone()).or_insert_with(|| c.clone());
             if mine.sign_pk == c.sign_pk && mine.enc_pk == c.enc_pk {
                 mine.verified |= c.verified;
+                if mine.kem.is_none() {
+                    mine.kem.clone_from(&c.kem);
+                }
             }
         }
         for (id, s) in &other.invites {
@@ -240,6 +281,9 @@ impl Keyring {
             }
             match self.pin_identity(&u.identity) {
                 Ok(_) => {
+                    if let Some(k) = &u.kem {
+                        drop(self.pin_kem(k));
+                    }
                     self.mark_verified(&u.identity.signer);
                     self.invites.remove(&inv.id);
                     done.push(u.identity.signer.clone());
@@ -260,6 +304,25 @@ pub fn check_identity(signed: &Signed) -> Result<Identity, Error> {
         return Err(Error::BadSignature);
     }
     Ok(id)
+}
+
+fn kem_body(doc: &Signed) -> Result<KemPub, Error> {
+    serde_json::from_slice(&doc.body.0).map_err(|_| Error::BadJson)
+}
+
+/// A signed `KemPub`, checked: signed by `sign_pk` under its own name, holding a
+/// well-formed key. Returns the key.
+pub fn check_kem(doc: &Signed, sign_pk: &[u8]) -> Result<Vec<u8>, Error> {
+    let k: KemPub = verify_doc(doc, "kem", sign_pk)?;
+    if k.username != doc.signer || !valid_kem_pk(&k.kem_pk.0) {
+        return Err(Error::BadSignature);
+    }
+    Ok(k.kem_pk.0)
+}
+
+/// The ML-KEM key inside a pinned (already checked) `KemPub`.
+pub fn kem_pk_of(doc: &Signed) -> Option<Vec<u8>> {
+    kem_body(doc).ok().map(|k| k.kem_pk.0)
 }
 
 /// Who sent an invite code and their fingerprint, if the code carries them.

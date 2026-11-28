@@ -11,6 +11,8 @@ license = "MIT"
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+[profile.dev.package.ml-kem]
+opt-level = 3
 
 [profile.release]
 lto = true

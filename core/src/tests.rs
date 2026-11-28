@@ -2,6 +2,7 @@ use super::*;
 use crate::item::{Field, FileRef, Passkey, Section};
 use crate::vault::Vault;
 
+const KEM_PK_VECTOR: &str = "c75400441b34f059ac1417189b641cbc15d22f83e45a88c8ae8f6d6fadf306a0";
 const BLOB_VECTOR: &str = "01030303030303030303030303030303030303030303030303f46a2a721b55a38803873c9683da27fbe1fc928015e0d59931";
 
 #[test]
@@ -75,11 +76,48 @@ fn blob_vector() {
 fn seal_to_roundtrip() {
     let kr = Keyring::new("alice");
     let me = kr.me();
-    let blob = seal_to(&me.enc_pk().0, b"ad", b"hi").unwrap();
-    assert_eq!(&open_from(&me.enc, b"ad", &blob).unwrap()[..], b"hi");
-    assert!(open_from(&me.enc, b"other", &blob).is_err());
-    // A low-order point instead of a real key is refused.
-    assert!(seal_to(&[0u8; 32], b"ad", b"hi").is_err());
+    let kem = kem_pk(&me.kem);
+    for k in [None, Some(&kem[..])] {
+        let blob = seal_to(&me.enc_pk().0, k, b"ad", b"hi").unwrap();
+        assert_eq!(blob.len(), if k.is_some() { 1 + 32 + 1088 + 43 } else { 32 + 43 });
+        assert_eq!(&open_from(&me.enc, &me.kem, b"ad", &blob).unwrap()[..], b"hi");
+        assert!(open_from(&me.enc, &me.kem, b"other", &blob).is_err());
+        // Someone else's keys can't open it.
+        let other = Keyring::new("bob").me();
+        assert!(open_from(&other.enc, &other.kem, b"ad", &blob).is_err());
+        // A low-order point instead of a real key is refused.
+        assert!(seal_to(&[0u8; 32], k, b"ad", b"hi").is_err());
+    }
+    // A hybrid blob needs the ML-KEM key too: the right X25519 key with another
+    // ML-KEM key doesn't open it, so breaking X25519 alone isn't enough.
+    let blob = seal_to(&me.enc_pk().0, Some(&kem), b"ad", b"hi").unwrap();
+    assert!(open_from(&me.enc, &Keyring::new("bob").me().kem, b"ad", &blob).is_err());
+    // Nor does stripping the ML-KEM part turn it into a classical blob.
+    assert!(open_from(&me.enc, &me.kem, b"ad", &blob[1..]).is_err());
+    assert!(open_from(&me.enc, &me.kem, b"ad", &[&blob[..33], &blob[33 + 1088..]].concat()).is_err());
+    // A malformed ML-KEM key is refused, not sealed to.
+    assert!(seal_to(&me.enc_pk().0, Some(&kem[..100]), b"ad", b"hi").is_err());
+    assert!(!valid_kem_pk(&[0xff; KEM_PK_LEN]));
+}
+
+/// The ML-KEM key comes from the same 32 bytes as the X25519 key, so an account
+/// made before post-quantum sealing gets it without changing its keyring. Pinned
+/// so a change in derivation can't slip by: it would lock everyone out of their wraps.
+#[test]
+fn kem_key_is_derived_from_the_enc_key() {
+    let k = kem_key(&[7u8; 32]);
+    assert_eq!(kem_pk(&k), kem_pk(&kem_key(&[7u8; 32])));
+    assert_ne!(kem_pk(&k), kem_pk(&kem_key(&[8u8; 32])));
+    assert_eq!(hex::encode(sha256(&kem_pk(&k))), KEM_PK_VECTOR);
+}
+
+/// Classical blobs whose random first byte is 0x02 still open (the hybrid try fails, then X25519).
+#[test]
+fn classical_blobs_starting_like_hybrid_still_open() {
+    let me = Keyring::new("alice").me();
+    let pt = vec![5u8; 2000];
+    let blob = (0..2000).map(|_| seal_to(&me.enc_pk().0, None, b"ad", &pt).unwrap()).find(|b| b[0] == 2).expect("1 in 256");
+    assert_eq!(&open_from(&me.enc, &me.kem, b"ad", &blob).unwrap()[..], &pt[..]);
 }
 
 fn account_response(s: &Signup) -> AccountResponse {
@@ -93,6 +131,7 @@ fn account_response(s: &Signup) -> AccountResponse {
         quota: None,
         usage: 0,
         paid: vec![],
+        kem: None,
     }
 }
 
@@ -161,6 +200,7 @@ impl Log {
             key: self.keys.iter().rev().find(|k| k.username == user).map(|k| k.key.clone()),
             items: self.items.iter().map(|(id, blob)| ItemBlob { id: *id, blob: blob.clone() }).collect(),
             gone: vec![],
+            kems: vec![],
         }
     }
 }
@@ -203,7 +243,7 @@ fn sync_and_server_tampering() {
 
     // The server swaps in a vault key of its own, sealed to alice's real key.
     let mut subst = good.clone();
-    let fake = seal_to(&me.enc_pk().0, &[ad("vault-key", &[&v.id.0]), 0u64.to_be_bytes().to_vec(), b"alice".to_vec()].concat(), &[9u8; 32]).unwrap();
+    let fake = seal_to(&me.enc_pk().0, None, &[ad("vault-key", &[&v.id.0]), 0u64.to_be_bytes().to_vec(), b"alice".to_vec()].concat(), &[9u8; 32]).unwrap();
     subst.key = Some(B64(fake));
     assert_eq!(fresh(&mut a, &subst), Err(Error::Tampered));
 
@@ -226,7 +266,7 @@ fn sync_and_server_tampering() {
     log2.put(&pf);
     let mut next = Vault::new(v.id);
     next.apply(&good, &mut a, 0).unwrap();
-    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![] };
+    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![], kems: vec![] };
     assert_eq!(next.apply(&fork, &mut a, 0), Err(Error::Rollback));
 
     // Reset to its rollback guard, a device downloads the vault afresh, but neither
@@ -285,7 +325,7 @@ fn sharing_roles_and_revocation() {
     // Revocation rotates the key: bob gets no new key and can't read what follows.
     let mut v = Vault::new(v.id);
     v.apply(&log.full("alice"), &mut a, 0).unwrap();
-    let r = v.revoke(&am, &["bob"], 0).unwrap();
+    let r = v.revoke(&am, &a, &["bob"], 0).unwrap();
     log.roster(&r);
     assert!(r.keys.iter().all(|k| k.username != "bob"));
     let mut va = Vault::new(v.id);
@@ -329,7 +369,7 @@ fn concurrent_edit_keeps_conflict_copy() {
     v1.pushed(&p1);
     log.put(&p1);
     v2.put(id, login("bank", "from device 2"));
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![] };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![], kems: vec![] };
     v2.apply(&resp, &mut a, 0).unwrap();
     assert_eq!(v2.get(&id).unwrap().password, "from device 2");
     let copy = v2.items().find(|(_, i)| i.title == "bank (conflict)").unwrap().1;
@@ -417,7 +457,7 @@ fn invites_verify_both_sides() {
     let mut admin = Keyring::new("admin");
     let (_, code) = admin.new_invite();
     let (_, s) = signup("newbie", "pw", Some(&code)).unwrap();
-    let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone() };
+    let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone(), kem: s.request.kem.clone() };
     assert_eq!(admin.verify_invitees(std::slice::from_ref(&user)).0, vec!["newbie".to_string()]);
     assert!(admin.contacts["newbie"].verified && admin.invites.is_empty());
 
@@ -594,10 +634,10 @@ fn audit_new_device_stays_on_pre_revocation_epoch() {
     vb.apply(&fork.full("bob"), &mut b, 0).unwrap();
     // Alice removes bob: new epoch, new key, every item re-sealed. Her device
     // pulls the new roster, which records it in her (synced) keyring.
-    let r = v.revoke(&am, &["bob"], 0).unwrap();
+    let r = v.revoke(&am, &a, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![] };
+    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], kems: vec![] };
     v.apply(&delta, &mut a, 0).unwrap();
     // Removed bob writes on the old branch; the server serves that branch to alice's new phone.
     vb.put(new_item_id(), login("Bank", "planted-by-removed-bob"));
@@ -629,7 +669,7 @@ fn audit_server_drops_concurrent_edit_without_conflict_copy() {
     log.put(&p1);
     v2.put(id, login("bank", "stale-edit-on-device-2"));
     // Same response as concurrent_edit_keeps_conflict_copy, minus the changed item's blob.
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![] };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![], kems: vec![] };
     // Refused: the other edit would otherwise vanish instead of becoming a conflict copy.
     assert_eq!(v2.apply(&resp, &mut a, 0), Err(Error::ManifestMismatch));
 }
@@ -682,7 +722,7 @@ fn audit_expired_owner_makes_history_unverifiable() {
     let g2 = vb.grant(&bm, &b, "carol", Role::Reader, None, 50).unwrap();
     log.roster(&g2);
     v.apply(&VaultResponse { counter: log.manifests.len() as u64, rosters: vec![g2.roster.clone()], ..Default::default() }, &mut a, 60).unwrap();
-    let r = v.revoke(&am, &["bob"], 200).unwrap();
+    let r = v.revoke(&am, &a, &["bob"], 200).unwrap();
     log.roster(&r);
     let later = Vault::new(v.id).apply(&log.full("alice"), &mut a, 300);
     assert!(later.is_ok(), "a fresh device of the vault's creator after bob left: {later:?}");
@@ -704,7 +744,7 @@ fn audit_invite_proof_loses_to_server_prepin() {
     Vault::new(fv.id).apply(&log.full("admin"), &mut admin, 0).unwrap();
     // The real newbie signs up with the code; the proof checks out.
     let (_, s) = signup("newbie", "pw", Some(&code)).unwrap();
-    let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone() };
+    let user = UserInfo { identity: s.request.identity.clone(), admin: false, disabled: false, invite: s.request.invite.clone(), kem: s.request.kem.clone() };
     // Neither wins silently: the proof only shows that whoever held the code made
     // this identity, and the server chose which name it's listed under.
     let (done, conflicts) = admin.verify_invitees(&[user]);
@@ -764,11 +804,11 @@ fn audit_delayed_rotation_undoes_a_delete() {
     let mut d2 = Vault::new(v.id);
     d2.apply(&log.full("alice"), &mut a, 0).unwrap();
     // The laptop removes bob (key rotation); the server holds that back from device 2 for now.
-    let r = v.revoke(&am, &["bob"], 0).unwrap();
+    let r = v.revoke(&am, &a, &["bob"], 0).unwrap();
     log.roster(&r);
     // Device 2 deletes the item, then pulls before pushing (as sync_vault does).
     d2.delete(id);
-    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![] };
+    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![], kems: vec![] };
     d2.apply(&resp, &mut a, 0).unwrap();
     assert!(d2.get(&id).is_none() && d2.has_changes(), "delete undone by a re-seal: item back = {:?}, pending delete = {}", d2.get(&id).map(|i| &i.title), d2.has_changes());
 }
@@ -821,7 +861,7 @@ fn attachments_are_padded() {
 
 /// A pull with just this manifest and its blobs (what the server sends after `p`).
 fn delta(log: &Log, p: &VaultPut) -> VaultResponse {
-    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![] }
+    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![], kems: vec![] }
 }
 
 fn titles(v: &Vault) -> Vec<String> {
@@ -883,10 +923,10 @@ fn pending_edit_and_delete_keep_syncing_after_a_rotation() {
     adopt(&mut v, &log, &g, &mut a);
     let mut d2 = Vault::new(v.id);
     d2.apply(&log.full("alice"), &mut a, 0).unwrap();
-    let r = v.revoke(&am, &["bob"], 0).unwrap();
+    let r = v.revoke(&am, &a, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![] };
+    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], kems: vec![] };
     v.apply(&rotation, &mut a, 0).unwrap();
     d2.put(x, login("edit me", "new"));
     d2.delete(y);
@@ -939,4 +979,98 @@ fn unicode_hosts_match_their_punycode() {
     assert!(on("https://my_host.example.com", "https://my_host.example.com", true));
     assert!(on("http://１２７．０．０．１:8080", "http://127.0.0.1:8080/", true));
     assert_eq!(site::host("https://www.Bücher.de/x").as_deref(), Some("xn--bcher-kva.de"));
+}
+
+fn is_pq(w: &WrappedKey) -> bool {
+    w.key.0[0] == 2 && w.key.0.len() == 1 + 32 + 1088 + 32 + 41
+}
+
+#[test]
+fn post_quantum_vault_keys_and_the_upgrade() {
+    let (mut a, mut b) = pair();
+    let (am, bm) = (a.me(), b.me());
+    // Our own key is always sealed post-quantum.
+    let (mut v, nv) = Vault::create(&am, "Family").unwrap();
+    assert!(is_pq(&nv.keys[0]));
+    let mut log = Log::new(&nv);
+    let id = new_item_id();
+    v.put(id, login("Netflix", "n3tfl1x"));
+    let p = v.push(&am, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+
+    // Bob's ML-KEM key isn't pinned yet: X25519 only, and the roster says so.
+    let g = v.grant(&am, &a, "bob", Role::Writer, None, 0).unwrap();
+    assert!(!is_pq(&g.keys[0]));
+    log.roster(&g);
+    v.apply(&VaultResponse { counter: log.manifests.len() as u64, rosters: vec![g.roster.clone()], ..Default::default() }, &mut a, 0).unwrap();
+    assert!(!v.needs_pq(&a, 0));
+
+    // The server relays bob's signed key with the vault: pinned only if bob signed it.
+    let mut forged = Keyring::new("bob").me().kem_doc();
+    let mut resp = VaultResponse { counter: log.manifests.len() as u64, kems: vec![forged.clone()], ..Default::default() };
+    v.apply(&resp, &mut a, 0).unwrap();
+    assert!(a.kem_doc("bob").is_none());
+    assert_eq!(a.pin_kem(&forged), Err(Error::BadSignature));
+    resp.kems = vec![bm.kem_doc()];
+    assert_eq!(v.apply(&resp, &mut a, 0), Ok(true));
+    assert_eq!(a.kem_doc("bob"), Some(bm.kem_doc()));
+    assert_eq!(a.pin_kem(&bm.kem_doc()), Ok(false));
+    // Once pinned it's never swapped, even for one bob really signed.
+    forged = bm.sign_doc("kem", &KemPub { username: "bob".into(), kem_pk: B64(kem_pk(&Keyring::new("x").me().kem)) });
+    assert_eq!(a.pin_kem(&forged), Err(Error::KeyChanged("bob".into())));
+    // Nor dropped by a server keyring that lacks it, and a device without it takes it.
+    let mut server = a.clone();
+    server.contacts.get_mut("bob").unwrap().kem = None;
+    assert!(a.clone().merge_from(&server));
+    let mut a2 = server.clone();
+    a2.merge_from(&a);
+    assert_eq!(a2.kem_doc("bob"), Some(bm.kem_doc()));
+
+    // The current key was sealed to bob with X25519 alone: the owner's device replaces it.
+    assert!(v.needs_pq(&a, 0));
+    // A role change alone keeps the old key, so the roster keeps saying X25519 for bob.
+    let g2 = v.grant(&am, &a, "bob", Role::Owner, None, 0).unwrap();
+    assert!(g2.keys.is_empty());
+    log.roster(&g2);
+    v.apply(&VaultResponse { counter: log.manifests.len() as u64, rosters: vec![g2.roster.clone()], ..Default::default() }, &mut a, 0).unwrap();
+    assert!(v.needs_pq(&a, 0));
+    let r = v.revoke(&am, &a, &[], 0).unwrap();
+    assert_eq!(r.keys.len(), 2);
+    assert!(r.keys.iter().all(is_pq));
+    log.roster(&r);
+    let mut v2 = Vault::new(v.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    assert!(!v2.needs_pq(&a, 0));
+    assert_eq!(v2.get(&id).unwrap().password, "n3tfl1x");
+    // Bob opens the new key, and learns alice's ML-KEM key from the roster she signed.
+    assert!(b.kem_doc("alice").is_none());
+    let mut vb = Vault::new(v.id);
+    vb.apply(&log.full("bob"), &mut b, 0).unwrap();
+    assert_eq!(vb.get(&id).unwrap().password, "n3tfl1x");
+    assert_eq!(b.kem_doc("alice"), Some(am.kem_doc()));
+}
+
+#[test]
+fn messages_are_post_quantum_once_the_key_is_pinned() {
+    let (mut a, b) = pair();
+    let am = a.me();
+    let s = send(&am, &a, "bob", &Content::Request("hi".into()), None).unwrap();
+    let m: Message = serde_json::from_slice(&s.body.0).unwrap();
+    assert!(m.sealed.0.len() < 1088);
+    a.pin_kem(&b.me().kem_doc()).unwrap();
+    let s = send(&am, &a, "bob", &Content::Request("hi".into()), None).unwrap();
+    let m: Message = serde_json::from_slice(&s.body.0).unwrap();
+    assert!(m.sealed.0[0] == 2 && m.sealed.0.len() > 1 + 32 + 1088);
+    assert_eq!(receive(&b, &s, 0).unwrap().1, Content::Request("hi".into()));
+}
+
+/// Keyrings and rosters written before post-quantum sealing still load.
+#[test]
+fn old_contacts_and_members_without_kem_load() {
+    let c: identity::Contact = serde_json::from_str(r#"{"sign_pk":"AA==","enc_pk":"AA==","verified":true}"#).unwrap();
+    assert!(c.kem.is_none());
+    let m: Member = serde_json::from_str(r#"{"username":"bob","sign_pk":"AA==","enc_pk":"AA==","role":"reader"}"#).unwrap();
+    assert!(m.kem.is_none());
+    assert!(!serde_json::to_string(&m).unwrap().contains("kem"));
 }

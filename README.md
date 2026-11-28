@@ -1,6 +1,6 @@
 # Plaintext
 
-A self-hosted password manager for a server you don't trust. Every item is encrypted on your devices with a key derived from your password and a 128-bit Secret Key that never leaves them, so a stolen database, a curious admin or a compromised host sees only ciphertext and can't brute-force your password offline. Vaults can be shared with family, teammates and AI agents, with roles, expiry and an audit log, and the server can't swap anyone's keys to read along.
+A self-hosted password manager for a server you don't trust. Every item is encrypted on your devices with a key derived from your password and a 128-bit Secret Key that never leaves them, so a stolen database, a curious admin or a compromised host sees only ciphertext and can't brute-force your password offline. Vaults can be shared with family, teammates and AI agents, with roles, expiry and an audit log, and the server can't swap anyone's keys to read along. Vault keys and shared items are sealed with X25519 and ML-KEM-768 together, so what the server stores today stays sealed against a future quantum computer.
 
 Site: https://getplaintext.org. Status: the protocol, server, command line and MCP server work and are tested end to end; the iPhone, Mac, Android and browser apps are being built. Read [DESIGN.md](DESIGN.md) for the threat model and protocol, [UI.md](UI.md) for how the apps look and behave, and [PARITY.md](PARITY.md) for coverage of 1Password's features.
 

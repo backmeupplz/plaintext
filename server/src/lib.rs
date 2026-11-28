@@ -102,6 +102,10 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
              COMMIT;",
         )?;
     }
+    // Each account's signed ML-KEM key (`KemPub`), for post-quantum sealing.
+    if !has_col(&c, "accounts", "kem")? {
+        c.execute("ALTER TABLE accounts ADD COLUMN kem TEXT", [])?;
+    }
     // A disabled person's agents are disabled with them (databases from before that rule).
     c.execute("UPDATE accounts SET disabled = 1 WHERE disabled = 0 AND owner IN (SELECT username FROM accounts WHERE disabled = 1)", [])?;
     Ok(c)
@@ -207,6 +211,7 @@ fn app(db: Connection, cfg: Config) -> Router {
         .route("/v1/logout", post(logout))
         .route("/v1/account", get(account).delete(delete_account))
         .route("/v1/account/keyring", put(put_keyring.layer(big(BLOB_BODY))))
+        .route("/v1/account/kem", put(put_kem))
         .route("/v1/account/password", post(change_password))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", axum::routing::delete(end_session))
@@ -445,12 +450,28 @@ fn sign_pk(db: &Connection, username: &str) -> R<Vec<u8>> {
 fn max_body(domain: &str) -> usize {
     match domain {
         "identity" => 2 << 10,
-        "roster" => 512 << 10,
+        "kem" => 4 << 10,
+        // Up to 1000 members, each with a signed ML-KEM key (about 2.3 KiB).
+        "roster" => 4 << 20,
         "leave" => 256,
         "message" => MAX_BLOB / 3 * 4 + (4 << 10),
         "manifest" => MAX_MANIFEST / 3 * 4 + (4 << 10),
         _ => 0,
     }
+}
+
+/// A signed `KemPub` for `username`, signed by `sign_pk`.
+fn check_kem(doc: &Signed, username: &str, sign_pk: &[u8]) -> R<()> {
+    if doc.signer != username || doc.body.0.len() > max_body("kem") {
+        return Err((BAD, "bad ML-KEM key"));
+    }
+    plaintext_core::identity::check_kem(doc, sign_pk).map(drop).map_err(|_| (BAD, "bad ML-KEM key"))
+}
+
+/// The signed `KemPub` an account published, if any.
+fn kem_of(db: &Connection, username: &str) -> R<Option<Signed>> {
+    let s: Option<Option<String>> = db.query_row("SELECT kem FROM accounts WHERE username = ?", [username], |r| r.get(0)).optional().map_err(db_err)?;
+    s.flatten().map(|s| serde_json::from_str(&s).map_err(db_err)).transpose()
 }
 
 fn verify_signed(db: &Connection, s: &Signed, domain: &str, expected_signer: &str) -> R<()> {
@@ -511,11 +532,14 @@ fn insert_account(tx: &Transaction, req: &SignupRequest, kind: Kind, owner: Opti
     if req.identity.signer != id.username || !valid_username(&id.username) || id.kind != kind || id.owner.as_deref() != owner {
         return Err((BAD, "bad identity"));
     }
+    if let Some(k) = &req.kem {
+        check_kem(k, &id.username, &id.sign_pk.0)?;
+    }
     let (invite_id, proof) = req.invite.as_ref().map(|i| (i.id.0.to_vec(), i.proof.0.clone())).unzip();
     let inserted = tx
         .execute(
-            "INSERT OR IGNORE INTO accounts(id, username, kind, owner, identity, auth_key, account_key, keyring, admin, invite_id, invite_proof, created)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO accounts(id, username, kind, owner, identity, auth_key, account_key, keyring, admin, invite_id, invite_proof, created, kem)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 &req.account_id.0[..],
                 id.username,
@@ -528,7 +552,8 @@ fn insert_account(tx: &Transaction, req: &SignupRequest, kind: Kind, owner: Opti
                 admin,
                 invite_id,
                 proof,
-                now()
+                now(),
+                req.kem.as_ref().map(json)
             ],
         )
         .map_err(db_err)?;
@@ -624,9 +649,9 @@ async fn logout(State(db): State<Db>, h: HeaderMap) -> R<StatusCode> {
 async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap) -> R<Json<AccountResponse>> {
     let db = lock(&db);
     let c = caller(&db, &h)?;
-    let (account_key, keyring, keyring_counter) = db
-        .query_row("SELECT account_key, keyring, keyring_counter FROM accounts WHERE id = ?", [&c.id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    let (account_key, keyring, keyring_counter, kem) = db
+        .query_row("SELECT account_key, keyring, keyring_counter, kem FROM accounts WHERE id = ?", [&c.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?))
         })
         .map_err(db_err)?;
     let mut q = db
@@ -655,7 +680,17 @@ async fn account(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Con
         quota: cfg.quota,
         usage,
         paid,
+        kem: kem.and_then(|k| serde_json::from_str(&k).ok()),
     }))
+}
+
+/// Publish the caller's signed ML-KEM key, for accounts made before signup sent one.
+async fn put_kem(State(db): State<Db>, h: HeaderMap, Json(doc): Json<Signed>) -> R<StatusCode> {
+    let db = lock(&db);
+    let c = caller(&db, &h)?;
+    check_kem(&doc, &c.username, &sign_pk(&db, &c.username)?)?;
+    db.execute("UPDATE accounts SET kem = ? WHERE id = ?", params![json(&doc), c.id]).map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_keyring(State(db): State<Db>, h: HeaderMap, Json(req): Json<KeyringPut>) -> R<StatusCode> {
@@ -841,7 +876,7 @@ async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
-const USER_COLS: &str = "SELECT identity, admin, disabled, invite_id, invite_proof FROM accounts";
+const USER_COLS: &str = "SELECT identity, admin, disabled, invite_id, invite_proof, kem FROM accounts";
 
 /// The directory. On an open (hosted) server only admins see everyone; others
 /// see the people who joined with their invites, so their devices can verify them,
@@ -871,13 +906,14 @@ fn user_rows(db: &Connection, sql: &str, arg: &str) -> R<Vec<UserInfo>> {
             let id: String = r.get(0)?;
             let inv: Option<Vec<u8>> = r.get(3)?;
             let proof: Option<Vec<u8>> = r.get(4)?;
-            Ok((id, r.get(1)?, r.get(2)?, inv.zip(proof)))
+            Ok((id, r.get(1)?, r.get(2)?, inv.zip(proof), r.get::<_, Option<String>>(5)?))
         })
         .map_err(db_err)?
         .filter_map(|row| {
-            let (id, admin, disabled, inv) = row.ok()?;
+            let (id, admin, disabled, inv, kem) = row.ok()?;
             let invite = inv.and_then(|(i, p)| Some(InviteProof { id: Hex(i.try_into().ok()?), proof: B64(p) }));
-            Some(UserInfo { identity: serde_json::from_str(&id).ok()?, admin, disabled, invite })
+            let kem = kem.and_then(|k| serde_json::from_str(&k).ok());
+            Some(UserInfo { identity: serde_json::from_str(&id).ok()?, admin, disabled, invite, kem })
         })
         .collect();
     Ok(list)
@@ -1039,6 +1075,16 @@ fn store_roster(tx: &Transaction, vault: &[u8], s: &Signed, r: &Roster) -> R<()>
         if id.sign_pk != m.sign_pk || id.enc_pk != m.enc_pk {
             return Err((BAD, "a member's keys don't match their identity"));
         }
+        // Signed by the member, so one they haven't published yet (a device that
+        // hasn't synced since updating) is published with it.
+        if let Some(k) = &m.kem {
+            check_kem(k, &m.username, &m.sign_pk.0)?;
+            match kem_of(tx, &m.username)? {
+                None => drop(tx.execute("UPDATE accounts SET kem = ? WHERE username = ?", params![json(k), m.username]).map_err(db_err)?),
+                Some(had) if had != *k => return Err((BAD, "a member's ML-KEM key doesn't match the one they published")),
+                Some(_) => {}
+            }
+        }
     }
     tx.execute("INSERT INTO rosters(vault_id, version, signed) VALUES(?,?,?)", params![vault, r.version, json(s)])
         .map_err(|_| (StatusCode::CONFLICT, "roster changed, pull first"))?;
@@ -1089,7 +1135,8 @@ fn store_keys(tx: &Transaction, vault: &[u8], keys: &[WrappedKey]) -> R<()> {
     )
     .map_err(db_err)?;
     for k in keys {
-        if k.key.0.is_empty() || k.key.0.len() > 1024 {
+        // A post-quantum wrap is 1194 bytes (`crypto::seal_to`).
+        if k.key.0.is_empty() || k.key.0.len() > 1536 {
             return Err((BAD, "key size"));
         }
         let member: bool = tx
@@ -1255,15 +1302,20 @@ async fn get_vault(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Q
         .map_err(db_err)?;
     let roster: Roster = parse(&serde_json::from_str::<Signed>(&roster).map_err(db_err)?)?;
     let mut gone = Vec::new();
+    let mut kems = Vec::new();
     for m in roster.members {
         let kept: bool = db
             .query_row("SELECT COUNT(*) FROM members WHERE vault_id = ? AND username = ?", params![&vault[..], m.username], |r| r.get(0))
             .map_err(db_err)?;
         if !kept {
             gone.push(m.username);
+        } else if m.kem.is_none()
+            && let Some(k) = kem_of(&db, &m.username)?
+        {
+            kems.push(k);
         }
     }
-    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone }))
+    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone, kems }))
 }
 
 async fn put_vault(

@@ -82,6 +82,15 @@ pub struct Identity {
     pub enc_pk: B64,
 }
 
+/// A user's ML-KEM-768 public key, signed by their identity key (domain `kem`).
+/// A document of its own, not a field of `Identity`, so accounts made before it
+/// keep their identity, fingerprint, pins and pending invite proofs.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct KemPub {
+    pub username: String,
+    pub kem_pk: B64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InviteProof {
     pub id: Hex,
@@ -106,6 +115,9 @@ pub struct Member {
     pub sign_pk: B64,
     pub enc_pk: B64,
     pub role: Role,
+    /// Their signed `KemPub`, when this roster's vault key was sealed to it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<Signed>,
     /// Unix seconds; after this the member is treated as removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
@@ -178,6 +190,10 @@ pub struct VaultResponse {
     /// longer serves them; an owner's device removes them for real (new key).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gone: Vec<String>,
+    /// The signed `KemPub`s of current members the latest roster lists without
+    /// one, so an owner's device can seal the next vault key to them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kems: Vec<Signed>,
 }
 
 /// `PUT /v1/vaults/{id}`: applied only if the server is still at `expected_counter`.
@@ -247,6 +263,9 @@ pub struct SignupRequest {
     /// Humans get a personal vault at signup; agents get none.
     pub vault: Option<NewVault>,
     pub invite: Option<InviteProof>,
+    /// The new account's signed `KemPub`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<Signed>,
     /// For the first account on a server started with PLAINTEXT_SETUP_CODE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
@@ -291,6 +310,9 @@ pub struct AccountResponse {
     /// `POST /v1/vaults/{id}/leave` takes it and its agents out of any of them.
     #[serde(default)]
     pub paid: Vec<Hex>,
+    /// The signed `KemPub` the server lists for this account (`PUT /v1/account/kem`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<Signed>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -329,6 +351,9 @@ pub struct UserInfo {
     pub admin: bool,
     pub disabled: bool,
     pub invite: Option<InviteProof>,
+    /// Their signed `KemPub`, once they published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<Signed>,
 }
 
 /// `GET /v1/info`, unauthenticated: what an app needs before showing the signup form.
