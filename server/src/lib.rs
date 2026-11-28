@@ -1384,7 +1384,8 @@ async fn update_roster(
         }
         let prev: String =
             tx.query_row("SELECT signed FROM rosters WHERE vault_id = ? AND version = ?", params![&vault[..], version], |row| row.get(0)).map_err(db_err)?;
-        let prev: Roster = parse(&serde_json::from_str::<Signed>(&prev).map_err(db_err)?)?;
+        let prev_signed: Signed = serde_json::from_str(&prev).map_err(db_err)?;
+        let prev: Roster = parse(&prev_signed)?;
         let had = |name: &str| prev.members.iter().any(|m| m.username == name);
         if !r.members.iter().any(|m| m.username == c.username) {
             return Err((BAD, "to stop using a vault, leave it"));
@@ -1413,21 +1414,16 @@ async fn update_roster(
                 return Err((StatusCode::CONFLICT, "someone left the vault: remove them with a new key first"));
             }
         }
-        // Adding someone needs room for the longer roster. Other changes (a promotion,
-        // removing someone with a new key) always go through, as long as the items don't grow.
+        // Adding someone, or growing the roster by fields the server doesn't know, needs
+        // room. Other changes (a promotion, removing someone with a new key) always go
+        // through, as long as the items don't grow.
         let store = || -> R<()> {
             store_roster(&tx, &vault, &u.roster, &r)?;
             store_keys(&tx, &vault, &u.keys)
         };
-        if r.members.iter().any(|m| !had(&m.username)) {
+        if r.members.iter().any(|m| !had(&m.username)) || padding(&u.roster, &r) > padding(&prev_signed, &prev) {
             within_quota(&tx, &cfg, creator(&tx, &vault)?.as_deref(), store)?;
         } else {
-            if let Some(quota) = cfg.quota
-                && padding(&u.roster, &r) > 0
-                && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota
-            {
-                return Err(FULL);
-            }
             store()?;
         }
         if let Some(put) = &u.rotation {

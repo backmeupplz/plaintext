@@ -476,6 +476,17 @@ fn storage_quota() {
     let id = plaintext_core::new_item_id();
     alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bank", "b4nk") }).unwrap();
     alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    // A roster change carrying fields the server doesn't know (say, from a newer client).
+    let padded = |s: &mut Session<Http>, role: Role, pad: usize| {
+        let u = s.vaults[&personal].grant(&s.me(), &s.keyring, "bob", role, None, now()).unwrap();
+        let mut r: serde_json::Value = serde_json::from_slice(&u.roster.body.0).unwrap();
+        r["pad"] = "A".repeat(pad).into();
+        let u = RosterUpdate { roster: s.me().sign_doc("roster", &r), ..u };
+        let code = status(s.call::<()>("POST", &format!("/v1/vaults/{personal}/roster"), Some(&u)));
+        s.sync().unwrap();
+        code
+    };
+    assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert_eq!(acct.quota, None, "unlimited unless set");
     assert!(acct.usage > 300_000);
@@ -516,6 +527,9 @@ fn storage_quota() {
     assert_eq!(stage(&bob, &mine, st, 100_000), 200);
     assert_eq!(stage(&bob, &mine, st, 200_000), 507);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
+    // Over the quota, a roster change may keep its unknown fields but not grow them.
+    assert_eq!(padded(&mut alice, Role::Writer, 2000), 507);
+    assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
     // Over the quota, a promotion and removing someone (a new key) still work;
     // adding someone doesn't.
     alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
@@ -537,6 +551,9 @@ fn storage_quota() {
     assert!(acct.usage < 20_000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
     alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    // Under the quota, a change that adds nobody still may not grow past it.
+    assert_eq!(padded(&mut alice, Role::Reader, 200_000), 507);
+    assert_eq!(padded(&mut alice, Role::Reader, 10_000), 200);
     bob.sync().unwrap();
     assert_eq!(stage(&bob, &personal, st, 100), 403, "readers can't stage");
     // Being out of storage doesn't stop anyone deleting their account.
