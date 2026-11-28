@@ -58,6 +58,8 @@ function welcome() {
 }
 
 function locked(accounts) {
+  // Nothing from the unlocked popup (a drop's result, "Up to date.") stays under the password field.
+  say('')
   const pw = el('input', { type: 'password', id: 'pw', autocomplete: 'current-password', required: true })
   const go = el('button', { class: 'primary', type: 'submit' }, icon('lock'), 'Unlock')
   const err = el('p', { class: 'error', role: 'alert' })
@@ -310,13 +312,10 @@ async function reviewUnsent(banner, p) {
     drop.disabled = keep.disabled = true
     try {
       const n = await ask('discardChanges', { key: p.key, vault: p.unsent })
-      // Locked meanwhile: nothing to say over the lock screen (#pw is its password field).
-      if (document.getElementById('pw')) return
       box.remove()
       say(n ? `Dropped ${n} unsent change${n > 1 ? 's' : ''} to ${c.name}.` : `Nothing was left to drop in ${c.name}.`)
       refreshList()
     } catch (e) {
-      if (document.getElementById('pw')) return
       drop.disabled = keep.disabled = false
       say(explain(e), 'error')
     }

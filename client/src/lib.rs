@@ -618,7 +618,7 @@ impl<T: AsyncTransport> Session<T> {
                 if !fresh.same_head(old) {
                     // Newer: another device pushed in between. Older, or a different copy
                     // of the same version: the server is lying.
-                    return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+                    return Err(if fresh.counter > old.counter { Error::Refused("This vault changed meanwhile. Try again.".into()) } else { plaintext_core::Error::Rollback.into() });
                 }
                 // Made a writer between the two downloads: a new roster leaves the head as it was.
                 if unsendable_only && fresh.role(self.username(), now()).is_some_and(|r| r >= Role::Writer) {
