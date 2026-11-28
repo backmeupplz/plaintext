@@ -601,9 +601,10 @@ fn storage_quota() {
     let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
     let mut alice = login(&url, "alice pw", &ask);
     alice.sync().unwrap();
+    let before: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     alice.revoke(&theirs, "carol").unwrap();
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
-    assert!(acct.paid.contains(&theirs) && acct.usage > 1, "{acct:?}");
+    assert!(acct.paid.contains(&theirs) && acct.usage > before.usage, "{acct:?}");
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -1979,7 +1980,7 @@ fn paged_pulls() {
     assert!(!stuck.vaults.contains_key(&personal) && !stuck.problems.is_empty(), "{:?}", stuck.problems);
     assert!(stuck.t.later.get() <= 2);
     // A vault reset while unlisted (`discard_changes`) and listed again is pulled
-    // afresh in pages; a push midway makes it start over, and the guard still holds.
+    // afresh in pages, past its guard; a push midway makes it start over.
     let mut v = behind.vaults.remove(&personal).unwrap();
     let guard = v.counter;
     v.forget();
@@ -2007,7 +2008,7 @@ fn paged_pulls() {
     let q = format!("/v1/vaults/{personal}?since=0&latest=true&at=1");
     assert_eq!(status(alice.call::<VaultResponse>("GET", &q, NONE)), 409);
     // Cursors past what SQLite stores are refused rather than wrapped (`from=-1` would be everything).
-    for q in ["since=0&from=18446744073709551615", "since=9223372036854775808", "roster=18446744073709551615"] {
+    for q in ["since=0&from=18446744073709551615", "since=9223372036854775808", "roster=18446744073709551615", "at=9223372036854775808"] {
         assert_eq!(status(alice.call::<VaultResponse>("GET", &format!("/v1/vaults/{personal}?{q}"), NONE)), 400, "{q}");
     }
     let _ = std::fs::remove_file(&path);
