@@ -1623,7 +1623,16 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(true);
     assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Network(_))));
     bob.t.1.set(false);
+    // Made a writer between the drop's two downloads, the first still saying he
+    // may only read: a promotion leaves the head as it was, only the roster changes.
+    let pull = format!("/v1/vaults/{fam}?{}", bob.vaults[&fam].pull_query());
+    let as_reader = bob.t.0.send("GET", &pull, Some(&bob.token), None).unwrap().1;
     alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    *bob.t.2.borrow_mut() = Some((pull, as_reader));
+    let raced = bob.discard_unsendable(&fam);
+    assert!(matches!(raced, Err(Error::Refused(_))), "{raced:?}");
+    *bob.t.2.borrow_mut() = None;
+    assert_eq!(bob.vaults[&fam].changes(), 3);
     assert!(matches!(bob.discard_unsendable(&fam), Err(Error::Refused(_))));
     assert!(matches!(bob.unsendable_changes(&fam), Err(Error::Refused(_))), "the drop's pull brought the new roster");
     assert_eq!(bob.vaults[&fam].changes(), 3);

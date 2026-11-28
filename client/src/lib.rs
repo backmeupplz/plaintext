@@ -594,6 +594,10 @@ impl<T: AsyncTransport> Session<T> {
                     // of the same version: the server is lying.
                     return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
                 }
+                // Made a writer between the two downloads: a new roster leaves the head as it was.
+                if unsendable_only && fresh.role(self.username(), now()).is_some_and(|r| r >= Role::Writer) {
+                    return Err(Error::Refused(WRITER_AGAIN.into()));
+                }
                 // The next sync uploads the keyring, as after any pull.
                 self.keyring = keyring;
                 self.keyring_dirty |= changed;
