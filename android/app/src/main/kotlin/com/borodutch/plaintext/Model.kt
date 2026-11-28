@@ -85,8 +85,8 @@ sealed interface Route {
 /** The vault whose unsent changes the banner's problem ([text]) offers to drop. */
 data class Unsent(val text: String, val account: String, val vault: String)
 
-/** Changes to drop, once the person confirms. */
-data class UnsentRequest(val account: String, val vault: String, val changes: UnsentChanges)
+/** Changes to drop, once the person confirms; [warning] is the vault's sync warning when they were asked for. */
+data class UnsentRequest(val account: String, val vault: String, val changes: UnsentChanges, val warning: String?)
 
 data class Toast(val text: String, val undo: (() -> Unit)? = null, val id: Long = System.nanoTime())
 
@@ -410,6 +410,9 @@ class Model(val context: Context) {
     /** Re-read lists from Rust's in-memory copies: cheap, no network. */
     fun reload() {
         accounts = core.accounts()
+        // The dialog describes the warning it opened on: one that now reads differently
+        // (no longer shared, say) or is gone needs a new review.
+        reviewing?.let { r -> if (warning(r.account, r.vault) != r.warning) reviewing = null }
         vaults = core.vaults()
         watch = core.watchtower()
         val all = { archived: Boolean -> core.items(null, null, query, archived) }
@@ -491,12 +494,16 @@ class Model(val context: Context) {
             // Locked meanwhile: nothing opens over the lock screen, an error neither.
             try {
                 val changes = call { it.unsentChanges(u.account, u.vault) }
-                if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes)
+                if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes, warning(u.account, u.vault))
             } catch (x: Exception) {
                 if (epoch == e) show(x)
             }
         }
     }
+
+    /** The sync warning that offers to drop this vault's unsent changes, if any. */
+    private fun warning(account: String, vault: String) =
+        accounts.firstOrNull { it.id == account }?.let { a -> a.problems.zip(a.problemUnsent).firstOrNull { it.second == vault }?.first }
 
     fun discard(r: UnsentRequest) {
         reviewing = null

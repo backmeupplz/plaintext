@@ -184,7 +184,7 @@ async function offerSave(note) {
       const r = await ask('savePending', { tabId, save: yes })
       if (r?.queued) say("Saved on this device. It goes to your server at the next sync.", 'warn')
       else if (r?.saved) say('Saved to Plaintext.')
-      if (yes) render(document.getElementById('list'))
+      if (yes) refreshList()
     } catch (e) {
       say(explain(e), 'error')
     }
@@ -241,21 +241,22 @@ async function lockedAccounts(note) {
 
 function showProblems(note, problems) {
   for (const old of note.querySelectorAll('.problem')) old.remove()
-  // A review the person has open stays while its warning does.
+  // A review the person has open stays while its warning does, word for word:
+  // one that now reads differently (no longer shared, say) needs a new review.
   const open = (p) => p.unsent && note.querySelector(`.unsent${unsentSelector(p)}`)
   for (const box of note.querySelectorAll('.unsent')) {
-    if (!problems.some((p) => p.key === box.dataset.key && p.unsent === box.dataset.vault)) box.remove()
+    if (!problems.some((p) => p.key === box.dataset.key && p.unsent === box.dataset.vault && p.text === box.dataset.text)) box.remove()
   }
   note.append(...problems.filter((p) => !open(p)).map(problem))
 }
 
-const unsentSelector = (p) => `[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"]`
+const unsentSelector = (p) => `[data-key="${CSS.escape(p.key)}"][data-vault="${CSS.escape(p.unsent)}"][data-text="${CSS.escape(p.text)}"]`
 
 /** One sync problem; one about changes that can't be sent offers to show and drop them. */
 function problem(p) {
   const banner = el(
     'div',
-    { class: 'banner warn problem', role: 'alert', 'data-key': p.unsent && p.key, 'data-vault': p.unsent },
+    { class: 'banner warn problem', role: 'alert', 'data-key': p.unsent && p.key, 'data-vault': p.unsent, 'data-text': p.unsent && p.text },
     icon('triangle-alert'),
     el('span', { class: 'row-text' }, p.text),
   )
@@ -271,7 +272,8 @@ async function reviewUnsent(banner, p) {
   } catch (e) {
     return say(explain(e), 'error')
   }
-  // A sync that finished meanwhile put up a new banner for it, or none.
+  // A sync that finished meanwhile put up a new banner for it, or none, or one that
+  // reads differently (that one has its own Review…).
   if (!banner.isConnected) banner = document.querySelector(`.problem${unsentSelector(p)}`)
   if (!banner) return
   const shown = c.changed.slice(0, 8)
@@ -284,7 +286,7 @@ async function reviewUnsent(banner, p) {
   const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(problem(p)) }, 'Keep')
   const box = el(
     'div',
-    { class: 'banner unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}`, 'data-key': p.key, 'data-vault': p.unsent },
+    { class: 'banner unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}`, 'data-key': p.key, 'data-vault': p.unsent, 'data-text': p.text },
     icon('triangle-alert'),
     el(
       'div',
@@ -310,12 +312,18 @@ async function reviewUnsent(banner, p) {
       const n = await ask('discardChanges', { key: p.key, vault: p.unsent })
       box.remove()
       say(n ? `Dropped ${n} unsent change${n > 1 ? 's' : ''} to ${c.name}.` : `Nothing was left to drop in ${c.name}.`)
-      render(document.getElementById('list'))
+      refreshList()
     } catch (e) {
       drop.disabled = keep.disabled = false
       say(explain(e), 'error')
     }
   }
+}
+
+/** Re-render the item list, unless an item is open in its place. */
+function refreshList() {
+  const list = document.getElementById('list')
+  if (list) render(list)
 }
 
 let renderSeq = 0

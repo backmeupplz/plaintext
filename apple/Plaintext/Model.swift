@@ -131,12 +131,15 @@ final class AppModel: ObservableObject {
     /// How many sync problems the banner has shown (`showProblems`).
     private var problemTurn = 0
     /// Changes to drop, once the person confirms (`unsentDialog`). Held here, not
-    /// by the banner, which may go away first; a lock closes it.
+    /// by the banner, which may go away first; a lock closes it, and so does a
+    /// change to its vault's warning (`reload`).
     @Published var reviewing: UnsentRequest?
     struct UnsentRequest {
         let account: String
         let vault: String
         let changes: UnsentChanges
+        /// The vault's warning when this was asked for.
+        let warning: String?
     }
     @Published var syncing = false
     /// Hidden from lists while its delete is pending.
@@ -466,6 +469,9 @@ final class AppModel: ObservableObject {
     /// Re-read lists from Rust's in-memory copies (cheap; no network).
     func reload() {
         accounts = core.accounts()
+        // The dialog describes the warning it opened on: one that now reads differently
+        // (no longer shared, say) or is gone needs a new review.
+        if let r = reviewing, warning(account: r.account, vault: r.vault) != r.warning { reviewing = nil }
         vaults = core.vaults()
         tags = core.tags()
         watch = core.watchtower()
@@ -557,11 +563,17 @@ final class AppModel: ObservableObject {
         do {
             let changes = try await call { try $0.unsentChanges(account: account, vault: vault) }
             if lockedSince(gen) { return nil }
-            return UnsentRequest(account: account, vault: vault, changes: changes)
+            return UnsentRequest(account: account, vault: vault, changes: changes, warning: warning(account: account, vault: vault))
         } catch {
-            show(error)
+            // Locked meanwhile: no error over the lock screen either.
+            if !lockedSince(gen) { show(error) }
             return nil
         }
+    }
+
+    /// The sync warning that offers to drop this vault's unsent changes, if any.
+    private func warning(account: String, vault: String) -> String? {
+        accounts.first { $0.id == account }.flatMap { a in zip(a.problems, a.problemUnsent).first { $0.1 == vault }?.0 }
     }
 
     func discard(_ r: UnsentRequest) async {
