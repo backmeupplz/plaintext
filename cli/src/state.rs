@@ -207,7 +207,7 @@ pub fn remove_account(cfg: &Config) -> Res<()> {
         let ids = ids.map_or("their ids are unknown".into(), |ids| ids.join(", "));
         eprintln!("plaintext: the sessions of this computer's security keys ({ids}) couldn't be ended; they end on their own within 30 days, or end them from another device with `plaintext sessions --end ID`.");
     }
-    crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e}), so it's still signed in; try again"))?;
+    crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e})"))?;
     forget(cfg, true)?;
     entry(cfg, "secret-key")?.delete()?;
     let cur = a.accounts.get(a.current).map(Config::name);
