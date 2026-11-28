@@ -1,32 +1,58 @@
-# Pushing a v* tag to git.borodutch.com (`git tag -a v0.1.0 -m "Plaintext 0.1.0" && git push origin v0.1.0`; the push
-# mirror carries it to GitHub) builds the command line (`plaintext`) and the server (`plaintext-server`) for every
-# platform docs/install supports and publishes them with SHA256SUMS, which the installer checks, as the GitHub Release
-# (the installer and Homebrew download from there) and the same release on git.borodutch.com. Then:
+# Publishing a release on git.borodutch.com (`tea release create --repo backmeupplz/plaintext --tag v0.1.0 --title v0.1.0`,
+# the tag must match the version in Cargo.toml) builds the command line (`plaintext`) and the server (`plaintext-server`)
+# for every platform docs/install supports, and attaches them with SHA256SUMS and its signature SHA256SUMS.sig to that
+# release and to the same release on the GitHub mirror, where the installer and Homebrew download from. Then:
 #   Homebrew  Formula/plaintext.rb in backmeupplz/homebrew-tap on git.borodutch.com     (secret FJ_PUSH_TOKEN)
 #   Docker    ghcr.io/backmeupplz/plaintext-server:<version> and :latest, amd64 + arm64   (secret GH_MIRROR_TOKEN)
+# Pre-releases get the binaries only.
+#
+# SHA256SUMS.sig is an SSH signature (`ssh-keygen -Y sign -n plaintext-release`) by the release key, whose public half is
+# the `key=` line in docs/install and is shown on the landing page. The installer, the Homebrew job and the Docker job
+# all refuse files the key didn't sign, so replacing release assets on GitHub isn't enough to ship a binary. The private
+# key is the secret RELEASE_SIGNING_KEY and is only used by the release job, which runs in a fresh container.
 # GH_MIRROR_TOKEN is a GitHub PAT (repo, write:packages): it creates the GitHub Release, since the repo there is a
 # read-only mirror, and pushes the image to GHCR (Forgejo's own registry is turned off on git.borodutch.com).
+#
 # Linux builds are static musl binaries and Windows is the GNU target, all cross-compiled with zig; the image is the
 # Linux server binary alone on an empty base, assembled by packaging/image.sh without a Docker daemon (jobs have none).
-# Pull requests that touch the release tooling or dependencies run the build job only, so a tag is never the first
-# build (the publish jobs only run on tags). Actions are
-# pinned to commits and every downloaded tool to a checksum, so a moved tag can't change a release.
+# Pull requests that touch the release tooling or dependencies run the build job only, so a release is never the
+# first build. Actions are pinned to commits and every downloaded tool to a checksum, except rustup and the Rust
+# toolchain, which come over HTTPS from rustup's own servers.
+#
+# The Mac runners are a shared host where every job runs as the same user, so an earlier job (another repo's, or a
+# pull request's) could leave files behind that change a later build, such as a .cargo/config.toml with a
+# rustc-wrapper in a parent directory. The build job therefore clones into a new temporary directory with git's own
+# config switched off, stops if Cargo or rustup config sits in any parent of it or in $HOME, installs Rust next to it
+# and builds with an empty environment and a system-only PATH. What it can't rule out is a job that tampered with the
+# runner program itself, the node it runs actions with (upload-artifact) or anything else that user can write outside
+# /usr and /System; only a runner that nothing else uses closes that, which is why the build log prints each archive's
+# SHA-256 for comparison with SHA256SUMS. It also turns off Xcode's xcrun lookup cache (xcrun_nocache), a file in that
+# user's temp directory that could otherwise point cc at another linker, and git's attributes file.
+#
+# Other limits, written down here rather than fixed in the workflow:
+# - Forgejo gives repo secrets to workflows on any branch pushed to this repo, so RELEASE_SIGNING_KEY is as safe as the
+#   list of accounts that can push branches here (backmeupplz and our bots), not just the release job.
+# - The installer checks that a release was signed, not that it is the newest, so someone who can replace the GitHub
+#   release files could serve an older signed release as the latest one.
+# - GH_MIRROR_TOKEN can push to the GitHub mirrors, which serve docs/install through Pages and the Homebrew tap.
 name: release
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   pull_request:
-    paths: [.forgejo/workflows/release.yml, packaging/**, Cargo.lock, "**/Cargo.toml"]
+    paths: [.forgejo/workflows/release.yml, packaging/**, docs/install, Cargo.lock, "**/Cargo.toml"]
 permissions:
   contents: read
 # one release at a time (the tap is pushed, not merged, and `latest` must end on the newest), PRs on their own
-concurrency: release-${{ github.event_name == 'pull_request' && github.ref || 'tags' }}
+# (other releases, like the Android test builds, get a group of their own: it's evaluated whatever the job `if` says)
+concurrency: release-${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') && 'tags' || github.ref }}
 env:
   GH_REPO: ${{ github.repository }} # gh talks to github.com/backmeupplz/plaintext, not to the Forgejo remote
+  TAG: ${{ github.event.release.tag_name }}
 jobs:
   build:
-    # outsiders' pull requests don't get the Mac runners
-    if: github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude"]'), github.event.pull_request.user.login)
+    # only v* releases build (later jobs need this one, so they skip too); outsiders' pull requests don't get the Mac runners
+    if: (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) || contains(fromJSON('["backmeupplz","renovate","claude"]'), github.event.pull_request.user.login)
     strategy:
       matrix:
         include:
@@ -38,132 +64,175 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TARGET: ${{ matrix.target }}
+      SERVER: ${{ matrix.server }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - name: A fresh clone in a new directory, without the runner's git config
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_ATTR_NOSYSTEM: "1"
+          xcrun_nocache: "1" # /usr/bin/git on macOS is a stub that finds git through xcrun, whose cache is in the shared temp dir
+        run: |
+          src="$(mktemp -d)/src"
+          /usr/bin/git init -q "$src"
+          /usr/bin/git -C "$src" -c core.attributesFile=/dev/null fetch -q --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_REF"
+          /usr/bin/git -C "$src" -c core.attributesFile=/dev/null -c advice.detachedHead=false checkout -q FETCH_HEAD
+          [ "$(/usr/bin/git -C "$src" rev-parse HEAD)" = "$GITHUB_SHA" ] || { echo "fetched $(/usr/bin/git -C "$src" rev-parse HEAD), expected $GITHUB_SHA"; exit 1; }
+          mkdir "$(dirname "$src")/dist"
+          echo "SRC=$src" >> "$GITHUB_ENV"
+          echo "DIST=$(dirname "$src")/dist" >> "$GITHUB_ENV"
       - name: The tag matches the version in Cargo.toml
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'release'
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml says $version, the tag is $GITHUB_REF_NAME"; exit 1; }
-      - name: Rust stable, in the job's own directory (the macOS runner is a shared host, the Linux image has none)
-        run: |
-          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME="$RUNNER_TEMP/cargo" RUSTUP_HOME="$RUNNER_TEMP/rustup" \
-            sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable --target "$TARGET"
-      - name: zig and cargo-zigbuild for the Linux and Windows targets
-        if: runner.os == 'Linux'
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SRC/Cargo.toml" | head -1)
+          [ "v$version" = "$TAG" ] || { echo "Cargo.toml says $version, the tag is $TAG"; exit 1; }
+      - name: No Cargo or rustup config left behind by earlier jobs
+        run: '"$SRC/packaging/check-build-dir.sh" "$SRC"'
+      - name: Rust stable (and zig with cargo-zigbuild on Linux) next to the clone
         env:
           ZIG_URL: https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
           ZIG_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
           ZIGBUILD_URL: https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz
           ZIGBUILD_SHA256: f09b180a517af0e4dd4bffc921bb88e5ab705452a9dd948c61e489b3020c68c2
         run: |
-          curl -sSfL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
-          curl -sSfL "$ZIGBUILD_URL" -o "$RUNNER_TEMP/zigbuild.tar.xz"
-          printf '%s  %s\n' "$ZIG_SHA256" "$RUNNER_TEMP/zig.tar.xz" "$ZIGBUILD_SHA256" "$RUNNER_TEMP/zigbuild.tar.xz" | sha256sum -c
-          mkdir "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components 1
-          tar -xJf "$RUNNER_TEMP/zigbuild.tar.xz" -C "$RUNNER_TEMP/cargo/bin" --strip-components 1 \
+          tools=$(dirname "$SRC")
+          /usr/bin/curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$tools/rustup-init.sh"
+          env -i xcrun_nocache=1 HOME="$tools" PATH=/usr/bin:/bin:/usr/sbin:/sbin CARGO_HOME="$tools/cargo" RUSTUP_HOME="$tools/rustup" \
+            sh "$tools/rustup-init.sh" -y --no-modify-path --profile minimal --default-toolchain stable --target "$TARGET"
+          [ "$RUNNER_OS" = Linux ] || exit 0
+          /usr/bin/curl -sSfL "$ZIG_URL" -o "$tools/zig.tar.xz"
+          /usr/bin/curl -sSfL "$ZIGBUILD_URL" -o "$tools/zigbuild.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$tools/zig.tar.xz" "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz" | sha256sum -c
+          mkdir "$tools/zig"
+          tar -xJf "$tools/zig.tar.xz" -C "$tools/zig" --strip-components 1
+          tar -xJf "$tools/zigbuild.tar.xz" -C "$tools/cargo/bin" --strip-components 1 \
             cargo-zigbuild-x86_64-unknown-linux-musl/cargo-zigbuild
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-      - name: Build
+      - name: Build and package, with an empty environment
         run: |
+          tools=$(dirname "$SRC")
           build=build; [ "$RUNNER_OS" = Linux ] && build=zigbuild
-          packages="-p plaintext-cli"; [ "${{ matrix.server }}" = true ] && packages="$packages -p plaintext-server"
-          cargo $build --release --locked --target "$TARGET" $packages
-      - name: Package
-        run: |
-          out=target/$TARGET/release
+          packages="-p plaintext-cli"; [ "$SERVER" = true ] && packages="$packages -p plaintext-server"
+          "$SRC/packaging/check-build-dir.sh" "$SRC" # again, since a job running alongside could have planted one since
+          cd "$SRC"
+          env -i xcrun_nocache=1 HOME="$tools" PATH="$tools/cargo/bin:$tools/zig:/usr/bin:/bin:/usr/sbin:/sbin" \
+            CARGO_HOME="$tools/cargo" RUSTUP_HOME="$tools/rustup" \
+            cargo $build --release --locked --target "$TARGET" $packages
+          out="$SRC/target/$TARGET/release"
           case "$TARGET" in
             aarch64-apple-darwin | x86_64-unknown-linux-musl) "$out/plaintext" --version ;; # the ones this runner can run
           esac
-          if [ "${{ matrix.server }}" = true ]; then
+          cd "$DIST" # not the workspace, which outlives the job on the Mac runners
+          if [ "$SERVER" = true ]; then
+            chmod 755 "$out/plaintext" "$out/plaintext-server"
             tar -czf "plaintext-$TARGET.tar.gz" -C "$out" plaintext
             tar -czf "plaintext-server-$TARGET.tar.gz" -C "$out" plaintext-server
           else
-            (cd "$out" && zip -q "$GITHUB_WORKSPACE/plaintext-$TARGET.zip" plaintext.exe)
+            (cd "$out" && zip -q "$DIST/plaintext-$TARGET.zip" plaintext.exe)
           fi
-          ls -l plaintext-*
+          for f in plaintext-*; do /usr/bin/shasum -a 256 "$f" 2>/dev/null || sha256sum "$f"; done
       - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
         with:
           name: plaintext-${{ matrix.target }}
-          path: |
-            plaintext-*.tar.gz
-            plaintext-*.zip
+          path: ${{ env.DIST }}/plaintext-*
+      - name: Remove the clone, the toolchain and the build, which would otherwise stay on the Mac runners
+        if: always()
+        run: '[ -z "${SRC:-}" ] || rm -rf "$(dirname "$SRC")"'
 
-  # One job publishes the release with every file at once, so releases/latest/download/* never 404s mid-release.
+  # One job publishes every file at once, so releases/latest/download/* never 404s mid-release.
   release:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'release'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
         with:
           pattern: plaintext-*
           path: dist
           merge-multiple: true
-      - run: cd dist && sha256sum plaintext-* > SHA256SUMS && cat SHA256SUMS
-      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "" --verify-tag
+      - run: command -v ssh-keygen && command -v gh && command -v jq || { sudo apt-get update && sudo apt-get install -y openssh-client gh jq; }
+      - name: SHA256SUMS, signed with the release key
         env:
-          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-
-  forgejo:
-    needs: release
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
-      - name: The same release on git.borodutch.com
-        env:
-          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-          FJ_TOKEN: ${{ github.token }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
-          gh release download "$GITHUB_REF_NAME" -D dist
-          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
-          id=$(jq -n --arg t "$GITHUB_REF_NAME" '{tag_name: $t, name: $t, body: ""}' |
-            curl -sSf -H "Authorization: token $FJ_TOKEN" -H 'Content-Type: application/json' -d @- "$api" | jq .id)
-          for f in dist/*; do
-            curl -sSf -o /dev/null -H "Authorization: token $FJ_TOKEN" -F "attachment=@$f" "$api/$id/assets?name=$(basename "$f")"
+          (cd dist && sha256sum plaintext-* > SHA256SUMS && cat SHA256SUMS)
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          ssh-keygen -Y sign -q -f "$key" -n plaintext-release dist/SHA256SUMS
+          packaging/verify.sh dist/SHA256SUMS # the key in docs/install accepts it
+      - name: The GitHub release, which the installer and Homebrew download from
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          # the push mirror carries the tag over within seconds; wait for it rather than letting GitHub create one
+          for i in $(seq 31); do
+            gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1 && break
+            [ "$i" = 31 ] && { echo "::error::$TAG hasn't reached the GitHub mirror after 5 minutes. Sync the push mirror (repo settings on git.borodutch.com, or POST /repos/$GITHUB_REPOSITORY/push_mirrors-sync), check the tag is on github.com and that GH_MIRROR_TOKEN still works, then re-run this job."; exit 1; }
+            sleep 10
+          done
+          flags=""; [ "$PRERELEASE" = true ] && flags="--prerelease"
+          # a draft until every file is on it, and a re-run finds the release already there and replaces its files,
+          # the sums last, so the installer never sees new sums before the archives they describe
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes "" --verify-tag $flags
+          gh release upload "$TAG" dist/plaintext-* --clobber
+          gh release upload "$TAG" dist/SHA256SUMS dist/SHA256SUMS.sig --clobber
+          gh release edit "$TAG" --draft=false
+      - name: The same files on this release on git.borodutch.com
+        env:
+          FJ_TOKEN: ${{ github.token }}
+          ASSETS: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets
+        run: |
+          existing=$(curl -fsS -H "Authorization: token $FJ_TOKEN" "$ASSETS")
+          # a re-run rebuilds every archive with new hashes, so it replaces what an earlier run attached, the sums last
+          for f in dist/plaintext-* dist/SHA256SUMS dist/SHA256SUMS.sig; do
+            name=$(basename "$f")
+            for id in $(printf '%s' "$existing" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id'); do
+              curl -fsS -X DELETE -H "Authorization: token $FJ_TOKEN" "$ASSETS/$id"
+            done
+            curl -fsS -o /dev/null -H "Authorization: token $FJ_TOKEN" -F "attachment=@$f" "$ASSETS?name=$name"
           done
 
   homebrew:
     needs: release
+    if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
-      - name: Formula/plaintext.rb in backmeupplz/homebrew-tap
+      - run: command -v ssh-keygen && command -v gh || { sudo apt-get update && sudo apt-get install -y openssh-client gh; }
+      - name: Formula/plaintext.rb in backmeupplz/homebrew-tap, from the signed SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
           FJ_PUSH_TOKEN: ${{ secrets.FJ_PUSH_TOKEN }}
         run: |
-          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS
-          packaging/homebrew/formula.sh "${GITHUB_REF_NAME#v}" SHA256SUMS > plaintext.rb
+          gh release download "$TAG" -p SHA256SUMS -p SHA256SUMS.sig
+          packaging/verify.sh SHA256SUMS
+          packaging/homebrew/formula.sh "${TAG#v}" SHA256SUMS > plaintext.rb
           git clone --depth 1 "https://backmeupplz:$FJ_PUSH_TOKEN@git.borodutch.com/backmeupplz/homebrew-tap.git" tap
           mv plaintext.rb tap/Formula/plaintext.rb
           cd tap
           git add Formula/plaintext.rb
           git diff --cached --quiet && exit 0
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "plaintext ${GITHUB_REF_NAME#v}"
+            commit -m "plaintext ${TAG#v}"
           git push
 
   docker:
     needs: release
+    if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - run: command -v ssh-keygen && command -v gh || { sudo apt-get update && sudo apt-get install -y openssh-client gh; }
       - name: crane, pinned by checksum because it gets the registry token
         env:
           CRANE_URL: https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
@@ -173,11 +242,12 @@ jobs:
           echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c
           mkdir "$RUNNER_TEMP/crane" && tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
           echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
-      - name: ghcr.io/backmeupplz/plaintext-server from the release's own Linux binaries
+      - name: ghcr.io/backmeupplz/plaintext-server from the release's own signed Linux binaries
         env:
           GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
         run: |
-          gh release download "$GITHUB_REF_NAME" -p 'plaintext-server-*-linux-musl.tar.gz' -p SHA256SUMS -D dist
+          gh release download "$TAG" -p 'plaintext-server-*-linux-musl.tar.gz' -p SHA256SUMS -p SHA256SUMS.sig -D dist
+          packaging/verify.sh dist/SHA256SUMS
           (cd dist && sha256sum -c --ignore-missing SHA256SUMS)
           printf '%s' "$GH_TOKEN" | crane auth login ghcr.io -u backmeupplz --password-stdin
-          packaging/image.sh ghcr.io/backmeupplz/plaintext-server "${GITHUB_REF_NAME#v}" dist
+          packaging/image.sh ghcr.io/backmeupplz/plaintext-server "${TAG#v}" dist

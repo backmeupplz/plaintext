@@ -20,13 +20,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; the stable branch is rebuilt on top of it, so its commits get orphaned
         with:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: The landing page shows the release key docs/install checks
+        run: |
+          key=$(sed -n "s/^key='\(.*\)'$/\1/p" docs/install)
+          [ -n "$key" ] && grep -qF "$key" docs/index.html
 
   wasm:
     runs-on: ubuntu-latest
@@ -34,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; the stable branch is rebuilt on top of it, so its commits get orphaned
         with:
           toolchain: 1.99.1 # RUST in wasm/build.sh
           targets: wasm32-unknown-unknown
