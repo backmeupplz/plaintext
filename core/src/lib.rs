@@ -200,7 +200,7 @@ pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup
 
 /// `host` is `crypto::server_host` of the address the client connects to.
 pub fn login_request(d: &Derived, ts_ms: u64, device: &str, host: &str) -> LoginRequest {
-    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms, host).to_vec()), device: device.into(), ttl: None }
+    LoginRequest { account_id: Hex(d.account_id), ts: ts_ms, sig: B64(sign_login(d, ts_ms, host).to_vec()), device: device.into(), ttl: None, keys: false, trust: None }
 }
 
 /// Decrypt the Account Key and keyring. Fails on a wrong password or Secret Key.
@@ -229,6 +229,14 @@ pub fn change_password(old: &Derived, account: &Account, sk: &SecretKey, new_pas
 pub fn delete_account(d: &Derived, ts_ms: u64, host: &str) -> AccountDelete {
     use ed25519_dalek::Signer;
     AccountDelete { ts: ts_ms, sig: B64(d.auth.sign(&account_delete_message(&d.account_id, ts_ms, host)).to_bytes().to_vec()) }
+}
+
+/// `POST /v1/account/signin-keys`, signed by the login key for the server's host.
+pub fn signin_keys_change(d: &Derived, ts_ms: u64, host: &str, action: &api::SigninKeyAction) -> api::SigninKeysChange {
+    use ed25519_dalek::Signer;
+    let body = serde_json::to_vec(action).expect("serializable");
+    let sig = d.auth.sign(&crypto::signin_keys_message(&d.account_id, ts_ms, host, &body)).to_bytes().to_vec();
+    api::SigninKeysChange { ts: ts_ms, action: B64(body), sig: B64(sig) }
 }
 
 // ---------- Messages: items shared with one user, agent access requests ----------

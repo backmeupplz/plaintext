@@ -116,6 +116,7 @@ fn base32(data: &[u8]) -> String {
 // ---------- Key derivation ----------
 
 /// Everything derived from (password, Secret Key).
+#[derive(Clone)]
 pub struct Derived {
     pub account_id: Id,
     /// Account Unlock Key: wraps the Account Key.
@@ -319,6 +320,33 @@ pub fn password_change_message(account_id: &Id, ts: u64, new_auth: &[u8], new_ac
 /// can't. Names the server's host like a login, so a look-alike can't relay it.
 pub fn account_delete_message(account_id: &Id, ts: u64, host: &str) -> Vec<u8> {
     [b"plaintext/v1/account-delete".as_slice(), account_id, &ts.to_be_bytes(), host.as_bytes()].concat()
+}
+
+/// Signed by the login key to add or remove a security key for sign-in, or to
+/// replace the recovery codes, so a stolen session token (or an admin) can't.
+pub fn signin_keys_message(account_id: &Id, ts: u64, host: &str, action: &[u8]) -> Vec<u8> {
+    [b"plaintext/v1/signin-keys".as_slice(), account_id, &ts.to_be_bytes(), host.as_bytes(), &sha256(action)].concat()
+}
+
+/// The challenge a new sign-in key answers when it's added, tying the proof to that request.
+pub fn signin_key_add_challenge(account_id: &Id, ts: u64) -> [u8; 32] {
+    sha256(&[b"plaintext/v1/signin-key-add".as_slice(), account_id, &ts.to_be_bytes()].concat())
+}
+
+/// A WebAuthn relying party id: the host, without the port.
+pub fn rp_id(host: &str) -> String {
+    match host.strip_prefix('[') {
+        Some(r) => r.split(']').next().unwrap_or_default().into(),
+        None => host.split(':').next().unwrap_or_default().into(),
+    }
+}
+
+/// clientDataJSON as a browser makes it, for clients that talk CTAP themselves.
+/// `origin` is `scheme://host[:port]`.
+pub fn client_data(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
+    use base64::Engine;
+    let c = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+    serde_json::to_vec(&serde_json::json!({ "type": kind, "challenge": c, "origin": origin, "crossOrigin": false })).expect("serializable")
 }
 
 /// A server address reduced to what both sides can agree on: lowercase host and

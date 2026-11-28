@@ -262,11 +262,120 @@ pub struct LoginRequest {
     /// Seconds the session should last, at most the server's limit (30 days).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
+    /// The client can finish a sign-in with a security key (`LoginResponse::key`).
+    /// Without it, an account that needs one is refused with a message saying so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keys: bool,
+    /// This device's `LoginResponse::trust` from an earlier sign-in with a security
+    /// key: it isn't asked for one again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoginResponse {
+    /// Empty when `key` is set.
+    #[serde(default)]
     pub token: String,
+    /// The account needs a security key: finish with `POST /v1/login/finish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<KeyNeeded>,
+    /// After a sign-in with a security key or a recovery code: send it with later
+    /// logins from this device (`LoginRequest::trust`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+}
+
+// ---------- Security keys for sign-in (DESIGN "Signing in with a security key") ----------
+
+/// A login whose account needs a security key, waiting to be finished.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeyNeeded {
+    /// Finishes the sign-in. Only the client that signed the login gets it.
+    pub pending: String,
+    /// The WebAuthn challenge. Its hex names the approval page, `/v1/login/key#<hex>`.
+    pub challenge: B64,
+    pub keys: Vec<KeyCred>,
+}
+
+/// A security key's credential and the relying party (a host of the server) it was made for.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct KeyCred {
+    pub id: B64,
+    pub rp_id: String,
+}
+
+/// A WebAuthn assertion, as a browser or a CTAP client returns it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Assertion {
+    /// The credential id.
+    pub id: B64,
+    /// clientDataJSON
+    pub client_data: B64,
+    pub auth_data: B64,
+    pub signature: B64,
+}
+
+/// `POST /v1/login/finish`: an assertion, a recovery code, or neither once the
+/// approval page has taken the assertion.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoginFinish {
+    pub pending: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion: Option<Assertion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+}
+
+/// `GET /v1/login/approve/{challenge}`: what the approval page shows and asks the key for.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Approval {
+    pub username: String,
+    pub device: String,
+    pub keys: Vec<KeyCred>,
+}
+
+/// `POST /v1/account/signin-keys`, signed by the login key over
+/// `crypto::signin_keys_message`, so only the password changes them.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SigninKeysChange {
+    pub ts: u64,
+    /// A `SigninKeyAction` as JSON: the exact bytes signed.
+    pub action: B64,
+    pub sig: B64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum SigninKeyAction {
+    /// `registration` is the new credential's authenticatorData; `proof` an
+    /// assertion by it over `crypto::signin_key_add_challenge`.
+    Add { name: String, rp_id: String, registration: B64, proof: Assertion },
+    Remove { id: B64 },
+    /// New recovery codes, replacing the old ones.
+    Codes,
+}
+
+/// `GET /v1/account/signin-keys`. Any key listed means sign-in needs one.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SigninKeys {
+    pub keys: Vec<SigninKey>,
+    pub codes_left: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SigninKey {
+    pub id: B64,
+    pub name: String,
+    pub rp_id: String,
+    pub added: u64,
+}
+
+/// The answer to a `SigninKeysChange`: new recovery codes (adding the first key,
+/// or `Codes`), shown once; otherwise none.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryCodes {
+    pub codes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

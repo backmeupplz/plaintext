@@ -16,11 +16,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use plaintext_core::api::*;
-use plaintext_core::crypto::{account_delete_message, login_message, password_change_message, server_host, sha256, verify};
+use plaintext_core::crypto::{
+    account_delete_message, login_message, password_change_message, rp_id, server_host, sha256, signin_key_add_challenge, signin_keys_message, verify,
+};
 use plaintext_core::identity::valid_username;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+mod webauthn;
+#[doc(hidden)]
+pub use webauthn::soft::SoftKey;
 
 // ponytail: one connection behind a mutex; a self-hosted vault server is nowhere
 // near SQLite's single-writer limit. Pool readers if that ever changes.
@@ -119,6 +125,7 @@ fn cleanup(db: &Connection) -> rusqlite::Result<()> {
     db.execute("DELETE FROM messages WHERE expires <= ?", [t])?;
     db.execute("DELETE FROM sessions WHERE expires <= ?", [t])?;
     db.execute("DELETE FROM staged WHERE created <= ?", [t - STAGE_TTL])?;
+    db.execute("DELETE FROM pending_logins WHERE expires <= ?", [t])?;
     Ok(())
 }
 
@@ -203,7 +210,12 @@ fn app(db: Connection, cfg: Config) -> Router {
     Router::new()
         .route("/v1/signup", post(signup).layer(limits.clone()))
         .route("/v1/agents", post(create_agent))
-        .route("/v1/login", post(login).layer(limits))
+        .route("/v1/login", post(login).layer(limits.clone()))
+        .route("/v1/login/finish", post(finish_login).layer(limits.clone()))
+        .route("/v1/login/approve/{challenge}", get(approval).post(approve).layer(limits))
+        .route("/v1/login/key", get(|| async { page(include_str!("key.html"), "text/html; charset=utf-8") }))
+        .route("/v1/login/key.js", get(|| async { page(include_str!("key.js"), "text/javascript; charset=utf-8") }))
+        .route("/v1/account/signin-keys", get(signin_keys).post(change_signin_keys))
         .route("/v1/logout", post(logout))
         .route("/v1/account", get(account).delete(delete_account))
         .route("/v1/account/keyring", put(put_keyring.layer(big(BLOB_BODY))))
@@ -602,17 +614,257 @@ async fn login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Confi
     if req.ts <= last || !hosts.iter().any(|host| key.verify_strict(&login_message(&req.account_id.0, req.ts, host), &sig).is_ok()) {
         return Err(denied);
     }
-    let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(db_err)?;
-    let token = hex::encode(raw);
     db.execute("UPDATE accounts SET last_login = ? WHERE id = ?", params![req.ts, &req.account_id.0[..]]).map_err(db_err)?;
+    let id = &req.account_id.0[..];
+    let ttl = req.ttl.unwrap_or(SESSION_TTL).min(SESSION_TTL);
+    let keys = key_creds(&db, id)?;
+    let trusted = || -> R<bool> {
+        let Some(t) = &req.trust else { return Ok(false) };
+        db.query_row("SELECT COUNT(*) FROM trusted_devices WHERE token_hash = ? AND account_id = ?", params![&sha256(t.as_bytes())[..], id], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)
+            .map_err(db_err)
+    };
+    if keys.is_empty() || trusted()? {
+        return Ok(Json(LoginResponse { token: new_session(&db, id, &req.device, ttl)?, key: None, trust: None }));
+    }
+    if !req.keys {
+        return Err((StatusCode::FORBIDDEN, "this account needs a security key to sign in, which this version of Plaintext can't do: update it"));
+    }
+    // The signed login is spent (last_login); a security key, or a recovery code, finishes it.
+    let (pending, challenge) = (hex::encode(random::<32>()?), random::<32>()?);
     db.execute(
-        "INSERT INTO sessions(token_hash, account_id, device, created, expires) VALUES(?,?,?,?,?)",
-        params![&sha256(token.as_bytes())[..], &req.account_id.0[..], req.device, now(), now() + req.ttl.unwrap_or(SESSION_TTL).min(SESSION_TTL)],
+        "INSERT INTO pending_logins(pending_hash, challenge, account_id, device, ttl, expires) VALUES(?,?,?,?,?,?)",
+        params![&sha256(pending.as_bytes())[..], &challenge[..], id, req.device, ttl, now() + PENDING_TTL],
     )
     .map_err(db_err)?;
-    Ok(Json(LoginResponse { token }))
+    Ok(Json(LoginResponse { token: String::new(), key: Some(KeyNeeded { pending, challenge: B64(challenge.to_vec()), keys }), trust: None }))
 }
+
+/// How long a signed login waits for its security key, in seconds.
+const PENDING_TTL: u64 = 300;
+
+fn random<const N: usize>() -> R<[u8; N]> {
+    let mut b = [0u8; N];
+    getrandom::fill(&mut b).map_err(db_err)?;
+    Ok(b)
+}
+
+fn new_session(db: &Connection, account: &[u8], device: &str, ttl: u64) -> R<String> {
+    let token = hex::encode(random::<32>()?);
+    db.execute(
+        "INSERT INTO sessions(token_hash, account_id, device, created, expires) VALUES(?,?,?,?,?)",
+        params![&sha256(token.as_bytes())[..], account, device, now(), now() + ttl],
+    )
+    .map_err(db_err)?;
+    Ok(token)
+}
+
+/// The account's security keys for sign-in; any at all means signing in needs one.
+fn key_creds(db: &Connection, account: &[u8]) -> R<Vec<KeyCred>> {
+    db.prepare("SELECT cred_id, rp_id FROM signin_keys WHERE account_id = ? ORDER BY added")
+        .map_err(db_err)?
+        .query_map([account], |r| Ok(KeyCred { id: B64(r.get(0)?), rp_id: r.get(1)? }))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)
+}
+
+/// Checks a security key's answer to `challenge` for `account`, and moves its counter on.
+fn check_key(db: &Connection, account: &[u8], a: &Assertion, challenge: &[u8], hosts: &[String]) -> R<()> {
+    let denied = (StatusCode::UNAUTHORIZED, "that security key isn't set up for this account");
+    let (rp, cose, count): (String, Vec<u8>, u32) = db
+        .query_row("SELECT rp_id, public_key, sign_count FROM signin_keys WHERE account_id = ? AND cred_id = ?", params![account, a.id.0], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(db_err)?
+        .ok_or(denied)?;
+    let origin_ok = |o: &str| hosts.iter().any(|h| *h == server_host(o));
+    let n = webauthn::check(a, &cose, &rp, challenge, origin_ok, count).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    db.execute("UPDATE signin_keys SET sign_count = ? WHERE account_id = ? AND cred_id = ?", params![n, account, a.id.0]).map_err(db_err)?;
+    Ok(())
+}
+
+/// Recovery codes are shown as `xxxxx-xxxxx-xxxxx-xxxxx`; typed in any case, with or without the dashes.
+fn code_hash(code: &str) -> [u8; 32] {
+    sha256(code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase().as_bytes())
+}
+
+/// Finishes a login that needs a security key: with its answer (`assertion`), a
+/// recovery code, or neither once the approval page has taken the key's answer.
+/// The device gets a token that spares it the key at its next logins.
+async fn finish_login(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap, Json(req): Json<LoginFinish>) -> R<Json<LoginResponse>> {
+    let hosts = own_hosts(&cfg, &h)?;
+    let mut db = lock(&db);
+    let tx = db.transaction().map_err(db_err)?;
+    let ph = sha256(req.pending.as_bytes());
+    let (account, challenge, device, ttl, approved): (Vec<u8>, Vec<u8>, String, u64, bool) = tx
+        .query_row(
+            "SELECT p.account_id, p.challenge, p.device, p.ttl, p.approved FROM pending_logins p JOIN accounts a ON a.id = p.account_id
+             WHERE p.pending_hash = ? AND p.expires > ? AND a.disabled = 0",
+            params![&ph[..], now()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or((StatusCode::UNAUTHORIZED, "this sign-in took too long: sign in again"))?;
+    match (&req.assertion, &req.recovery) {
+        (Some(a), None) => check_key(&tx, &account, a, &challenge, &hosts)?,
+        (None, Some(code)) => {
+            let used = tx.execute("DELETE FROM recovery_codes WHERE account_id = ? AND code_hash = ?", params![account, &code_hash(code)[..]]).map_err(db_err)?;
+            if used == 0 {
+                return Err((StatusCode::UNAUTHORIZED, "that recovery code is wrong or used"));
+            }
+        }
+        (None, None) if approved => {}
+        (None, None) => return Err((StatusCode::CONFLICT, "the security key hasn't approved this sign-in yet")),
+        _ => return Err((BAD, "a security key or a recovery code, not both")),
+    }
+    tx.execute("DELETE FROM pending_logins WHERE pending_hash = ?", [&ph[..]]).map_err(db_err)?;
+    let token = new_session(&tx, &account, &device, ttl)?;
+    let trust = hex::encode(random::<32>()?);
+    tx.execute("INSERT INTO trusted_devices(token_hash, account_id, created) VALUES(?,?,?)", params![&sha256(trust.as_bytes())[..], account, now()])
+        .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(Json(LoginResponse { token, key: None, trust: Some(trust) }))
+}
+
+/// The pending login the approval page names by its challenge.
+fn pending_by_challenge(db: &Connection, challenge: &str) -> R<(Vec<u8>, Vec<u8>, String)> {
+    let c = hex::decode(challenge).map_err(|_| (BAD, "bad id"))?;
+    db.query_row(
+        "SELECT account_id, challenge, device FROM pending_logins WHERE challenge = ? AND expires > ? AND approved = 0",
+        params![c, now()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or((StatusCode::NOT_FOUND, "this sign-in is finished or took too long: sign in again"))
+}
+
+async fn approval(State(db): State<Db>, Path(challenge): Path<String>) -> R<Json<Approval>> {
+    let db = lock(&db);
+    let (account, _, device) = pending_by_challenge(&db, &challenge)?;
+    let username = db.query_row("SELECT username FROM accounts WHERE id = ?", [&account], |r| r.get(0)).map_err(db_err)?;
+    Ok(Json(Approval { username, device, keys: key_creds(&db, &account)? }))
+}
+
+/// The approval page hands over the key's answer; the app then finishes the login.
+async fn approve(State(db): State<Db>, axum::Extension(cfg): axum::Extension<Config>, h: HeaderMap, Path(challenge): Path<String>, Json(a): Json<Assertion>) -> R<StatusCode> {
+    let hosts = own_hosts(&cfg, &h)?;
+    let db = lock(&db);
+    let (account, c, _) = pending_by_challenge(&db, &challenge)?;
+    check_key(&db, &account, &a, &c, &hosts)?;
+    db.execute("UPDATE pending_logins SET approved = 1 WHERE challenge = ?", [&c]).map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The approval page: static, it asks the security key for this server's own
+/// relying party and touches nothing else (DESIGN "Signing in with a security key").
+fn page(body: &'static str, kind: &'static str) -> Response {
+    let csp = "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    ([(header::CONTENT_TYPE, kind), (header::CONTENT_SECURITY_POLICY, csp), (header::X_FRAME_OPTIONS, "DENY"), (header::REFERRER_POLICY, "no-referrer")], body).into_response()
+}
+
+async fn signin_keys(State(db): State<Db>, h: HeaderMap) -> R<Json<SigninKeys>> {
+    let db = lock(&db);
+    let c = caller(&db, &h)?;
+    let keys = db
+        .prepare("SELECT cred_id, name, rp_id, added FROM signin_keys WHERE account_id = ? ORDER BY added")
+        .map_err(db_err)?
+        .query_map([&c.id], |r| Ok(SigninKey { id: B64(r.get(0)?), name: r.get(1)?, rp_id: r.get(2)?, added: r.get(3)? }))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let codes_left = db.query_row("SELECT COUNT(*) FROM recovery_codes WHERE account_id = ?", [&c.id], |r| r.get(0)).map_err(db_err)?;
+    Ok(Json(SigninKeys { keys, codes_left }))
+}
+
+const MAX_SIGNIN_KEYS: i64 = 10;
+
+/// Adds or removes a security key for sign-in, or replaces the recovery codes.
+/// Signed by the login key, so neither a stolen session nor an admin can.
+async fn change_signin_keys(
+    State(db): State<Db>,
+    axum::Extension(cfg): axum::Extension<Config>,
+    h: HeaderMap,
+    Json(req): Json<SigninKeysChange>,
+) -> R<Json<RecoveryCodes>> {
+    let hosts = own_hosts(&cfg, &h)?;
+    let mut db = lock(&db);
+    let c = caller(&db, &h)?;
+    if !c.human {
+        return Err(DENIED);
+    }
+    let auth: Vec<u8> = db.query_row("SELECT auth_key FROM accounts WHERE id = ?", [&c.id], |r| r.get(0)).map_err(db_err)?;
+    let id: [u8; 16] = c.id.as_slice().try_into().map_err(db_err)?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&auth.try_into().map_err(db_err)?).map_err(db_err)?;
+    let sig = ed25519_dalek::Signature::from_slice(&req.sig.0).map_err(|_| (BAD, "bad signature"))?;
+    if req.ts.abs_diff(now_ms()) > LOGIN_SKEW_MS
+        || !hosts.iter().any(|host| key.verify_strict(&signin_keys_message(&id, req.ts, host, &req.action.0), &sig).is_ok())
+    {
+        return Err((StatusCode::UNAUTHORIZED, "re-enter your password"));
+    }
+    let action: SigninKeyAction = serde_json::from_slice(&req.action.0).map_err(|_| (BAD, "malformed request"))?;
+    let tx = db.transaction().map_err(db_err)?;
+    let had = tx.query_row("SELECT COUNT(*) FROM signin_keys WHERE account_id = ?", [&c.id], |r| r.get::<_, i64>(0)).map_err(db_err)?;
+    let new_codes = match action {
+        SigninKeyAction::Add { name, rp_id: rp, registration, proof } => {
+            if name.trim().is_empty() || name.len() > 64 {
+                return Err((BAD, "name the key in 1 to 64 characters"));
+            }
+            if !hosts.iter().any(|h| rp_id(h) == rp) {
+                return Err((BAD, "add the key for this server's own address"));
+            }
+            if had >= MAX_SIGNIN_KEYS {
+                return Err((StatusCode::CONFLICT, "an account can have at most 10 security keys"));
+            }
+            let (cred, cose) = webauthn::registration(&registration.0, &rp).map_err(|e| (BAD, e))?;
+            if proof.id.0 != cred {
+                return Err((BAD, "the proof is by another security key"));
+            }
+            let origin_ok = |o: &str| hosts.iter().any(|h| *h == server_host(o));
+            let count = webauthn::check(&proof, &cose, &rp, &signin_key_add_challenge(&id, req.ts), origin_ok, 0).map_err(|e| (BAD, e))?;
+            let n = tx
+                .execute(
+                    "INSERT OR IGNORE INTO signin_keys(account_id, cred_id, name, rp_id, public_key, sign_count, added) VALUES(?,?,?,?,?,?,?)",
+                    params![c.id, cred, name.trim(), rp, cose, count, now()],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err((StatusCode::CONFLICT, "that security key is already added"));
+            }
+            had == 0
+        }
+        SigninKeyAction::Remove { id: cred } => {
+            if tx.execute("DELETE FROM signin_keys WHERE account_id = ? AND cred_id = ?", params![c.id, cred.0]).map_err(db_err)? == 0 {
+                return Err((StatusCode::NOT_FOUND, "no such security key"));
+            }
+            // The last one: signing in needs no key any more, so nothing it left behind lingers.
+            if had == 1 {
+                tx.execute("DELETE FROM recovery_codes WHERE account_id = ?", [&c.id]).map_err(db_err)?;
+                tx.execute("DELETE FROM trusted_devices WHERE account_id = ?", [&c.id]).map_err(db_err)?;
+            }
+            false
+        }
+        SigninKeyAction::Codes if had == 0 => return Err((StatusCode::CONFLICT, "add a security key first")),
+        SigninKeyAction::Codes => true,
+    };
+    let mut codes = vec![];
+    if new_codes {
+        tx.execute("DELETE FROM recovery_codes WHERE account_id = ?", [&c.id]).map_err(db_err)?;
+        for _ in 0..RECOVERY_CODES {
+            let hx = hex::encode(random::<10>()?);
+            let code = (0..4).map(|i| &hx[i * 5..i * 5 + 5]).collect::<Vec<_>>().join("-");
+            tx.execute("INSERT INTO recovery_codes(account_id, code_hash) VALUES(?,?)", params![c.id, &code_hash(&code)[..]]).map_err(db_err)?;
+            codes.push(code);
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(Json(RecoveryCodes { codes }))
+}
+
+const RECOVERY_CODES: usize = 10;
 
 async fn logout(State(db): State<Db>, h: HeaderMap) -> R<StatusCode> {
     let db = lock(&db);
@@ -689,8 +941,9 @@ async fn change_password(State(db): State<Db>, h: HeaderMap, Json(req): Json<Pas
     }
     db.execute("UPDATE accounts SET auth_key = ?, account_key = ? WHERE id = ?", params![&new[..], req.account_key.0, c.id])
         .map_err(db_err)?;
-    // Every other device signs in again with the new password.
+    // Every other device signs in again with the new password, and with a security key if the account needs one.
     db.execute("DELETE FROM sessions WHERE account_id = ? AND token_hash != ?", params![c.id, c.token_hash]).map_err(db_err)?;
+    db.execute("DELETE FROM trusted_devices WHERE account_id = ?", [&c.id]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

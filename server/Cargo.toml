@@ -7,9 +7,13 @@ license.workspace = true
 [dependencies]
 plaintext-core = { path = "../core" }
 axum = "0.8"
+base64 = "0.22"
+ciborium = "0.2"
 ed25519-dalek = "2"
 getrandom = "0.3"
 hex = "0.4"
+# Security keys for sign-in (webauthn.rs): pure Rust, like the rest of the server.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

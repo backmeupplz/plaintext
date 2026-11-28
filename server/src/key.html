@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Plaintext sign-in</title>
+<style>
+  :root { color-scheme: light dark; font: 17px/1.5 system-ui, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: Canvas; color: CanvasText; }
+  main { max-width: 26rem; padding: 1.5rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 .75rem; }
+  p { margin: 0 0 1rem; }
+  button { font: inherit; padding: .6rem 1.2rem; border-radius: .5rem; border: 0; background: #2f6fde; color: white; cursor: pointer; }
+  button[hidden] { display: none; }
+  .muted { opacity: .7; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sign in with your security key</h1>
+  <p id="what">Loading…</p>
+  <p><button id="go" hidden>Use my security key</button></p>
+  <p id="note" class="muted">Only continue if you just started signing in to Plaintext yourself. Nothing secret reaches this page: it only asks your key to approve the sign-in.</p>
+</main>
+<script src="key.js"></script>
+</body>
+</html>

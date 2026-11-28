@@ -1995,3 +1995,101 @@ fn leaving_an_unlisted_vault_drops_its_unsent_changes() {
     assert!(bob.problems.is_empty(), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
 }
+
+/// DESIGN "Signing in with a security key": a key, the approval page, recovery
+/// codes and trusted devices, over real HTTP with a software key.
+#[test]
+fn security_key_for_sign_in() {
+    use plaintext_core::crypto::{rp_id, signin_key_add_challenge};
+    let (url, path) = server();
+    let (sk, alice) = join(Http::new(&url), "alice", "pw-a", Some("first-run-code"), "laptop");
+    let d = derive("pw-a", &sk);
+    let host = Http::new(&url).host();
+    let rp = rp_id(&host);
+    let mut key = plaintext_server::SoftKey::new();
+    let add = |key: &mut plaintext_server::SoftKey, d: &Derived, name: &str| {
+        let ts = now_ms();
+        let proof = key.assert(&rp, &signin_key_add_challenge(&d.account_id, ts), &url);
+        alice.change_signin_keys(d, ts, &SigninKeyAction::Add { name: name.into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof })
+    };
+    // Only the password adds a key, and the proof must be by the key added.
+    assert_eq!(status(add(&mut key, &derive("wrong", &sk), "blue")), 401);
+    let ts = now_ms();
+    let other = plaintext_server::SoftKey::new().assert(&rp, &signin_key_add_challenge(&d.account_id, ts), &url);
+    let bad = SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof: other };
+    assert_eq!(status(alice.change_signin_keys(&d, ts, &bad)), 400);
+    let codes = add(&mut key, &d, "blue").unwrap();
+    assert_eq!(codes.len(), 10);
+    assert_eq!(status(add(&mut key, &d, "blue again")), 409);
+    let listed = alice.signin_keys().unwrap();
+    assert_eq!((listed.keys.len(), listed.codes_left, listed.keys[0].name.as_str()), (1, 10, "blue"));
+
+    // Apps that can't do keys are told so; new ones get a pending sign-in.
+    assert_eq!(status(Session::login(Http::new(&url), &d, "old app")), 403);
+    let pending = |device: &str, trust: Option<&str>| match Session::sign_in(Http::new(&url), &d, device, trust).unwrap() {
+        SignIn::Key(p) => p,
+        SignIn::Done(_) => panic!("signed in without the key"),
+    };
+    let mut p = pending("phone", None);
+    assert_eq!(p.needed.keys, vec![KeyCred { id: B64(key.id.clone()), rp_id: rp.clone() }]);
+    assert_eq!(p.rp_id(), rp);
+    assert_eq!(status(p.finish(None, None)), 409);
+    let wrong_challenge = key.assert(&rp, b"another challenge", &url);
+    assert_eq!(status(p.finish(Some(wrong_challenge), None)), 401);
+    let elsewhere = key.assert(&rp, &p.needed.challenge.0, "https://evil.example");
+    assert_eq!(status(p.finish(Some(elsewhere), None)), 401);
+    let a = key.assert(&rp, &p.needed.challenge.0, &url);
+    let (s, trust) = p.finish(Some(a), None).unwrap();
+    assert_eq!(s.username(), "alice");
+    assert!(p.finish(None, None).is_err(), "finished once");
+    // A replayed answer doesn't finish another sign-in.
+    let mut p2 = pending("phone", None);
+    let old = key.assert(&rp, &p2.needed.challenge.0, &url);
+    key.count -= 1;
+    let again = key.assert(&rp, &p2.needed.challenge.0, &url);
+    p2.finish(Some(old), None).unwrap();
+    let mut p3 = pending("phone", None);
+    assert_eq!(status(p3.finish(Some(again), None)), 401);
+
+    // The device that used the key isn't asked again; another one is.
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap(), SignIn::Done(_)));
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some("made-up")).unwrap(), SignIn::Key(_)));
+
+    // The approval page takes the key's answer, then the app finishes.
+    let t = Http::new(&url);
+    let page = t.send("GET", "/v1/login/key", None, None).unwrap();
+    assert!(page.0 == 200 && String::from_utf8_lossy(&page.1).contains("key.js"));
+    let mut p = pending("extension", None);
+    let c = hex::encode(&p.needed.challenge.0);
+    let (code, body) = t.send("GET", &format!("/v1/login/approve/{c}"), None, None).unwrap();
+    let approval: Approval = serde_json::from_slice(&body).unwrap();
+    assert_eq!((code, approval.username.as_str(), approval.device.as_str()), (200, "alice", "extension"));
+    let a = serde_json::to_vec(&key.assert(&rp, &p.needed.challenge.0, &url)).unwrap();
+    assert_eq!(t.send("POST", &format!("/v1/login/approve/{c}"), None, Some(a.clone())).unwrap().0, 204);
+    assert_eq!(t.send("POST", &format!("/v1/login/approve/{c}"), None, Some(a)).unwrap().0, 404, "approved once");
+    assert!(p.page().ends_with(&c));
+    p.finish(None, None).unwrap();
+
+    // A recovery code works once.
+    let mut p = pending("borrowed", None);
+    assert_eq!(status(p.finish(None, Some("00000-00000-00000-00000"))), 401);
+    p.finish(None, Some(&codes[0].to_uppercase().replace('-', " "))).unwrap();
+    assert_eq!(status(pending("borrowed", None).finish(None, Some(&codes[0]))), 401);
+    assert_eq!(alice.signin_keys().unwrap().codes_left, 9);
+    let fresh = alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Codes).unwrap();
+    assert_eq!(status(pending("borrowed", None).finish(None, Some(&codes[1]))), 401, "replaced");
+    pending("borrowed", None).finish(None, Some(&fresh[0])).unwrap();
+
+    // A new password: every device needs the key again.
+    alice.change_password(&d, &sk, "pw-b").unwrap();
+    let d = derive("pw-b", &sk);
+    let SignIn::Key(mut p) = Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() else { panic!("still trusted") };
+    let (alice, _) = p.finish(Some(key.assert(&rp, &p.needed.challenge.0, &url)), None).unwrap();
+
+    // Removing the last key turns it off.
+    assert_eq!(status(alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Remove { id: B64(vec![1]) })), 404);
+    assert!(alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Remove { id: B64(key.id.clone()) }).unwrap().is_empty());
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", None).unwrap(), SignIn::Done(_)));
+    assert_eq!(alice.signin_keys().unwrap().codes_left, 0);
+    let _ = std::fs::remove_file(&path);
+}

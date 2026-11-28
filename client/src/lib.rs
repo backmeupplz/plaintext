@@ -252,6 +252,60 @@ fn find<'a>(name: &str, vaults: impl Iterator<Item = (&'a Hex, &'a Vault)> + Clo
     }
 }
 
+/// The outcome of `Session::sign_in_async`.
+pub enum SignIn<T: AsyncTransport> {
+    Done(Session<T>),
+    /// The account needs a security key (DESIGN "Signing in with a security key").
+    Key(Pending<T>),
+}
+
+/// A signed login waiting a few minutes for the account's security key: its
+/// answer, a recovery code, or the approval page (`page`) finishes it.
+pub struct Pending<T: AsyncTransport> {
+    t: Option<T>,
+    d: Derived,
+    pub needed: KeyNeeded,
+}
+
+impl<T: AsyncTransport> Pending<T> {
+    /// Where the approval page is, after the server's address, for apps that
+    /// can't talk to the key themselves: it asks the key in the browser.
+    pub fn page(&self) -> String {
+        format!("/v1/login/key#{}", hex::encode(&self.needed.challenge.0))
+    }
+
+    /// The key's relying party: this server's host as the user typed it, never
+    /// what the server says, so a look-alike can't ask for the real server's answer.
+    pub fn rp_id(&self) -> String {
+        self.t.as_ref().map(|t| plaintext_core::crypto::rp_id(&t.login_host())).unwrap_or_default()
+    }
+
+    /// Finish with the key's `assertion`, a `recovery` code, or neither once the
+    /// approval page has the key's answer (until then this fails with 409, and
+    /// can be tried again). Also returns the token that spares this device the
+    /// key at later sign-ins (`Session::sign_in_async`'s `trust`): keep it.
+    pub async fn finish_async(&mut self, assertion: Option<Assertion>, recovery: Option<&str>) -> Result<(Session<T>, String)> {
+        let t = self.t.take().ok_or_else(|| Error::Refused("this sign-in is finished already".into()))?;
+        let req = LoginFinish { pending: self.needed.pending.clone(), assertion, recovery: recovery.map(String::from) };
+        match call_async::<_, LoginResponse>(&t, "POST", "/v1/login/finish", None, Some(&req)).await {
+            Ok(resp) => {
+                let trust = resp.trust.unwrap_or_default();
+                Ok((Session::open_async(t, &self.d, resp.token).await?, trust))
+            }
+            Err(e) => {
+                self.t = Some(t);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl<T: Transport> Pending<T> {
+    pub fn finish(&mut self, assertion: Option<Assertion>, recovery: Option<&str>) -> Result<(Session<T>, String)> {
+        block_on(self.finish_async(assertion, recovery))
+    }
+}
+
 /// A signed-in, unlocked account.
 pub struct Session<T: AsyncTransport> {
     pub t: T,
@@ -320,9 +374,29 @@ impl std::fmt::Display for Problem {
 /// everything else uses the blocking methods below, which run the same code.
 impl<T: AsyncTransport> Session<T> {
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
+    /// An account that needs a security key is refused: people's apps use `sign_in_async`.
     pub async fn login_async(t: T, d: &Derived, device: &str) -> Result<Self> {
         let req = plaintext_core::login_request(d, now_ms(), device, &t.login_host());
         let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
+        Self::open_async(t, d, resp.token).await
+    }
+
+    /// Sign in with (password, Secret Key). If the account needs a security key
+    /// and `trust` (this device's token from an earlier such sign-in) doesn't
+    /// spare it, a `Pending` sign-in comes back for the key to finish.
+    pub async fn sign_in_async(t: T, d: &Derived, device: &str, trust: Option<&str>) -> Result<SignIn<T>> {
+        let mut req = plaintext_core::login_request(d, now_ms(), device, &t.login_host());
+        req.keys = true;
+        req.trust = trust.map(String::from);
+        let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
+        match resp.key {
+            Some(needed) => Ok(SignIn::Key(Pending { t: Some(t), d: d.clone(), needed })),
+            None => Ok(SignIn::Done(Self::open_async(t, d, resp.token).await?)),
+        }
+    }
+
+    async fn open_async(t: T, d: &Derived, token: String) -> Result<Self> {
+        let resp = LoginResponse { token, key: None, trust: None };
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&resp.token), NONE).await?;
         let (account, keyring) = plaintext_core::unlock(d, &acct)?;
         Ok(Session {
@@ -998,6 +1072,23 @@ impl<T: Transport> Session<T> {
     /// Sign in with keys derived from (password, Secret Key) or an agent key.
     pub fn login(t: T, d: &Derived, device: &str) -> Result<Self> {
         block_on(Self::login_async(t, d, device))
+    }
+
+    pub fn sign_in(t: T, d: &Derived, device: &str, trust: Option<&str>) -> Result<SignIn<T>> {
+        block_on(Self::sign_in_async(t, d, device, trust))
+    }
+
+    /// The account's security keys for sign-in (any at all means signing in needs one).
+    pub fn signin_keys(&self) -> Result<SigninKeys> {
+        self.call("GET", "/v1/account/signin-keys", NONE)
+    }
+
+    /// Add or remove a security key for sign-in, or replace the recovery codes:
+    /// signed by the login key, so the password is needed. Returns new recovery
+    /// codes (adding the first key, or `Codes`) to show once.
+    pub fn change_signin_keys(&self, d: &Derived, ts: u64, action: &SigninKeyAction) -> Result<Vec<String>> {
+        let req = plaintext_core::signin_keys_change(d, ts, &self.t.host(), action);
+        Ok(self.call::<RecoveryCodes>("POST", "/v1/account/signin-keys", Some(&req))?.codes)
     }
 
     /// Pick up a stored session (token + Account Key, e.g. from the OS keychain)

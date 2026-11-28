@@ -4,8 +4,11 @@
 //! new device, and the server learns nothing secret from it.
 
 use plaintext_client::plaintext_core::Account;
-use plaintext_client::plaintext_core::crypto::{Derived, Id, derive, open_for_security_key, random, seal_for_security_key};
-use plaintext_client::{Error, Session, Transport, now};
+use plaintext_client::plaintext_core::api::{Assertion, B64, SigninKeyAction};
+use plaintext_client::plaintext_core::crypto::{
+    Derived, Id, client_data, derive, open_for_security_key, random, rp_id, seal_for_security_key, server_host, signin_key_add_challenge,
+};
+use plaintext_client::{Error, Session, SignIn, Transport, now, now_ms};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -66,6 +69,14 @@ pub trait Authenticator {
     /// The output without the PIN (a touch), or None if the key refuses to
     /// give one without it (alwaysUv).
     fn secret_without_pin(&mut self, cred: &[u8], salt: &[u8; 32]) -> Res<Option<Zeroizing<[u8; 32]>>>;
+
+    /// For signing in (DESIGN "Signing in with a security key"): a new credential
+    /// for `rp`, answering `client_data` (a touch, and the PIN if the key has one,
+    /// which making a credential needs). Its authenticatorData.
+    fn register(&mut self, rp: &str, client_data: &[u8], pin: Option<&str>) -> Res<Vec<u8>>;
+    /// An answer to `client_data` by whichever of `creds` the key holds (a touch,
+    /// no PIN): the credential id, authenticatorData and signature.
+    fn assert(&mut self, rp: &str, creds: &[Vec<u8>], client_data: &[u8]) -> Res<(Vec<u8>, Vec<u8>, Vec<u8>)>;
 }
 
 pub fn load(cfg: &Config) -> Res<Keys> {
@@ -97,7 +108,7 @@ fn password(cfg: &Config, ask: Ask) -> Res<Derived> {
 /// A session of its own for a key's sealed copy, named after the key in
 /// `plaintext sessions`.
 fn login(cfg: &Config, d: &Derived, name: &str) -> Res<(S, String)> {
-    let s = Session::login(state::http(&cfg.server)?, d, &format!("{} (security key: {name})", state::device()))?;
+    let s = sign_in(cfg, d, &format!("{} (security key: {name})", state::device()), &mut Hid::default(), &mut |m: &str| state::prompt(m))?;
     match s.sessions().map(|l| l.into_iter().find(|x| x.current).map(|x| x.id)) {
         Ok(Some(id)) => Ok((s, id)),
         r => {
@@ -203,6 +214,89 @@ pub fn remove(cfg: &Config, name: &str) -> Res<Enrolled> {
     Ok(e)
 }
 
+// ---------- Signing in (DESIGN "Signing in with a security key") ----------
+
+/// The origin a browser on this server's address would report, for clientDataJSON.
+fn origin(cfg: &Config) -> String {
+    let scheme = cfg.server.split_once("://").map_or("https".into(), |(s, _)| s.to_ascii_lowercase());
+    format!("{scheme}://{}", server_host(&cfg.server))
+}
+
+/// Sign in with the password. If the account needs a security key and this
+/// computer isn't trusted yet, the key plugged in answers (a touch); failing
+/// that, the approval page in a browser or a recovery code. The computer is
+/// then trusted, so it isn't asked again.
+pub fn sign_in(cfg: &Config, d: &Derived, device: &str, auth: &mut dyn Authenticator, ask: Ask) -> Res<S> {
+    let trust = state::entry(cfg, "trust")?.find().unwrap_or_default();
+    let mut p = match Session::sign_in(state::http(&cfg.server)?, d, device, trust.as_deref())? {
+        SignIn::Done(s) => return Ok(s),
+        SignIn::Key(p) => p,
+    };
+    let rp = p.rp_id();
+    let creds: Vec<Vec<u8>> = p.needed.keys.iter().filter(|k| k.rp_id == rp).map(|k| k.id.0.clone()).collect();
+    eprintln!("{} needs a security key to sign in on this computer. Touch it.", cfg.name());
+    let cd = client_data("webauthn.get", &p.needed.challenge.0, &origin(cfg));
+    let answer = match creds.is_empty() {
+        true => Err(format!("none of this account's security keys was added for {rp}").into()),
+        false => auth.assert(&rp, &creds, &cd),
+    };
+    let done = match answer {
+        Ok((id, auth_data, signature)) => p.finish(Some(Assertion { id: B64(id), client_data: B64(cd), auth_data: B64(auth_data), signature: B64(signature) }), None)?,
+        Err(e) => {
+            eprintln!("plaintext: {}", crate::clean(&e.to_string()));
+            let page = format!("{}{}", cfg.server, p.page());
+            let mut tries = 0;
+            loop {
+                let a = ask(&format!("Approve the sign-in at {page} with your security key and press Enter, or type a recovery code: "))?;
+                let code = Some(a.trim()).filter(|c| !c.is_empty());
+                match p.finish(None, code) {
+                    Err(Error::Server(409 | 401, m)) if tries < 4 && !m.contains("too long") => {
+                        tries += 1;
+                        eprintln!("plaintext: {}", crate::clean(&m));
+                    }
+                    r => break r?,
+                }
+            }
+        }
+    };
+    let (s, trust) = done;
+    if let Err(e) = state::entry(cfg, "trust").and_then(|e| e.set(&trust)) {
+        eprintln!("plaintext: couldn't remember that this computer signed in with a security key ({e}); it'll be asked for one again next time");
+    }
+    Ok(s)
+}
+
+/// Make the plugged-in key one that signing in to this account needs (on top of
+/// the password): its PIN if it has one, and two touches. Returns new recovery
+/// codes when it's the first.
+pub fn add_for_sign_in(cfg: &Config, s: &S, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> Res<Vec<String>> {
+    let d = password(cfg, ask)?;
+    let rp = rp_id(&server_host(&cfg.server));
+    let pin = if auth.has_pin()? { Some(ask("Security key PIN: ")?) } else { None };
+    eprintln!("Touch your security key to add it.");
+    let registration = auth.register(&rp, &client_data("webauthn.create", &random::<32>(), &origin(cfg)), pin.as_deref().map(|p| p.as_str()))?;
+    let ts = now_ms();
+    let cd = client_data("webauthn.get", &signin_key_add_challenge(&d.account_id, ts), &origin(cfg));
+    eprintln!("Touch it once more, to check it.");
+    // Only the new credential: the key answers with it, which proves it holds it.
+    let cred = cred_id(&registration).ok_or("the security key's answer is malformed")?;
+    let (id, auth_data, signature) = auth.assert(&rp, &[cred], &cd)?;
+    let proof = Assertion { id: B64(id), client_data: B64(cd), auth_data: B64(auth_data), signature: B64(signature) };
+    Ok(s.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: name.into(), rp_id: rp, registration: B64(registration), proof })?)
+}
+
+/// The credential id in a new credential's authenticatorData.
+fn cred_id(a: &[u8]) -> Option<Vec<u8>> {
+    let n = u16::from_be_bytes([*a.get(53)?, *a.get(54)?]) as usize;
+    a.get(55..55 + n).map(<[u8]>::to_vec)
+}
+
+/// Stop a key being needed to sign in (the last one: none is needed any more),
+/// or replace the recovery codes. Both need the password.
+pub fn change_sign_in(cfg: &Config, s: &S, action: SigninKeyAction, ask: Ask) -> Res<Vec<String>> {
+    Ok(s.change_signin_keys(&password(cfg, ask)?, now_ms(), &action)?)
+}
+
 /// A USB security key, through `ctap-hid-fido2`. Builds without it (the static
 /// Linux release, Windows) say so instead.
 #[derive(Default)]
@@ -223,6 +317,12 @@ impl Authenticator for Hid {
         Err(UNSUPPORTED.into())
     }
     fn secret_without_pin(&mut self, _: &[u8], _: &[u8; 32]) -> Res<Option<Zeroizing<[u8; 32]>>> {
+        Err(UNSUPPORTED.into())
+    }
+    fn register(&mut self, _: &str, _: &[u8], _: Option<&str>) -> Res<Vec<u8>> {
+        Err(UNSUPPORTED.into())
+    }
+    fn assert(&mut self, _: &str, _: &[Vec<u8>], _: &[u8]) -> Res<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         Err(UNSUPPORTED.into())
     }
 }
@@ -363,6 +463,41 @@ mod hid {
                 r => r.map_err(|e| ctap(anyhow::anyhow!(e.to_string()))),
             }
         }
+
+        // The crate hashes what it's given as the challenge into clientDataHash, so
+        // passing clientDataJSON itself gives what a browser would sign.
+        fn register(&mut self, rp: &str, client_data: &[u8], pin: Option<&str>) -> Res<Vec<u8>> {
+            let b = MakeCredentialArgsBuilder::new(rp, client_data);
+            let b = match pin {
+                Some(p) => b.pin(p),
+                None => b.without_pin_and_uv(),
+            };
+            Ok(self.one()?.make_credential_with_args(&b.build()).map_err(ctap)?.auth_data)
+        }
+
+        fn assert(&mut self, rp: &str, creds: &[Vec<u8>], client_data: &[u8]) -> Res<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            let mut b = GetAssertionArgsBuilder::new(rp, client_data).without_pin_and_uv();
+            for c in creds {
+                b = b.add_credential_id(c);
+            }
+            let args = b.build();
+            // Whichever key is plugged in: with several, the first that holds one of them.
+            self.0 = None;
+            let mut err = None;
+            for d in devices()? {
+                match d.get_assertion_with_args(&args) {
+                    Ok(a) => {
+                        let a = a.into_iter().next().ok_or("the security key gave no answer")?;
+                        let id = Some(a.credential_id).filter(|c| !c.is_empty()).or_else(|| (creds.len() == 1).then(|| creds[0].clone())).ok_or("the security key didn't say which credential answered")?;
+                        return Ok((id, a.auth_data, a.signature));
+                    }
+                    Err(e) => err = Some(e),
+                }
+            }
+            Err(err.map_or_else(|| NO_KEY.into(), |e| {
+                if e.to_string().contains("NO_CREDENTIALS") { "the security key plugged in isn't one this account signs in with".into() } else { ctap(e) }
+            }))
+        }
     }
 
     impl Hid {
@@ -406,6 +541,8 @@ pub mod tests {
         pub always_uv: bool,
         /// Refuses the silent probe (`which`).
         pub no_probe: bool,
+        /// Credentials for signing in, with the relying party each was made for.
+        pub signin: Vec<(String, plaintext_server::SoftKey)>,
     }
 
     impl Authenticator for Soft {
@@ -444,9 +581,31 @@ pub mod tests {
             }
             self.output(cred, salt, false).map(Some)
         }
+        fn register(&mut self, rp: &str, cd: &[u8], pin: Option<&str>) -> Res<Vec<u8>> {
+            Soft::register(self, rp, cd, pin)
+        }
+        fn assert(&mut self, rp: &str, creds: &[Vec<u8>], cd: &[u8]) -> Res<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            Soft::assert(self, rp, creds, cd)
+        }
     }
 
     impl Soft {
+        fn register(&mut self, rp: &str, _: &[u8], pin: Option<&str>) -> Res<Vec<u8>> {
+            self.touches += 1;
+            if self.pin.as_deref() != pin {
+                return Err("wrong security key PIN".into());
+            }
+            let k = plaintext_server::SoftKey::new();
+            let a = k.register(rp);
+            self.signin.push((rp.into(), k));
+            Ok(a)
+        }
+        fn assert(&mut self, rp: &str, creds: &[Vec<u8>], client_data: &[u8]) -> Res<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            self.touches += 1;
+            let (_, k) = self.signin.iter_mut().find(|(r, k)| r == rp && creds.contains(&k.id)).ok_or("the security key plugged in isn't one this account signs in with")?;
+            let a = k.sign(rp, client_data.to_vec());
+            Ok((a.id.0, a.auth_data.0, a.signature.0))
+        }
         fn output(&self, cred: &[u8], salt: &[u8; 32], uv: bool) -> Res<Zeroizing<[u8; 32]>> {
             let (_, r) = self.held.iter().find(|(c, _)| c == cred).ok_or("not set up here")?;
             Ok(Zeroizing::new(hmac(&[&r[..], &[uv as u8]].concat(), salt)))
@@ -575,6 +734,34 @@ pub mod tests {
         assert!(load(&cfg).is_err());
         assert!(add(&cfg, &mut key, "green", &mut ask).is_err());
         assert!(clear(&cfg).is_err());
+        std::fs::remove_dir_all(p).unwrap();
+
+        // Signing in with a key on top of the password (DESIGN "Signing in with a security key").
+        let mut yubi = Soft { pin: Some("1234".into()), ..Default::default() };
+        let codes = add_for_sign_in(&cfg, &first, &mut yubi, "yubi", &mut ask).unwrap();
+        assert_eq!((codes.len(), yubi.touches), (10, 2));
+        assert_eq!(asked.take(), ["Password for alice: ", "Security key PIN: "]);
+        let d = derive("correct horse", &sk);
+        // A computer that isn't trusted yet: a touch, no PIN. Then it's remembered.
+        sign_in(&cfg, &d, "test", &mut yubi, &mut ask).unwrap();
+        assert_eq!((yubi.touches, asked.take().len()), (3, 0));
+        sign_in(&cfg, &d, "test", &mut Soft::default(), &mut ask).unwrap();
+        // Adding an unlock key signs in too, on this trusted computer.
+        add(&cfg, &mut key, "blue", &mut ask).unwrap();
+        asked.take();
+        // Without the key, a recovery code (the prompt also offers the approval page).
+        state::entry(&cfg, "trust").unwrap().delete().unwrap();
+        let mut code = |m: &str| -> Res<Zeroizing<String>> {
+            asked.borrow_mut().push(m.into());
+            Ok(Zeroizing::new(codes[0].clone()))
+        };
+        sign_in(&cfg, &d, "test", &mut Soft::default(), &mut code).unwrap();
+        assert!(asked.take()[0].contains("/v1/login/key#"));
+        // Removing the last key turns it off.
+        let id = first.signin_keys().unwrap().keys[0].id.clone();
+        change_sign_in(&cfg, &first, SigninKeyAction::Remove { id }, &mut ask).unwrap();
+        state::entry(&cfg, "trust").unwrap().delete().unwrap();
+        sign_in(&cfg, &d, "test", &mut Soft::default(), &mut ask).unwrap();
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_file(db);
     }

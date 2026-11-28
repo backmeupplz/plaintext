@@ -7,7 +7,7 @@ mod state;
 use std::io::{Read, Write};
 
 use clap::{Parser, Subcommand};
-use plaintext_client::plaintext_core::api::{Hex, Kind, Role};
+use plaintext_client::plaintext_core::api::{Hex, Kind, Role, SigninKeyAction};
 use plaintext_client::plaintext_core::item::{Field, Item, Section};
 use plaintext_client::plaintext_core::tools::{self, Recipe};
 use plaintext_client::plaintext_core::{Content, new_item_id};
@@ -124,6 +124,9 @@ enum Cmd {
     /// Security keys (FIDO2, such as a YubiKey) that unlock this computer instead of the password
     #[command(subcommand)]
     Key(KeyCmd),
+    /// Security keys that signing in to your account on a new device needs, on top of the password
+    #[command(subcommand, name = "signin-key")]
+    SigninKey(SigninKeyCmd),
     /// Who you're signed in as, and your fingerprint
     Whoami,
     /// List items, optionally matching a search
@@ -330,6 +333,21 @@ enum KeyCmd {
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SigninKeyCmd {
+    /// Make the security key plugged in one that signing in needs (asks for the password)
+    Add {
+        /// What to call it, e.g. "blue yubikey"
+        name: String,
+    },
+    /// The account's security keys for signing in, and how many recovery codes are left
+    Ls,
+    /// Stop a security key being needed to sign in; removing the last one turns the requirement off
+    Remove { name: String },
+    /// New recovery codes, replacing the old ones
+    Codes,
 }
 
 #[derive(Subcommand)]
@@ -596,6 +614,7 @@ fn run(cli: Cli) -> Res<()> {
             say!("Unlocked as {} in this terminal until you run `plaintext lock` (or 12 hours pass).", s.username());
         }
         Cmd::Key(k) => key_cmd(k)?,
+        Cmd::SigninKey(k) => signin_key_cmd(k)?,
         Cmd::Lock => {
             state::forget(&state::load_config()?, false);
             say!("Locked.");
@@ -981,6 +1000,53 @@ fn key_cmd(k: KeyCmd) -> Res<()> {
                 say!("This terminal is locked.");
             }
         }
+    }
+    Ok(())
+}
+
+fn show_codes(codes: &[String]) {
+    say!("\nRecovery codes, each good for one sign-in without a security key. They aren't shown again: keep them somewhere safe, apart from your keys.");
+    for c in codes {
+        say!("  {c}");
+    }
+}
+
+fn signin_key_cmd(k: SigninKeyCmd) -> Res<()> {
+    let cfg = state::load_config()?;
+    let s = state::open()?;
+    let ask = &mut |m: &str| Ok(Zeroizing::new(rpassword::prompt_password(m)?));
+    match k {
+        SigninKeyCmd::Add { name } => {
+            let codes = seckey::add_for_sign_in(&cfg, &s, &mut seckey::Hid::default(), &name, ask)?;
+            say!("Added {name}. Signing in to {} on a new device now needs a security key as well as your password and Secret Key.", cfg.name());
+            say!("Each device asks once; after that it's remembered until your password changes.");
+            if !codes.is_empty() {
+                show_codes(&codes);
+            }
+        }
+        SigninKeyCmd::Ls => {
+            let k = s.signin_keys()?;
+            if k.keys.is_empty() {
+                say!("Signing in to {} needs no security key. `plaintext signin-key add NAME` adds the one plugged in.", cfg.name());
+            }
+            for key in &k.keys {
+                say!("{}  (for {})", key.name, key.rp_id);
+            }
+            if !k.keys.is_empty() {
+                say!("{} recovery codes left; `plaintext signin-key codes` makes new ones.", k.codes_left);
+            }
+        }
+        SigninKeyCmd::Remove { name } => {
+            let keys = s.signin_keys()?.keys;
+            let key = keys.iter().find(|k| k.name == name).ok_or_else(|| format!("no security key named {name}; plaintext signin-key ls lists them"))?;
+            seckey::change_sign_in(&cfg, &s, SigninKeyAction::Remove { id: key.id.clone() }, ask)?;
+            if keys.len() == 1 {
+                say!("Removed {name}. Signing in needs no security key any more, and the recovery codes are gone.");
+            } else {
+                say!("Removed {name}.");
+            }
+        }
+        SigninKeyCmd::Codes => show_codes(&seckey::change_sign_in(&cfg, &s, SigninKeyAction::Codes, ask)?),
     }
     Ok(())
 }

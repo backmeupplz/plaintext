@@ -119,3 +119,37 @@ CREATE TABLE IF NOT EXISTS staged(
   created INTEGER NOT NULL,
   PRIMARY KEY(vault_id, username, id));
 CREATE INDEX IF NOT EXISTS staged_created ON staged(created);
+
+-- Security keys that signing in needs (DESIGN "Signing in with a security key").
+-- An account with any needs one, its recovery codes or a device it trusts.
+CREATE TABLE IF NOT EXISTS signin_keys(
+  account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  cred_id BLOB NOT NULL,
+  name TEXT NOT NULL,
+  rp_id TEXT NOT NULL,
+  public_key BLOB NOT NULL,          -- COSE
+  sign_count INTEGER NOT NULL DEFAULT 0,
+  added INTEGER NOT NULL,
+  PRIMARY KEY(account_id, cred_id));
+
+CREATE TABLE IF NOT EXISTS recovery_codes(
+  account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  code_hash BLOB NOT NULL,
+  PRIMARY KEY(account_id, code_hash));
+
+-- Devices that signed in with a key or a recovery code once; only the hash of their token.
+CREATE TABLE IF NOT EXISTS trusted_devices(
+  token_hash BLOB PRIMARY KEY,
+  account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS trusted_account ON trusted_devices(account_id);
+
+-- Signed logins waiting for a security key, for a few minutes.
+CREATE TABLE IF NOT EXISTS pending_logins(
+  pending_hash BLOB PRIMARY KEY,
+  challenge BLOB NOT NULL UNIQUE,
+  account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device TEXT NOT NULL,
+  ttl INTEGER NOT NULL,
+  approved INTEGER NOT NULL DEFAULT 0,
+  expires INTEGER NOT NULL);

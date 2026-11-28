@@ -203,6 +203,7 @@ pub fn remove_account(cfg: &Config) -> Res<()> {
     crate::seckey::clear(cfg).map_err(|e| format!("couldn't delete this computer's security keys ({e}), so it's still signed in; try again"))?;
     forget(cfg, true);
     let _ = entry(cfg, "secret-key")?.delete();
+    let _ = entry(cfg, "trust")?.delete();
     let cur = a.accounts.get(a.current).map(Config::name);
     a.accounts.retain(|c| c.name() != cfg.name());
     a.current = a.accounts.iter().position(|c| Some(c.name()) == cur).unwrap_or(0);
@@ -320,7 +321,7 @@ fn resume(cfg: &Config) -> Option<S> {
 
 /// Ask at the terminal. Without one (a script, an AI tool's command) there's
 /// nobody to ask, so say what to do instead.
-fn prompt(msg: &str) -> Res<Zeroizing<String>> {
+pub fn prompt(msg: &str) -> Res<Zeroizing<String>> {
     rpassword::prompt_password(msg).map(Zeroizing::new).map_err(|_| {
         "this needs your password and there's no terminal to ask in. Unlock in a terminal; scripts and AI tools use an agent key (plaintext agent create)".into()
     })
@@ -336,7 +337,7 @@ pub fn sign_in(cfg: &Config) -> Res<S> {
     http(&cfg.server)?;
     let sk = secret_key(cfg)?;
     let pw = prompt(&format!("Password for {}: ", cfg.username))?;
-    let s = Session::login(http(&cfg.server)?, &derive(&pw, &sk), &device())?;
+    let s = crate::seckey::sign_in(cfg, &derive(&pw, &sk), &device(), &mut crate::seckey::Hid::default(), &mut |m: &str| prompt(m))?;
     remember(cfg, &s, false)?;
     Ok(s)
 }
