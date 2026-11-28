@@ -208,6 +208,21 @@ pub const NONE: Option<&()> = None;
 /// How long a file no item refers to stays on the server (`Session::collect_files`).
 pub const FILE_GRACE: u64 = 7 * 24 * 3600;
 
+/// A vault by id prefix or name (case-insensitive). A full id wins over a vault
+/// someone named like it.
+fn find<'a>(name: &str, vaults: impl Iterator<Item = (&'a Hex, &'a Vault)> + Clone) -> Result<Hex> {
+    let n = name.to_lowercase();
+    if let Some((id, _)) = vaults.clone().find(|(id, _)| id.to_string() == n) {
+        return Ok(*id);
+    }
+    let hits: Vec<Hex> = vaults.filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n)).map(|(id, _)| *id).collect();
+    match hits.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(Error::NotFound(format!("vault {name}"))),
+        _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
+    }
+}
+
 /// A signed-in, unlocked account.
 pub struct Session<T: AsyncTransport> {
     pub t: T,
@@ -220,7 +235,9 @@ pub struct Session<T: AsyncTransport> {
     pub admin: bool,
     pub vaults: BTreeMap<Hex, Vault>,
     /// Vaults the server stopped listing. Their verified state is kept, so if
-    /// they come back the server can't hand us an older copy as if new.
+    /// they come back the server can't hand us an older copy as if new. Changes
+    /// made here can't be sent: sync says so until `discard_changes` drops them,
+    /// keeping only that guard (`Vault::forget`).
     pub hidden: BTreeMap<Hex, Vault>,
     /// Per vault, members whose accounts the server says were deleted.
     gone: BTreeMap<Hex, Vec<String>>,
@@ -229,8 +246,9 @@ pub struct Session<T: AsyncTransport> {
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
     /// Vaults whose changes the last `sync` couldn't send because we may only
-    /// read them now, each with the index of its warning in `problems`;
-    /// `discard_changes` drops the changes and the warning.
+    /// read them now, or the server stopped listing them (`hidden`), each with
+    /// the index of its warning in `problems`; `discard_changes` drops the
+    /// changes and the warning.
     pub unsendable: Vec<(Hex, usize)>,
 }
 
@@ -323,8 +341,11 @@ impl<T: AsyncTransport> Session<T> {
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_))) => {
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
-                    if known.is_none() {
-                        self.vaults.remove(id);
+                    // One reset while unlisted keeps its guard for the next try.
+                    if known.is_none()
+                        && let Some(v) = self.vaults.remove(id).filter(|v| v.counter > 0)
+                    {
+                        self.hidden.insert(*id, v);
                     }
                     let name = known.unwrap_or_else(|| id.to_string());
                     // Only pending changes make a reader's push fail.
@@ -338,6 +359,11 @@ impl<T: AsyncTransport> Session<T> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        for (id, v) in self.hidden.iter().filter(|(_, v)| v.has_changes()) {
+            let name = if v.meta.name.is_empty() { id.to_string() } else { v.meta.name.clone() };
+            self.unsendable.push((*id, self.problems.len()));
+            self.problems.push(format!("vault {name} isn't listed for you any more, so this device's changes to it can't be sent unless it's shared with you again"));
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
@@ -436,26 +462,34 @@ impl<T: AsyncTransport> Session<T> {
     /// (say, made before we became a reader) by downloading it again. The new copy
     /// must be the version this device already verified; otherwise, or if the
     /// download fails, nothing changes. Returns how many changes were dropped.
+    ///
+    /// A vault the server no longer lists can't be downloaded: it keeps only its
+    /// rollback guard, and is downloaded in full if it's listed again.
     pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
-        self.pull_async(id).await?;
-        let n = self.vaults[id].changes();
-        if n > 0 {
-            // Edits overwrote, and deletes removed, the server's copies: fetch every item.
-            let mut fresh = Vault::new(*id);
-            let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
-            let mut keyring = self.keyring.clone();
-            let changed = fresh.apply(&resp, &mut keyring, now())?;
-            let old = &self.vaults[id];
-            if !fresh.same_head(old) {
-                // Newer: another device pushed in between. Older, or a different copy
-                // of the same version: the server is lying.
-                return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+        let n = if let Some(v) = self.hidden.get_mut(id) {
+            if v.has_changes() { v.forget() } else { 0 }
+        } else {
+            self.pull_async(id).await?;
+            let n = self.vaults[id].changes();
+            if n > 0 {
+                // Edits overwrote, and deletes removed, the server's copies: fetch every item.
+                let mut fresh = Vault::new(*id);
+                let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
+                let mut keyring = self.keyring.clone();
+                let changed = fresh.apply(&resp, &mut keyring, now())?;
+                let old = &self.vaults[id];
+                if !fresh.same_head(old) {
+                    // Newer: another device pushed in between. Older, or a different copy
+                    // of the same version: the server is lying.
+                    return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+                }
+                // The next sync uploads the keyring, as after any pull.
+                self.keyring = keyring;
+                self.keyring_dirty |= changed;
+                self.vaults.insert(*id, fresh);
             }
-            // The next sync uploads the keyring, as after any pull.
-            self.keyring = keyring;
-            self.keyring_dirty |= changed;
-            self.vaults.insert(*id, fresh);
-        }
+            n
+        };
         // Nothing is left to send: so is the last sync's warning about it.
         if let Some(k) = self.unsendable.iter().position(|(v, _)| v == id) {
             let (_, i) = self.unsendable.remove(k);
@@ -611,22 +645,12 @@ impl<T: AsyncTransport> Session<T> {
 
     /// Find a vault by id prefix or name (case-insensitive).
     pub fn vault(&self, name: &str) -> Result<Hex> {
-        let n = name.to_lowercase();
-        // A full id wins over a vault someone named like it.
-        if let Some(id) = self.vaults.keys().find(|id| id.to_string() == n) {
-            return Ok(*id);
-        }
-        let hits: Vec<Hex> = self
-            .vaults
-            .iter()
-            .filter(|(id, v)| v.meta.name.to_lowercase() == n || id.to_string().starts_with(&n))
-            .map(|(id, _)| *id)
-            .collect();
-        match hits.as_slice() {
-            [one] => Ok(*one),
-            [] => Err(Error::NotFound(format!("vault {name}"))),
-            _ => Err(Error::NotFound(format!("one vault called {name} (several match)"))),
-        }
+        find(name, self.vaults.iter())
+    }
+
+    /// Like `vault`, also among vaults the server stopped listing (`hidden`).
+    pub fn vault_or_hidden(&self, name: &str) -> Result<Hex> {
+        find(name, self.vaults.iter().chain(&self.hidden))
     }
 
     /// The vault new items go to by default: the one this account made at signup.

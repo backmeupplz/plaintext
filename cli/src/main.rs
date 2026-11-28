@@ -975,8 +975,9 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             }
         }
         VaultCmd::Reset { vault, yes } => {
-            let id = s.vault(&vault)?;
-            let v = &s.vaults[&id];
+            // Also one the server stopped listing, whose changes can't be sent either.
+            let id = s.vault_or_hidden(&vault)?;
+            let v = s.vaults.get(&id).or(s.hidden.get(&id)).expect("found above");
             if v.changes() == 0 {
                 say!("{vault} has no unsent changes on this device.");
             } else if yes {
@@ -987,8 +988,15 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
             } else {
                 // They may exist nowhere else: show them before anything is dropped.
                 say!("Unsent changes to {vault} on this device:");
+                // `get` can't reach a vault the server stopped listing: show them in
+                // full, secrets behind one-time codes and passkeys included (as `get --json`).
+                let unlisted = s.hidden.contains_key(&id);
                 for (_, i) in v.changed() {
-                    say!("  added or edited: {}", i.title);
+                    if unlisted {
+                        say!("{}", serde_json::to_string_pretty(i)?);
+                    } else {
+                        say!("  added or edited: {}", i.title);
+                    }
                 }
                 match v.deleted() {
                     0 => {}
@@ -998,7 +1006,11 @@ fn vault_cmd(v: VaultCmd) -> Res<()> {
                 if v.meta_changed() {
                     say!("  the vault's name or description changed");
                 }
-                say!("Copy out anything you want to keep (`plaintext get ITEM`), then run again with --yes to drop these changes.");
+                if unlisted {
+                    say!("Copy out anything you want to keep from above, then run again with --yes to drop these changes.");
+                } else {
+                    say!("Copy out anything you want to keep (`plaintext get ITEM`), then run again with --yes to drop these changes.");
+                }
             }
         }
     }
