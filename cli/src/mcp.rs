@@ -93,7 +93,11 @@ fn spellings(secret: &str, username: &str) -> Vec<String> {
 }
 
 fn call(s: &mut S, name: &str, a: &Value) -> Res<String> {
-    s.sync()?;
+    // A change held back (a full account, a race) waits, as in the CLI; the rest still work.
+    match s.sync() {
+        Err(e) if e.held_back() => {}
+        r => r?,
+    }
     let vault = arg(a, "vault").map(|v| s.vault(v)).transpose()?;
     Ok(match name {
         "list_vaults" => {
