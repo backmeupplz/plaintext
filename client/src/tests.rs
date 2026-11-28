@@ -2111,13 +2111,24 @@ fn security_key_for_sign_in() {
     alice.end_session(&id).unwrap();
     let SignIn::Key(mut p) = Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() else { panic!("still trusted after its session ended") };
     let (_, trust) = p.finish(Some(key.assert(&rp, &p.needed.challenge.0, &url)), None).unwrap();
-    // A device ending its own other session (the CLI does, for its unlock keys) stays trusted.
+    // A device ending its own other session, as the CLI does for its unlock keys, stays trusted
+    // when it says so (a user signing a session out always revokes: a copied token looks the same).
     let signed_in = || match Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() {
         SignIn::Done(s) => s,
         SignIn::Key(_) => panic!("no longer trusted"),
     };
+    let current = |s: &Session<Http>| s.sessions().unwrap().into_iter().find(|x| x.current).unwrap().id;
     let (one, two) = (signed_in(), signed_in());
-    one.end_session(&two.sessions().unwrap().into_iter().find(|x| x.current).unwrap().id).unwrap();
+    one.end_own_session(&current(&two)).unwrap();
+    alice.end_own_session(&current(&one)).unwrap();
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap(), SignIn::Key(_)), "kept only by the same trust");
+    let SignIn::Key(mut p) = Session::sign_in(Http::new(&url), &d, "phone", None).unwrap() else { panic!("trusted") };
+    let (_, trust) = p.finish(Some(key.assert(&rp, &p.needed.challenge.0, &url)), None).unwrap();
+    let signed_in = || match Session::sign_in(Http::new(&url), &d, "phone", Some(&trust)).unwrap() {
+        SignIn::Done(s) => s,
+        SignIn::Key(_) => panic!("no longer trusted"),
+    };
+    signed_in().logout().unwrap();
     signed_in();
     // Trust lapses 90 days after the device last signed in.
     let db = plaintext_server::open_db(path.to_str().unwrap()).unwrap();

@@ -125,7 +125,7 @@ fn keep(cfg: &Config, keys: &mut Keys, i: usize, s: &S, session: String, cred: &
     keys.keys[i].session = session;
     keys.keys[i].sealed = hex::encode(seal_for_security_key(out, &s.account.id, cred, &s.account.account_key, &s.token));
     save(cfg, keys).inspect_err(|_| {
-        let _ = s.end_session(&keys.keys[i].session);
+        let _ = s.end_own_session(&keys.keys[i].session);
     })
 }
 
@@ -165,7 +165,7 @@ pub fn add(cfg: &Config, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> 
     let (cred, out) = match made {
         Ok(x) => x,
         Err(e) => {
-            let _ = s.end_session(&session);
+            let _ = s.end_own_session(&session);
             return Err(e);
         }
     };
@@ -196,7 +196,7 @@ pub fn unlock(cfg: &Config, auth: &mut dyn Authenticator, ask: Ask) -> Res<S> {
             let d = password(cfg, ask)?;
             let (s, session) = login(cfg, auth, ask, &d, &keys.keys[i].name)?;
             if s.account.id != id {
-                let _ = s.end_session(&session);
+                let _ = s.end_own_session(&session);
                 return Err("that password signs in to a different account".into());
             }
             keep(cfg, &mut keys, i, &s, session, &cred, &out)?;

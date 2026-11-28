@@ -280,7 +280,7 @@ pub fn end_sessions(cfg: &Config, mut ids: Vec<String>) -> bool {
     });
     ids.sort_by_key(|id| Some(id) == own.as_ref());
     // Every one is tried, even after one fails.
-    let ok = ids.iter().filter(|id| !h.send("DELETE", &format!("/v1/sessions/{id}"), Some(&st.token), None).is_ok_and(|(code, _)| code < 300)).count() == 0;
+    let ok = ids.iter().filter(|id| !h.send("DELETE", &format!("/v1/sessions/{id}?keep_trust=1"), Some(&st.token), None).is_ok_and(|(code, _)| code < 300)).count() == 0;
     if own.is_some_and(|o| ids.contains(&o))
         && let Ok(e) = entry(cfg, "session")
     {

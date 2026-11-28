@@ -1292,6 +1292,12 @@ impl<T: Transport> Session<T> {
         self.call("DELETE", &format!("/v1/sessions/{id}"), NONE)
     }
 
+    /// End another session of this same device (one it made itself), keeping the
+    /// trust that spares it the security key at sign-in, which `end_session` revokes.
+    pub fn end_own_session(&self, id: &str) -> Result<()> {
+        self.call("DELETE", &format!("/v1/sessions/{id}?keep_trust=1"), NONE)
+    }
+
     pub fn change_password(&self, old: &Derived, sk: &SecretKey, new_password: &str) -> Result<()> {
         let pc = plaintext_core::change_password(old, &self.account, sk, new_password, now_ms());
         self.call("POST", "/v1/account/password", Some(&pc))

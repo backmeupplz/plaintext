@@ -1127,21 +1127,29 @@ async fn sessions(State(db): State<Db>, h: HeaderMap) -> R<Json<Vec<DeviceSessio
     Ok(Json(list))
 }
 
-async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
+/// `?keep_trust=1`: a device ending its own other session (the CLI does, for its
+/// security keys' sessions) keeps the trust that session came with, if its own has the same.
+#[derive(Deserialize)]
+struct EndSession {
+    #[serde(default)]
+    keep_trust: u8,
+}
+
+async fn end_session(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<EndSession>) -> R<StatusCode> {
     let db = lock(&db);
     let c = caller(&db, &h)?;
     let prefix = hex::decode(&id).map_err(|_| (BAD, "bad id"))?;
     if prefix.len() != 8 {
         return Err((BAD, "bad id"));
     }
-    // Ending another device's session also stops trusting that device, so a stolen one needs
-    // the key again. Not a device ending its own (the CLI ends its security keys' sessions),
-    // and not logging out (the CLI and the extension log out on every lock).
+    // Ending a session also stops trusting the device it came from, so a stolen one needs the
+    // key again; whoever has a copy of its token has the same trust, so a user ending one always
+    // revokes it. Not logging out: the CLI and the extension log out on every lock.
     db.execute(
         "DELETE FROM trusted_devices WHERE account_id = ?1
            AND token_hash IN (SELECT trust FROM sessions WHERE account_id = ?1 AND substr(token_hash, 1, 8) = ?2)
-           AND token_hash IS NOT (SELECT trust FROM sessions WHERE token_hash = ?3)",
-        params![c.id, prefix, c.token_hash],
+           AND NOT (?4 AND token_hash IS (SELECT trust FROM sessions WHERE token_hash = ?3))",
+        params![c.id, prefix, c.token_hash, q.keep_trust == 1],
     )
     .map_err(db_err)?;
     db.execute("DELETE FROM sessions WHERE account_id = ? AND substr(token_hash, 1, 8) = ?", params![c.id, prefix]).map_err(db_err)?;
@@ -2096,8 +2104,8 @@ mod tests {
 
     #[test]
     fn key_answer_origins() {
-        let hosts = ["vault.example.com".to_string(), "192.168.1.5:8080".to_string()];
-        let ok = ["https://vault.example.com", "https://vault.example.com:443", "http://192.168.1.5:8080", "chrome-extension://abc", "moz-extension://1-2"];
+        let hosts = ["vault.example.com".to_string(), "192.168.1.5:8080".to_string(), "localhost:8080".to_string()];
+        let ok = ["https://vault.example.com", "https://vault.example.com:443", "http://192.168.1.5:8080", "http://localhost:8080", "chrome-extension://abc", "moz-extension://1-2"];
         for o in ok {
             assert!(super::origin_ok(&hosts, o), "{o}");
         }

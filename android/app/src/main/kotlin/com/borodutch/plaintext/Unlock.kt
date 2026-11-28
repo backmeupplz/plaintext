@@ -208,7 +208,7 @@ fun KeyStep(finish: suspend (recovery: String?) -> Unit) {
             runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(page))) }
         })
         Text(
-            "That opens a page on your server in the browser, which asks your key: hold it to the phone or plug it in. Then come back here and continue. This phone won't ask again.",
+            "That opens a page on your server in the browser, which asks your key: hold it to the phone or plug it in. Then come back here and continue. Only approve a sign-in you just started yourself. After that, this phone is remembered.",
             color = P.muted, style = MaterialTheme.typography.bodySmall,
         )
         Field("Or a recovery code", code, { code = it }, kind = Input.Secret, revealed = true)

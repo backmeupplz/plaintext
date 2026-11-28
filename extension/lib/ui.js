@@ -89,6 +89,8 @@ export function keyStep(w, done) {
       done(await ask('finishKey', { key: w.key, ...data }))
     } catch (x) {
       err.textContent = explain(x)
+      // Not approved on the page yet, or the server refused the key's answer: the page is the way on.
+      if (x?.name === 'not_approved' || x?.name === 'key_refused') page.hidden = false
     } finally {
       btn.disabled = false
     }
@@ -97,7 +99,7 @@ export function keyStep(w, done) {
     'div',
     { hidden: true },
     el('button', { type: 'button', onclick: () => chrome.tabs.create({ url: w.page }) }, 'Approve on my server’s page instead'),
-    el('p', { class: 'muted small-text' }, 'That page asks your key on your server’s own site. Touch the key there, then come back here and continue.'),
+    el('p', { class: 'muted small-text' }, 'That page asks your key on your server’s own site. Touch the key there, then come back here and continue. Only approve a sign-in you just started yourself.'),
   )
   const fallBack = (why) => {
     page.hidden = false
@@ -131,7 +133,7 @@ export function keyStep(w, done) {
   return el(
     'form',
     { class: 'key-step', onsubmit: (e) => (e.preventDefault(), finish({ recovery: code.value.trim() }, go)) },
-    el('p', {}, `${who} needs your security key to sign in on this browser. It won’t ask again.`),
+    el('p', {}, `${who} needs your security key to sign in on this browser. After that, this browser is remembered.`),
     usable && touch,
     page,
     el('label', { for: 'recovery' }, 'Or use a recovery code'),

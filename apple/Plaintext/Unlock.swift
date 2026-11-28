@@ -169,7 +169,7 @@ struct KeyStepView: View {
             } label: {
                 Label("Approve with my security key", systemImage: "key")
             }
-            Text("That opens a page on your server in the browser, which asks your key: hold it to the device or plug it in. Then come back here and continue. This device won't ask again.")
+            Text("That opens a page on your server in the browser, which asks your key: hold it to the device or plug it in. Then come back here and continue. Only approve a sign-in you just started yourself. After that, this device is remembered.")
                 .font(.footnote)
                 .foregroundStyle(Palette.muted)
             TextField("Or a recovery code", text: $code)
