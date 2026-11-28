@@ -352,12 +352,15 @@ impl<T: AsyncTransport> Session<T> {
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
                     // A vault opened before keeps its name, though it may never open again.
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| (v.meta.name.clone(), v.creator.clone()));
+                    let read_only = matches!(e, Error::Core(plaintext_core::Error::ReadOnly));
                     if known.is_none() {
                         self.vaults.remove(id);
                     }
                     match known {
                         // Your own vault: a server serving an old copy mustn't talk you into deleting it.
-                        Some((name, creator)) if creator == self.keyring.username => {
+                        // Nor does a change you can't send (you only read the vault) need you to
+                        // leave; the vault itself synced, so it's named below if you pay for it.
+                        Some((name, creator)) if creator == self.keyring.username || read_only => {
                             self.problems.push(format!("vault {name} wasn't updated: {e}"))
                         }
                         k => {
@@ -367,7 +370,9 @@ impl<T: AsyncTransport> Session<T> {
                             self.problems.push(format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"));
                         }
                     }
-                    failed.push(*id);
+                    if !read_only {
+                        failed.push(*id);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -422,13 +427,74 @@ impl<T: AsyncTransport> Session<T> {
         self.remove_members_async(id, None).await
     }
 
-    /// Pull, then push pending changes; on a conflict pull again and retry.
+    /// Pull, then push pending changes.
     pub async fn sync_vault_async(&mut self, id: &Hex) -> Result<()> {
         self.pull_async(id).await?;
+        self.push_async(id).await
+    }
+
+    /// Pull a vault and refuse if we may only read it. A reader's sync never
+    /// pushes, so a change made anyway would stay on this device without a word.
+    /// Offline it passes, so the change waits for the next sync, unless the
+    /// roster we already have says we only read. An offline pull's error comes
+    /// back inside (Ok(Err)) for the caller.
+    async fn check_async(&mut self, id: &Hex) -> Result<Result<()>> {
+        let pulled = self.pull_async(id).await;
+        if let Err(e) = &pulled
+            && !matches!(e, Error::Network(_) | Error::Server(500..=599, _))
+        {
+            return pulled.map(Ok);
+        }
+        // A vault never pulled has no roster yet: the pull's error says more.
+        if let Err(e) = self.may_write(id) {
+            return if self.vaults[id].roster.is_none() { pulled.and(Err(e)) } else { Err(e) };
+        }
+        Ok(pulled)
+    }
+
+    fn may_write(&self, id: &Hex) -> Result<()> {
+        let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
+        match v.role(self.username(), now()) {
+            Some(r) if r >= Role::Writer => Ok(()),
+            _ => Err(plaintext_core::Error::ReadOnly.into()),
+        }
+    }
+
+    /// Make a change and push it; if we may only read the vault (see
+    /// `check_async`), undo it and refuse. The change goes in before the pull,
+    /// as with `sync_vault`, so the pull still sees another device's newer copy
+    /// of the item (an edit keeps it as a conflict, a delete gives way to it).
+    async fn change_async(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
+        let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
+        let before = v.snapshot(&self.account);
+        f(v);
+        match self.check_async(id).await {
+            Ok(pulled) => {
+                pulled?;
+                self.push_async(id).await
+            }
+            // Only the refusal is undone: after any other error the change waits
+            // for the next sync, as it did before this check.
+            Err(e @ Error::Core(plaintext_core::Error::ReadOnly)) => {
+                // The undo also undid the pull; pull again so the roster that
+                // refused us stays (best effort: offline the old one says so).
+                self.vaults.insert(*id, Vault::restore(&self.account, *id, &before)?);
+                drop(self.pull_async(id).await);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Push pending changes (a pull came just before); on a conflict pull again and retry.
+    async fn push_async(&mut self, id: &Hex) -> Result<()> {
         for _ in 0..5 {
             let me = self.me();
             let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
-            if !v.has_changes() || v.role(&me.username, now()).is_none_or(|r| r < Role::Writer) {
+            // Changes made while we could still write (offline, or just before a
+            // demotion) can't go to a reader's vault: `push` says ReadOnly, on every
+            // sync, rather than keep them without a word.
+            if !v.has_changes() {
                 return Ok(());
             }
             let put = v.push(&me, now())?;
@@ -671,8 +737,7 @@ impl<T: AsyncTransport> Session<T> {
 
     /// Add or replace an item and push it.
     pub async fn put_item_async(&mut self, vault: &Hex, id: Hex, item: Item) -> Result<()> {
-        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.put(id, item);
-        self.sync_vault_async(vault).await
+        self.change_async(vault, |v| v.put(id, item)).await
     }
 
     pub async fn logout_async(&self) -> Result<()> {
@@ -805,9 +870,14 @@ impl<T: Transport> Session<T> {
         block_on(self.sync_async())
     }
 
-    /// Pull, then push pending changes; on a conflict pull again and retry.
+    /// Pull, then push pending changes.
     pub fn sync_vault(&mut self, id: &Hex) -> Result<()> {
         block_on(self.sync_vault_async(id))
+    }
+
+    /// Pull a vault and refuse if we may only read it (`check_async`).
+    pub fn writable(&mut self, id: &Hex) -> Result<()> {
+        block_on(self.check_async(id)).map(drop)
     }
 
     fn pull(&mut self, id: &Hex) -> Result<()> {
@@ -949,8 +1019,7 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn rename_vault(&mut self, id: &Hex, meta: VaultMeta) -> Result<()> {
-        self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?.set_meta(meta);
-        self.sync_vault(id)
+        block_on(self.change_async(id, |v| v.set_meta(meta)))
     }
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
@@ -1039,8 +1108,7 @@ impl<T: Transport> Session<T> {
     /// sync collects them (`collect_files`), so another device that brings the item
     /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.delete(id);
-        self.sync_vault(vault)
+        block_on(self.change_async(vault, |v| v.delete(id)))
     }
 
     /// Save imported items: each source vault goes to our own vault of that name
@@ -1049,17 +1117,26 @@ impl<T: Transport> Session<T> {
     /// one pull brings (`api::MAX_PUSH`). Every item goes into this device's copy
     /// before anything is pushed, so a failed push loses nothing: the report
     /// carries that error, and the items go out with the next sync. Once an upload
-    /// fails, the remaining attachments are left out and listed.
+    /// fails, the remaining attachments are left out and listed. Refused before
+    /// anything changes if we may only read an existing target (see `writable`).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn import(&mut self, imported: Vec<import::Imported>, into: Option<Hex>) -> Result<ImportReport> {
+        // Where each part goes: a vault we have, or (Err) one to make. Kept, so a
+        // pull here that renames a vault can't send items to an unchecked one.
         let mut targets = Vec::new();
-        // Where each part goes: a vault we have, or (Err) one to make.
+        let mut checked = Vec::new();
         for v in imported {
             let to = match into {
                 Some(id) => Ok(id),
                 None if v.name.is_empty() || v.name.eq_ignore_ascii_case("personal") => Ok(self.default_vault()?),
                 None => self.own_vault(&v.name).ok_or(v.name),
             };
+            if let Ok(id) = to
+                && !checked.contains(&id)
+            {
+                self.writable(&id)?;
+                checked.push(id);
+            }
             targets.push((to, v.items));
         }
         // Sealed, an item is padded to 256 bytes plus 41, and each attachment adds
