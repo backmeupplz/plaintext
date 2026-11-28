@@ -48,11 +48,15 @@ async function remember(a, acct) {
   await chrome.storage.session.set({ [`session:${a.key}`]: acct.sessionState() })
 }
 
-/** Sync, keep this device's copies, and return what the user should know. */
+/** Sync, keep this device's copies, and return what the user should know:
+ *  `{ text, key, vault, about }`, where `vault` is one the problem offers to leave
+ *  and `about` the vault it's about. */
 async function sync(a, acct) {
   let problems
   try {
-    problems = JSON.parse(await acct.sync())
+    // The client's text starts lower case ("vault Team wasn't updated…"); other
+    // problems (one starting with a username, say) are shown as they are.
+    problems = JSON.parse(await acct.sync()).map((p) => ({ text: p.text.charAt(0).toUpperCase() + p.text.slice(1), key: a.key, vault: p.leave, about: p.vault }))
   } catch (e) {
     // The server ended the session (expired, or signed out elsewhere): unlock again.
     if (e.name === 'signed_out') await forget(a.key)
@@ -323,11 +327,22 @@ async function fromPage(msg) {
         try {
           problems.push(...(await sync(a, acct)))
         } catch (e) {
-          problems.push(`${a.username} on ${hostOf(a.server)}: ${e.name === 'network' ? "couldn't reach the server" : e.message}`)
+          problems.push({ text: `${a.username} on ${hostOf(a.server)}: ${e.name === 'network' ? "couldn't reach the server" : e.message}` })
         }
       }
       await touch()
       return problems
+    }
+    case 'leaveCheck':
+      return JSON.parse(await withAccount(msg.key, (acct) => acct.leaveCheck(msg.vault)))
+    case 'leave': {
+      const acct = await withAccount(msg.key, async (acct) => (await acct.leaveVault(msg.vault), acct))
+      // The leave happened either way. If this save fails, the stored copy still
+      // has the vault: after a restart it comes back until the next sync hides it
+      // again, and if it had unsent changes, every sync reports it as no longer
+      // listed for you.
+      await save(msg.key, acct).catch(() => {})
+      return true
     }
     case 'pending': {
       const p = await pending(msg.tabId)
@@ -391,6 +406,19 @@ async function fromPage(msg) {
   throw fail('refused', `unknown action ${msg.action}`)
 }
 
+/** Run `f(acct, a)` on an unlocked account; an ended session locks it again. */
+async function withAccount(key, f) {
+  const [a, acct] = (await unlocked()).find(([x]) => x.key === key) ?? []
+  if (!acct) throw fail('locked', 'Unlock Plaintext first.')
+  await touch()
+  try {
+    return await f(acct, a)
+  } catch (e) {
+    if (e.name === 'signed_out') await forget(a.key)
+    throw e
+  }
+}
+
 async function add({ server, secretKey, password }) {
   await ready
   const base = server.trim().replace(/\/+$/, '')
@@ -420,7 +448,7 @@ async function add({ server, secretKey, password }) {
 async function settle(a, acct) {
   const problems = []
   const copies = await local(`local:${a.key}`)
-  if (copies) await acct.loadLocal(copies).catch((e) => problems.push(`This device's saved copy couldn't be merged: ${e.message}`))
+  if (copies) await acct.loadLocal(copies).catch((e) => problems.push({ text: `This device's saved copy couldn't be merged: ${e.message}` }))
   await remember(a, acct)
   // Kept now so a failed first sync can still be reopened offline; a copy that
   // didn't merge is left as it was.
@@ -428,7 +456,7 @@ async function settle(a, acct) {
   try {
     problems.push(...(await sync(a, acct)))
   } catch (e) {
-    problems.push(e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : e.message)
+    problems.push({ text: e.name === 'network' ? "Couldn't reach the server to sync; showing what this device has." : `Couldn't sync: ${e.message}` })
   }
   return problems
 }

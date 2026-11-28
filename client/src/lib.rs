@@ -273,11 +273,47 @@ pub struct Session<T: AsyncTransport> {
     /// What the last `sync` couldn't do, for the user to see: vaults that didn't
     /// verify (kept as last verified, or left out if never verified) and invite
     /// conflicts. One bad vault doesn't stop the rest from syncing.
-    pub problems: Vec<String>,
+    pub problems: Vec<Problem>,
     /// Vaults whose changes the last `sync` couldn't send because we may only
     /// read them now, or the server stopped listing them (`hidden`);
     /// `discard_changes` drops them.
     pub unsendable: Vec<Hex>,
+}
+
+/// Something the last sync couldn't do, in words (which may end with a CLI hint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    pub text: String,
+    /// The vault it suggests leaving: never one of your own, since leaving a
+    /// vault nobody else uses deletes it.
+    pub leave: Option<Hex>,
+    /// The vault it's about, so leaving that vault drops it.
+    pub vault: Option<Hex>,
+}
+
+impl From<String> for Problem {
+    fn from(text: String) -> Self {
+        Problem { text, leave: None, vault: None }
+    }
+}
+
+impl From<&str> for Problem {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl std::ops::Deref for Problem {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 /// The logic, written once. Browsers call these through an `AsyncTransport`;
@@ -374,6 +410,9 @@ impl<T: AsyncTransport> Session<T> {
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
                     let own = self.is_own(id);
+                    // Never offer to leave (delete) your own vault (`leavable`).
+                    // Before `self.vaults.remove` below, which `leavable` looks at.
+                    let leave = self.leavable(id).then_some(*id);
                     // A vault opened before keeps its name, though it may never open again.
                     let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
                     let read_only = matches!(e, Error::Core(plaintext_core::Error::ReadOnly));
@@ -391,14 +430,22 @@ impl<T: AsyncTransport> Session<T> {
                         true if read_only => {
                             // Only pending changes make a reader's push fail.
                             self.unsendable.push(*id);
-                            self.problems.push(format!("vault {name} wasn't updated: {e}, so this device's changes to it can't be sent"))
+                            self.problems.push(Problem {
+                                text: format!("vault {name} wasn't updated: {e}, so this device's changes to it can't be sent"),
+                                leave: None,
+                                vault: Some(*id),
+                            })
                         }
                         // Your own vault: a server serving an old copy mustn't talk you into deleting it.
-                        _ if own => self.problems.push(format!("vault {name} wasn't updated: {e}")),
+                        _ if own => self.problems.push(Problem { text: format!("vault {name} wasn't updated: {e}"), leave: None, vault: Some(*id) }),
                         _ => {
                             let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
                             // The app drops a trailing " (plaintext …" hint.
-                            self.problems.push(format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"));
+                            self.problems.push(Problem {
+                                text: format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"),
+                                leave,
+                                vault: Some(*id),
+                            });
                         }
                     }
                     if !read_only {
@@ -410,7 +457,11 @@ impl<T: AsyncTransport> Session<T> {
         }
         for (id, v) in self.hidden.iter().filter(|(_, v)| v.has_changes()) {
             let name = if v.meta.name.is_empty() { id.to_string() } else { v.meta.name.clone() };
-            self.problems.push(format!("vault {name} isn't listed for you any more, so this device's changes to it can't be sent unless it's shared with you again"));
+            self.problems.push(Problem {
+                text: format!("vault {name} isn't listed for you any more, so this device's changes to it can't be sent unless it's shared with you again"),
+                leave: None,
+                vault: Some(*id),
+            });
             self.unsendable.push(*id);
         }
         // Someone can make you an owner and leave, and the vault counts against you
@@ -419,25 +470,24 @@ impl<T: AsyncTransport> Session<T> {
         // but didn't create only while storage is limited (or a vault you took over on
         // purpose would be named on every sync for nothing). One that failed is named above.
         for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
-            match self.vaults.get(id).filter(|v| v.roster.is_some()) {
-                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
-                Some(v) => self.problems.push(format!(
-                    "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
-                    v.meta.name, v.creator
-                )),
+            let text = match self.vaults.get(id).filter(|v| v.roster.is_some()) {
+                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => continue,
+                Some(v) => format!("vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)", v.meta.name, v.creator),
                 None if self.is_own(id) => {
                     // The full id too: `vault leave` can't find a vault it doesn't list by name.
                     let name = self.hidden.get(id).filter(|v| v.roster.is_some()).map_or_else(|| id.to_string(), |v| format!("{} ({id})", v.meta.name));
-                    self.problems.push(format!("vault {name} counts against your storage, but the server isn't listing it for you (unless you were taken out of it, don't leave it for that: a server can hide a vault on purpose)"));
+                    format!("vault {name} counts against your storage, but the server isn't listing it for you (unless you were taken out of it, don't leave it for that: a server can hide a vault on purpose)")
                 }
                 None => {
                     // The name this device last saw, if it kept the vault (`hidden`).
                     let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
-                    self.problems.push(format!(
-                        "vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
-                    ))
+                    format!("vault {name} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)")
                 }
-            }
+            };
+            // Ahead of what else this sync says about the vault, so an app showing
+            // one problem shows the one that can offer to leave it.
+            let at = self.problems.iter().position(|p| p.vault == Some(*id)).unwrap_or(self.problems.len());
+            self.problems.insert(at, Problem { text, leave: self.leavable(id).then_some(*id), vault: Some(*id) });
         }
         // Users who joined with our invites get verified through their proof.
         if !self.keyring.invites.is_empty() {
@@ -447,11 +497,22 @@ impl<T: AsyncTransport> Session<T> {
             for n in conflicts {
                 self.problems.push(format!(
                     "someone signed up with your invite as {n}, but you already had different keys for {n}; compare fingerprints in person (plaintext user verify {n} --fingerprint …)"
-                ));
+                ).into());
             }
         }
         self.save_keyring_async().await?;
         full.map_or(Ok(()), Err)
+    }
+
+    /// Whether a problem may offer to leave vault `id` (`Problem::leave`): never our
+    /// own, and with no verified roster here, only a vault none of our devices ever
+    /// verified (an agent's, say). A fresh device can't tell which of the others we
+    /// created, and a server can hide one to get it offered.
+    // ponytail: a server that also serves a fresh device an older keyring (without the
+    // vault's checkpoint) gets past this; the CLI hint (#998) has the same ceiling.
+    fn leavable(&self, id: &Hex) -> bool {
+        let here = self.vaults.get(id).or_else(|| self.hidden.get(id)).is_some_and(|v| v.roster.is_some());
+        !self.is_own(id) && (here || !self.keyring.rosters.contains_key(id))
     }
 
     /// Whether vault `id` is our own, as far as this device can tell: one we created
@@ -842,6 +903,47 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn logout_async(&self) -> Result<()> {
         self.call_async("POST", "/v1/logout", NONE).await
     }
+
+    /// Whether we're the only owner of vault `id` and others would keep using it
+    /// without us, as the server counts them: current members other than us, our
+    /// agents, and disabled or deleted accounts.
+    pub async fn leaves_ownerless_async(&self, id: &Hex) -> Result<bool> {
+        let me = self.username().to_string();
+        let Some(v) = self.vaults.get(id) else { return Ok(false) };
+        let Some(r) = &v.roster else { return Ok(false) };
+        if v.role(&me, now()) != Some(Role::Owner) {
+            return Ok(false);
+        }
+        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut keepers = Vec::new();
+        for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
+            match self.call_async::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE).await {
+                Err(Error::Server(404, _)) => {}
+                Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
+                Ok(_) => keepers.push(m.role),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(!keepers.is_empty() && !keepers.contains(&Role::Owner))
+    }
+
+    /// Stop using a vault, along with your agents. Its owners' devices replace the
+    /// key. The vault is deleted if nobody else uses it; as its only owner, you
+    /// leave the others a vault whose members and key can't change any more.
+    pub async fn leave_vault_async(&mut self, id: &Hex) -> Result<()> {
+        let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
+        self.call_async::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req)).await?;
+        // Kept as a vault this device knows nothing about: unsent changes are
+        // gone (also those to one the server stopped listing), and if someone adds
+        // us again it starts afresh.
+        if self.vaults.remove(id).is_some() || self.hidden.contains_key(id) {
+            self.hidden.insert(*id, Vault::new(*id));
+        }
+        self.unsendable.retain(|v| v != id);
+        // What the last sync said about it no longer applies.
+        self.problems.retain(|p| p.vault != Some(*id));
+        Ok(())
+    }
 }
 
 impl<T: Transport> Session<T> {
@@ -1119,6 +1221,10 @@ impl<T: Transport> Session<T> {
         self.call::<()>("POST", "/v1/vaults", Some(&nv))?;
         let id = v.id;
         self.vaults.insert(id, v);
+        // Record it in the keyring now, so this account's new devices know it's a vault
+        // of ours and never offer to leave (delete) it (`leavable`). Best effort: the
+        // vault exists either way, and the next sync saves the keyring.
+        drop(self.pull(&id).and_then(|()| self.save_keyring()));
         Ok(id)
     }
 
@@ -1162,42 +1268,14 @@ impl<T: Transport> Session<T> {
         self.save_keyring()
     }
 
-    /// Whether we're the only owner of vault `id` and others would keep using it
-    /// without us, as the server counts them: current members other than us, our
-    /// agents, and disabled or deleted accounts.
+    /// See `leaves_ownerless_async`.
     pub fn leaves_ownerless(&self, id: &Hex) -> Result<bool> {
-        let me = self.username().to_string();
-        let Some(v) = self.vaults.get(id) else { return Ok(false) };
-        let Some(r) = &v.roster else { return Ok(false) };
-        if v.role(&me, now()) != Some(Role::Owner) {
-            return Ok(false);
-        }
-        let gone = self.gone.get(id).map(Vec::as_slice).unwrap_or_default();
-        let mut keepers = Vec::new();
-        for m in r.members.iter().filter(|m| m.username != me && m.expires.is_none_or(|e| e > now()) && !gone.contains(&m.username)) {
-            match self.call::<UserInfo>("GET", &format!("/v1/users/{}", m.username), NONE) {
-                Err(Error::Server(404, _)) => {}
-                Ok(u) if u.disabled || serde_json::from_slice::<Identity>(&u.identity.body.0).is_ok_and(|i| i.owner.as_deref() == Some(&me)) => {}
-                Ok(_) => keepers.push(m.role),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(!keepers.is_empty() && !keepers.contains(&Role::Owner))
+        block_on(self.leaves_ownerless_async(id))
     }
 
-    /// Stop using a vault, along with your agents. Its owners' devices replace the
-    /// key. The vault is deleted if nobody else uses it; as its only owner, you
-    /// leave the others a vault whose members and key can't change any more.
+    /// See `leave_vault_async`.
     pub fn leave_vault(&mut self, id: &Hex) -> Result<()> {
-        let req = self.me().sign_doc("leave", &LeaveVault { vault_id: *id, ts: now_ms() });
-        self.call::<()>("POST", &format!("/v1/vaults/{id}/leave"), Some(&req))?;
-        // Kept as a vault this device knows nothing about: unsent changes are
-        // gone, and if someone adds us again it starts afresh.
-        if self.vaults.remove(id).is_some() || self.hidden.contains_key(id) {
-            self.hidden.insert(*id, Vault::new(*id));
-        }
-        self.unsendable.retain(|u| u != id);
-        Ok(())
+        block_on(self.leave_vault_async(id))
     }
 
     pub fn audit(&self, id: &Hex) -> Result<Vec<AuditEntry>> {

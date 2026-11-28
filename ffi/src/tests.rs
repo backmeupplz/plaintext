@@ -1,6 +1,7 @@
 //! The app API end to end over real HTTP, the way the iPhone and Mac apps use it.
 
 use super::*;
+use plaintext_client::Problem;
 
 fn server() -> String {
     server_with(plaintext_server::Config { setup_code: Some("setup-code".into()), ..Default::default() })
@@ -283,4 +284,88 @@ fn several_accounts() {
     assert_eq!(app.accounts().len(), 1);
     assert!(app.vaults().iter().all(|v| v.account_id == h));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Leaving a vault, also one only a sync problem names: an owner who left
+/// hands bob a vault that counts against his storage.
+#[test]
+fn leaving_a_vault() {
+    let url = server_with(plaintext_server::Config { setup_code: Some("setup-code".into()), quota: Some(64 << 20), ..Default::default() });
+    let (alice, _) = app();
+    let a = alice.signup(url.clone(), "alice".into(), "alice pw".into(), Some("setup-code".into())).unwrap().account.id;
+    let (bob, _) = app();
+    let br = bob.signup(url.clone(), "bob".into(), "bob pw".into(), Some(alice.invite(a.clone()).unwrap())).unwrap();
+    let (b, unlock) = (br.account.id, br.unlock);
+    alice.sync(a.clone()).unwrap();
+
+    // Alice is the only owner of a vault bob writes to: she's warned.
+    let team = alice.create_vault(a.clone(), "Team".into()).unwrap();
+    alice.share_vault(a.clone(), team.clone(), "bob".into(), Role::Writer, None).unwrap();
+    let c = alice.leave_check(a.clone(), team.clone()).unwrap();
+    assert!(c.only_owner && !c.unsent && c.name.as_deref() == Some("Team"));
+
+    // She makes bob an owner and leaves; the vault now counts against him.
+    alice.share_vault(a.clone(), team.clone(), "bob".into(), Role::Owner, None).unwrap();
+    assert!(!alice.leave_check(a.clone(), team.clone()).unwrap().only_owner);
+    alice.leave_vault(a.clone(), team.clone()).unwrap();
+    assert!(alice.vaults().iter().all(|v| v.id != team));
+    bob.sync(b.clone()).unwrap();
+    let problems = bob.accounts()[0].problems.clone();
+    assert!(problems.iter().any(|p| p.contains("counts against your storage, though alice created it")), "{problems:?}");
+    assert_eq!(bob.accounts()[0].problem_vaults.iter().flatten().collect::<Vec<_>>(), [&team]);
+
+    // He has a change to it that wasn't sent, and a problem about it that offers
+    // no leave (as when the server stops listing it): he's warned of the change.
+    let tid = hex_id(&team).unwrap();
+    {
+        let acct = bob.acct(&b).unwrap();
+        let mut s = acct.session.lock().unwrap();
+        s.vaults.get_mut(&tid).unwrap().put(core::new_item_id(), Item { title: "Unsent".into(), ..Default::default() });
+        s.problems.push(Problem { text: "vault Team isn't listed for you any more".into(), leave: None, vault: Some(tid) });
+        bob.persist(&acct, &s).unwrap();
+    }
+    let c = bob.leave_check(b.clone(), team.clone()).unwrap();
+    assert!(!c.only_owner && c.unsent && c.name.as_deref() == Some("Team"));
+
+    // Bob leaves it from the problem; nobody else uses it, so it's gone, with
+    // the change and everything the last sync said about it.
+    bob.leave_vault(b.clone(), team.clone()).unwrap();
+    assert!(bob.accounts()[0].problems.is_empty() && bob.vaults().iter().all(|v| v.id != team));
+    assert!(!bob.leave_check(b.clone(), team.clone()).unwrap().unsent);
+    bob.sync(b.clone()).unwrap();
+    assert!(bob.accounts()[0].problems.is_empty());
+
+    // A vault only bob's agent is in: his device can't open it, so the problem
+    // names it by id, and he leaves it by that id.
+    let bob_default = bob.vaults().into_iter().find(|v| v.is_default).unwrap().id;
+    bob.create_agent(b.clone(), "bob-bot".into(), bob_default, Role::Reader, None).unwrap();
+    let gift = alice.create_vault(a.clone(), "Gift".into()).unwrap();
+    alice.share_vault(a.clone(), gift.clone(), "bob-bot".into(), Role::Owner, None).unwrap();
+    alice.leave_vault(a.clone(), gift.clone()).unwrap();
+    bob.sync(b.clone()).unwrap();
+    let problems = bob.accounts()[0].problems.clone();
+    assert!(problems.len() == 1 && problems[0].contains("only an agent of yours is in it"), "{problems:?}");
+    assert_eq!(bob.accounts()[0].problem_vaults, [Some(gift.clone())]);
+    let c = bob.leave_check(b.clone(), gift.clone()).unwrap();
+    assert!(c.name.is_none() && !c.only_owner && !c.unsent);
+
+    // A server's error text can carry a hint of its own: only sync's choice of
+    // vault counts, and never one of your own. Leaving the vault it names leaves
+    // the problem alone.
+    {
+        let acct = bob.acct(&b).unwrap();
+        let mut s = acct.session.lock().unwrap();
+        s.problems.push(Problem { text: format!("vault Personal wasn't updated: server said 404: x (plaintext vault leave {gift} if you don't want it)"), leave: None, vault: None });
+        bob.persist(&acct, &s).unwrap();
+    }
+    assert_eq!(bob.accounts()[0].problem_vaults, [Some(gift.clone()), None]);
+    bob.leave_vault(b.clone(), gift.clone()).unwrap();
+    assert_eq!(bob.accounts()[0].problem_vaults, [None]);
+    assert!(bob.accounts()[0].problems[0].starts_with("vault Personal wasn't updated"));
+    bob.sync(b.clone()).unwrap();
+    assert!(bob.accounts()[0].problems.is_empty(), "{:?}", bob.accounts()[0].problems);
+    // Still gone after a restart, from the device's copy.
+    bob.lock(false);
+    bob.resume(url.clone(), unlock).unwrap();
+    assert!(bob.vaults().iter().all(|v| v.id != gift && v.id != team));
 }

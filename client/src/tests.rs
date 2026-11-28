@@ -267,6 +267,7 @@ fn lying_server_and_hostile_users() {
     // It's still named, as a vault you pay for, but without a hint to leave (delete) it.
     assert!(a3.problems.iter().any(|p| p.contains(&format!("vault Personal ({mine}) counts against your storage"))), "{:?}", a3.problems);
     assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.leave == Some(mine)), "{:?}", a3.problems);
     // ...and it stays hidden (not editable) when this device opens offline.
     let dir = std::env::temp_dir().join(format!("plaintext-hidden-{}", hex::encode(plaintext_core::crypto::random::<8>())));
     a3.save_local(&dir).unwrap();
@@ -280,7 +281,7 @@ fn lying_server_and_hostile_users() {
     a3.sync().unwrap();
     assert!(a3.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a3.problems);
     // Without a hint to leave (delete) the vault the server is attacking.
-    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave") || p.leave.is_some()), "{:?}", a3.problems);
     assert!(a3.vaults[&mine].items().any(|(_, i)| i.password == "added-later"));
 
     // The same for a vault of your own besides the default one.
@@ -337,12 +338,20 @@ fn lying_server_and_hostile_users() {
     *a4.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old.clone()));
     a4.sync().unwrap();
     assert!(a4.problems.iter().any(|p| p.contains(&format!("vault {mine} wasn't updated")) && p.contains("older or different copy")), "{:?}", a4.problems);
-    assert!(!a4.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a4.problems);
+    assert!(!a4.problems.iter().any(|p| p.contains("vault leave") || p.leave.is_some()), "{:?}", a4.problems);
     *a4.t.replay.borrow_mut() = None;
     a4.t.hide.set(Some(mine));
     a4.sync().unwrap();
     assert!(a4.problems.iter().any(|p| p.contains(&format!("vault {mine} counts against your storage"))), "{:?}", a4.problems);
-    assert!(!a4.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a4.problems);
+    assert!(!a4.problems.iter().any(|p| p.contains("vault leave") || p.leave.is_some()), "{:?}", a4.problems);
+    // Nor another vault of yours a fresh device has never opened, when the server
+    // hides it, even before the device that made it syncs again.
+    let home = a3.create_vault("Home").unwrap();
+    let mut a5 = Session::login(evil(&url), &derive("alice pw", &ask), "phone").unwrap();
+    a5.t.hide.set(Some(home));
+    a5.sync().unwrap();
+    assert!(a5.problems.iter().any(|p| p.contains(&format!("vault {home} counts against your storage"))), "{:?}", a5.problems);
+    assert!(!a5.problems.iter().any(|p| p.leave.is_some()), "{:?}", a5.problems);
 
     // Once a co-owner really demotes you in your own vault (a signed demotion), the hint is back.
     a3.t.hide.set(None);
@@ -353,7 +362,7 @@ fn lying_server_and_hostile_users() {
     a3.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
     a3.t.hide.set(Some(mine));
     a3.sync().unwrap();
-    assert!(a3.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {mine}"))), "{:?}", a3.problems);
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {mine}")) && p.leave == Some(mine)), "{:?}", a3.problems);
     // Dropping its unsent change doesn't make it yours again, though it's the signup vault.
     assert_eq!(a3.discard_changes(&mine).unwrap(), 1);
     a3.sync().unwrap();
@@ -1168,7 +1177,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     bob.sync().unwrap();
     assert!(!bob.vaults.contains_key(&trap));
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&trap.to_string())).collect();
-    assert!(named.len() == 1 && named[0].contains(&format!("it counts against your storage (plaintext vault leave {trap} ")), "{named:?}");
+    assert!(named.len() == 1 && named[0].contains(&format!("it counts against your storage (plaintext vault leave {trap} ")) && named[0].leave == Some(trap), "{named:?}");
     bob.leave_vault(&trap).unwrap();
     assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
     // The last one out deletes it.
@@ -1201,9 +1210,9 @@ fn nobody_is_stuck_paying_for_a_vault() {
     bob.sync().unwrap();
     assert!(bob.vaults.contains_key(&big));
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&big.to_string())).collect();
-    assert!(named.len() == 1 && named[0].contains("vault Big counts against your storage, though mallory created it"), "{named:?}");
+    assert!(named.len() == 1 && named[0].contains("vault Big counts against your storage, though mallory created it") && named[0].leave == Some(big), "{named:?}");
     let personal = bob.default_vault().unwrap();
-    assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal")), "{:?}", bob.problems);
+    assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal") || p.leave == Some(personal)), "{:?}", bob.problems);
     bob.leave_vault(&big).unwrap();
     assert_eq!(creator(&big), None);
 
@@ -1220,7 +1229,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.vaults.contains_key(&stale));
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&stale.to_string())).collect();
     assert!(
-        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("it counts against your storage (plaintext vault leave {stale} ")),
+        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("it counts against your storage (plaintext vault leave {stale} ")) && named[0].leave == Some(stale),
         "{named:?}"
     );
     bob.leave_vault(&stale).unwrap();
@@ -1279,7 +1288,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.vaults.contains_key(&open));
     assert!(!bob.problems.iter().any(|p| p.contains("vault Open") || p.contains(&open.to_string())), "{:?}", bob.problems);
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&gift.to_string())).collect();
-    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {gift}")), "{named:?}");
+    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {gift}")) && named[0].leave == Some(gift), "{named:?}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1376,6 +1385,7 @@ fn audit_hidden_default_vault_sends_new_items_to_a_shared_vault() {
     let mut a2 = Session::login(evil(&url), &derive("alice pw", &ask), "laptop").unwrap();
     a2.t.hide.set(Some(personal));
     a2.sync().unwrap();
+    assert!(!a2.problems.iter().any(|p| p.leave == Some(personal)), "{:?}", a2.problems);
     // No silent fallback to Family (shared with bob): the user has to pick a vault.
     assert!(matches!(a2.default_vault(), Err(Error::NotFound(_))), "default_vault() picked {:?} (Family: {fam:?})", a2.default_vault());
     bob.sync().unwrap();
@@ -1957,5 +1967,31 @@ fn device_state_offline_and_import() {
     assert!(back.admin && back.keyring.default_vault == Some(mine));
     assert!(Session::offline(Http::new(&url), alice.token.clone(), account(), Path::new("/nonexistent")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Leaving a vault the server stopped listing drops this device's unsent changes
+/// to it too, so sync stops reporting them.
+#[test]
+fn leaving_an_unlisted_vault_drops_its_unsent_changes() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, quota: Some(64 << 20), ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    let (_, mut bob) = join(evil(&url), "bob", "bob pw", None, "t");
+    let fam = alice.create_vault("Family").unwrap();
+    alice.share_vault(&fam, "bob", Role::Owner, None).unwrap();
+    alice.leave_vault(&fam).unwrap();
+    bob.sync().unwrap();
+    bob.vaults.get_mut(&fam).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "x"));
+    bob.t.hide.set(Some(fam));
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.contains("isn't listed for you any more")), "{:?}", bob.problems);
+    // The one that offers to leave comes first, for an app's one-problem banner.
+    assert!(bob.problems[0].leave == Some(fam), "{:?}", bob.problems);
+
+    bob.leave_vault(&fam).unwrap();
+    assert!(!bob.hidden[&fam].has_changes() && bob.unsendable.is_empty() && bob.problems.is_empty(), "{:?}", bob.problems);
+    bob.t.hide.set(None);
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
     let _ = std::fs::remove_file(&path);
 }

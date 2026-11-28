@@ -250,3 +250,45 @@ fn a_submit_without_a_username() {
     assert_eq!(code(&run(save_login(&mut s, "https://two.example/", "", "other")).unwrap_err()), "refused");
     assert_eq!(list(&s, None, "").len(), 3);
 }
+
+/// Leaving a vault a sync problem names: an owner who left hands bob a vault
+/// that counts against his storage, and the popup offers to leave it.
+#[test]
+fn leaving_a_vault_a_problem_names() {
+    let url = server_with(plaintext_server::Config { open_signup: true, quota: Some(64 << 20), ..Default::default() });
+    let mut alice = Session::signup(Http::new(&url), "alice", "pw", None, "cli").unwrap().1.unwrap();
+    alice.sync().unwrap();
+    let (sk, bob) = Session::signup(Http::new(&url), "bob", "pw", None, "cli").unwrap();
+    bob.unwrap().sync().unwrap();
+    let (mut s, _) = run(add(Later(Http::new(&url)), "pw", &sk.encode(), "x")).unwrap();
+    run(sync(&mut s)).unwrap();
+
+    // Alice is the only owner of a vault bob writes to: she's warned.
+    let team = alice.create_vault("Team").unwrap();
+    alice.share_vault(&team, "bob", Role::Writer, None).unwrap();
+    assert_eq!(run(leave_check(&alice, &team.to_string())).unwrap(), json!({ "name": "Team", "only_owner": true, "unsent": false }));
+
+    // She makes bob an owner and leaves: his sync names the vault, with its id to leave.
+    alice.share_vault(&team, "bob", Role::Owner, None).unwrap();
+    alice.leave_vault(&team).unwrap();
+    let problems = run(sync(&mut s)).unwrap();
+    let named: Vec<_> = problems.iter().filter(|p| p.leave == Some(team)).collect();
+    assert!(named.len() == 1 && named[0].contains("counts against your storage, though alice created it"), "{problems:?}");
+    assert!(problems.iter().all(|p| p.leave == Some(team)), "{problems:?}");
+    let sent = json!(problems);
+    assert_eq!(sent[0]["leave"], team.to_string());
+
+    // A change to it wasn't sent, and a problem about it offers no leave (as when
+    // the server stops listing it): the change is warned about.
+    s.vaults.get_mut(&team).unwrap().put(plaintext_client::plaintext_core::new_item_id(), Item { title: "Unsent".into(), ..Default::default() });
+    s.problems.push(plaintext_client::Problem { text: "vault Team isn't listed for you any more".into(), leave: None, vault: Some(team) });
+    assert_eq!(run(leave_check(&s, &team.to_string())).unwrap(), json!({ "name": "Team", "only_owner": false, "unsent": true }));
+
+    // Nobody else uses it: leaving deletes it with the change and every problem
+    // about it, and the next sync is clean.
+    run(leave(&mut s, &team.to_string())).unwrap();
+    assert!(!s.vaults.contains_key(&team) && s.problems.is_empty());
+    assert_eq!(run(leave_check(&s, &team.to_string())).unwrap()["unsent"], false);
+    assert!(run(sync(&mut s)).unwrap().is_empty());
+    assert_eq!(code(&run(leave(&mut s, "not a vault")).unwrap_err()), "not_found");
+}

@@ -214,6 +214,9 @@ pub struct AccountInfo {
     /// What the last sync couldn't do: vaults that didn't verify (kept as last
     /// verified) and invite conflicts. Show them; the other vaults synced.
     pub problems: Vec<String>,
+    /// For each problem, the vault it offers to leave (one that counts against
+    /// your storage or doesn't verify), as sync decided: never one of your own.
+    pub problem_vaults: Vec<Option<String>>,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -255,6 +258,17 @@ pub struct VaultInfo {
     /// Made by this account (the only kind new items go to by default).
     pub own: bool,
     pub is_default: bool,
+}
+
+/// What leaving a vault would do, to say before it happens.
+#[derive(uniffi::Record)]
+pub struct LeaveCheck {
+    /// None for a vault this device can't open.
+    pub name: Option<String>,
+    /// The others keep it, but nobody can add people or replace its key any more.
+    pub only_owner: bool,
+    /// Changes to it that haven't reached the server yet, which are lost.
+    pub unsent: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -1443,6 +1457,26 @@ impl PlaintextApp {
         self.with(&account, |s| Ok(s.revoke(&id, &username)?))
     }
 
+    /// Ask before `leave_vault`. Asks the server who else uses the vault.
+    pub fn leave_check(&self, account: String, vault: String) -> Res<LeaveCheck> {
+        let id = hex_id(&vault)?;
+        self.peek(&account, |s| {
+            let v = s.vaults.get(&id).or_else(|| s.hidden.get(&id));
+            Ok(LeaveCheck {
+                name: v.filter(|v| v.roster.is_some() && !v.meta.name.is_empty()).map(|v| v.meta.name.clone()),
+                only_owner: s.leaves_ownerless(&id)?,
+                unsent: v.is_some_and(|v| v.has_changes()),
+            })
+        })
+    }
+
+    /// Stop using a vault, with your agents, also one this device can't open
+    /// (by its id from `AccountInfo::problem_vaults`). It's deleted if nobody else uses it.
+    pub fn leave_vault(&self, account: String, vault: String) -> Res<()> {
+        let id = hex_id(&vault)?;
+        self.with(&account, |s| Ok(s.leave_vault(&id)?))
+    }
+
     pub fn audit(&self, account: String, vault: String) -> Res<Vec<AuditData>> {
         let id = hex_id(&vault)?;
         self.peek(&account, |s| Ok(s.audit(&id)?.into_iter().rev().map(|e| AuditData { ts: e.ts, username: e.username, action: e.action }).collect()))
@@ -1723,7 +1757,7 @@ impl PlaintextApp {
 
     fn start(&self, s: S, server: String) -> Res<AccountInfo> {
         let id = hex::encode(s.account.id);
-        let info = AccountInfo { id: id.clone(), server: server.clone(), username: s.username().into(), admin: s.admin, fingerprint: s.me().fingerprint(), pending: false, problems: vec![] };
+        let info = AccountInfo { id: id.clone(), server: server.clone(), username: s.username().into(), admin: s.admin, fingerprint: s.me().fingerprint(), pending: false, problems: vec![], problem_vaults: vec![] };
         let a = Arc::new(Acct { id: id.clone(), server, info: RwLock::new(info), session: Mutex::new(s) });
         {
             let mut accounts = self.accounts.write().expect("lock");
@@ -1754,7 +1788,8 @@ impl PlaintextApp {
             let mut info = a.info.write().expect("lock");
             info.admin = s.admin;
             info.pending = s.vaults.values().any(|v| v.has_changes());
-            info.problems = s.problems.clone();
+            info.problems = s.problems.iter().map(|p| p.text.clone()).collect();
+            info.problem_vaults = s.problems.iter().map(|p| p.leave.map(|id| id.to_string())).collect();
         }
         let rows = s.vaults.iter().flat_map(|(vid, v)| {
             v.items().map(move |(id, item)| Row { account: a.id.clone(), vault: *vid, vault_name: v.meta.name.clone(), id: *id, item: item.clone() })
