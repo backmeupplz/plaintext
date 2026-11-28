@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Plaintext",
+  "version": "0.1.0",
+  "description": "Fills your logins and saves new ones from your Plaintext vaults. Everything is decrypted here, never on the server.",
+  "homepage_url": "https://getplaintext.org",
+  "minimum_chrome_version": "127",
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Plaintext",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png" }
+  },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["storage", "unlimitedStorage", "scripting", "alarms", "offscreen", "clipboardWrite"],
+  "host_permissions": ["https://*/*", "http://*/*"],
+  "content_scripts": [{ "matches": ["https://*/*", "http://*/*"], "js": ["content.js"], "run_at": "document_idle" }],
+  "commands": {
+    "fill": {
+      "suggested_key": { "default": "Ctrl+Shift+L", "mac": "Command+Shift+L" },
+      "description": "Fill the best login for this page"
+    }
+  },
+  "options_ui": { "page": "setup.html", "open_in_tab": true },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https: http:; img-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  }
+}

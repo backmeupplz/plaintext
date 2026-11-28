@@ -26,6 +26,9 @@ pub struct Item {
     pub password: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
+    /// Offer this login only on its URLs' exact hosts, not their whole site.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exact_host: bool,
     /// `otpauth://` URI or a base32 secret.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub totp: String,
@@ -207,6 +210,11 @@ impl Item {
             || self.tags.iter().any(|t| hit(t))
             || hit(&self.notes)
             || self.sections.iter().flat_map(|s| &s.fields).any(|f| f.kind != "concealed" && (hit(&f.label) || hit(&f.value)))
+    }
+
+    /// Whether autofill may offer this login on `page` (see `site::matches`).
+    pub fn matches_page(&self, page: &str) -> bool {
+        self.urls.iter().any(|u| crate::site::matches(u, page, self.exact_host))
     }
 
     /// A field by label (case-insensitive), or one of the built-ins.

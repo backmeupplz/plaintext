@@ -135,16 +135,37 @@ pub fn account_id(sk: &SecretKey) -> Id {
 }
 
 pub fn derive(password: &str, sk: &SecretKey) -> Derived {
+    let stretched = stretch(password, &sha256(&[b"plaintext/v1/argon-salt".as_slice(), &sk.0[..]].concat()));
+    // The Secret Key is the HKDF salt: without it, the password alone yields nothing.
+    expand_keys(&Hkdf::<Sha256>::new(Some(&sk.0[..]), &stretched[..]), account_id(sk))
+}
+
+fn stretch(password: &str, salt: &[u8]) -> Key {
     // NFKD so the same password typed on macOS, Windows and Android matches.
     let password = Zeroizing::new(password.nfkd().collect::<String>());
-    let salt = sha256(&[b"plaintext/v1/argon-salt".as_slice(), &sk.0[..]].concat());
     let params = Params::new(ARGON_M_KIB, ARGON_T, ARGON_P, Some(32)).expect("valid params");
     let mut stretched = Zeroizing::new([0u8; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password.as_bytes(), &salt, &mut stretched[..])
+        .hash_password_into(password.as_bytes(), salt, &mut stretched[..])
         .expect("argon2");
-    // The Secret Key is the HKDF salt: without it, the password alone yields nothing.
-    expand_keys(&Hkdf::<Sha256>::new(Some(&sk.0[..]), &stretched[..]), account_id(sk))
+    stretched
+}
+
+/// The Secret Key as a browser extension keeps it between unlocks, which have
+/// only the password: sealed under the password, stretched with a random salt.
+/// Apps keep it in the OS keychain instead; a browser profile has nothing like
+/// that, so someone who copies the profile can guess the password offline at
+/// Argon2 speed, as they could with the server's database and the Secret Key.
+pub fn seal_secret_key(password: &str, sk: &SecretKey) -> Vec<u8> {
+    let salt: [u8; 16] = random();
+    [&salt[..], &seal(&stretch(password, &salt), &ad("local-secret-key", &[]), &sk.0[..])].concat()
+}
+
+/// `Tampered` means the wrong password (or a damaged blob).
+pub fn open_secret_key(password: &str, blob: &[u8]) -> Result<SecretKey, Error> {
+    let (salt, sealed) = blob.split_at_checked(16).ok_or(Error::Tampered)?;
+    let raw = open(&stretch(password, salt), &ad("local-secret-key", &[]), sealed)?;
+    Ok(SecretKey(Zeroizing::new(raw[..].try_into().map_err(|_| Error::Tampered)?)))
 }
 
 fn expand_keys(hk: &Hkdf<Sha256>, account_id: Id) -> Derived {

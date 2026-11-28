@@ -8,6 +8,12 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["extension"]
+# The browser extension's exports: accounts, sync and autofill over fetch. The
+# share-link viewer (docs/s) builds without them (wasm/build.sh).
+extension = ["dep:plaintext-client", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:zeroize", "dep:hex"]
+
 [dependencies]
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["wasm_js"] }
@@ -15,3 +21,13 @@ plaintext-core = { path = "../core" }
 serde_json = "1"
 # Must match the wasm-bindgen CLI that build.sh downloads.
 wasm-bindgen = "=0.2.130"
+plaintext-client = { path = "../client", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+zeroize = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+
+[dev-dependencies]
+plaintext-server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+serde_json = "1"

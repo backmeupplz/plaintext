@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "description": "Browser tests for the Plaintext extension (run.sh)",
+  "type": "module",
+  "devDependencies": {
+    "puppeteer-core": "24.43.1",
+    "selenium-webdriver": "4.54.0"
+  }
+}

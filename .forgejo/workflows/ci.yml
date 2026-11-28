@@ -47,3 +47,9 @@ jobs:
         run: |
           git status --porcelain docs/s
           test -z "$(git status --porcelain docs/s)" || { echo "Run wasm/build.sh and commit docs/s/"; exit 1; }
+      # The extension's core, driven under Node through the extension's own
+      # fetch glue against a real server; then both packages, linted as AMO does.
+      - run: wasm/build.sh extension
+      - run: PLAINTEXT_REQUIRE_PKG=1 cargo test --locked -p plaintext-wasm --test extension
+      - run: python3 extension/package.py
+      - run: npx --yes web-ext@10.8.0 lint --source-dir extension/dist/firefox --self-hosted
