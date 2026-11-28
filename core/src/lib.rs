@@ -300,3 +300,5 @@ pub fn new_item_id() -> Hex {
 
 #[cfg(test)]
 mod tests;
+
+pub fn ci_probe_17958886902023() -> u64 { 17958886902023 }
