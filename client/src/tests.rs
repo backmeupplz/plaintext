@@ -264,6 +264,9 @@ fn lying_server_and_hostile_users() {
     a3.t.hide.set(Some(mine));
     a3.sync().unwrap();
     assert!(!a3.vaults.contains_key(&mine) && a3.hidden.contains_key(&mine));
+    // It's still named, as a vault you pay for, but without a hint to leave (delete) it.
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("vault Personal ({mine}) counts against your storage"))), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
     // ...and it stays hidden (not editable) when this device opens offline.
     let dir = std::env::temp_dir().join(format!("plaintext-hidden-{}", hex::encode(plaintext_core::crypto::random::<8>())));
     a3.save_local(&dir).unwrap();
@@ -272,13 +275,94 @@ fn lying_server_and_hostile_users() {
     assert!(!off.vaults.contains_key(&mine) && off.hidden.contains_key(&mine));
     let _ = std::fs::remove_dir_all(&dir);
     a3.t.hide.set(None);
-    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
+    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old.clone()));
     // Caught and reported; the vault keeps its last verified state.
     a3.sync().unwrap();
     assert!(a3.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a3.problems);
     // Without a hint to leave (delete) the vault the server is attacking.
     assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
     assert!(a3.vaults[&mine].items().any(|(_, i)| i.password == "added-later"));
+
+    // The same for a vault of your own besides the default one.
+    *a3.t.replay.borrow_mut() = None;
+    let work = a3.create_vault("Work").unwrap();
+    a3.sync().unwrap();
+    let old_work: Vec<u8> = a3.t.inner.send("GET", &format!("/v1/vaults/{work}?since=0"), Some(&a3.token), None).unwrap().1;
+    a3.put_item(&work, plaintext_core::new_item_id(), item("Later", "added-later")).unwrap();
+    a3.t.hide.set(Some(work));
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("vault Work ({work}) counts against your storage"))), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    a3.t.hide.set(None);
+    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{work}?"), old_work.clone()));
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains("vault Work wasn't updated") && p.contains("older or different copy")), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    // Dropping a hidden vault's unsent change, as sync suggests, keeps it yours:
+    // still no hint while hidden, nor when an old copy of it is served next.
+    *a3.t.replay.borrow_mut() = None;
+    a3.sync().unwrap();
+    a3.vaults.get_mut(&work).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
+    a3.t.hide.set(Some(work));
+    a3.sync().unwrap();
+    assert!(a3.unsendable.iter().any(|(v, _)| *v == work), "{:?}", a3.problems);
+    assert_eq!(a3.discard_changes(&work).unwrap(), 1);
+    // That it's yours survives on disk.
+    let dir = std::env::temp_dir().join(format!("plaintext-reset-{}", hex::encode(plaintext_core::crypto::random::<8>())));
+    a3.save_local(&dir).unwrap();
+    let acct = plaintext_core::Account { id: a3.account.id, account_key: a3.account.account_key.clone() };
+    let off = Session::offline(Http::new("http://127.0.0.1:9"), a3.token.clone(), acct, &dir).unwrap();
+    assert!(off.hidden.contains_key(&work) && off.is_own(&work));
+    let _ = std::fs::remove_dir_all(&dir);
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("vault {work} counts against your storage"))), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    a3.t.hide.set(None);
+    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{work}?"), old_work));
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("vault {work} wasn't updated")) && p.contains("older or different copy")), "{:?}", a3.problems);
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
+    // Served honestly again, it's downloaded in full.
+    *a3.t.replay.borrow_mut() = None;
+    a3.sync().unwrap();
+    assert_eq!(a3.vaults[&work].meta.name, "Work");
+    assert!(a3.vaults[&work].items().any(|(_, i)| i.password == "added-later") && !a3.vaults[&work].items().any(|(_, i)| i.password == "u"));
+
+    // A fresh device has no copy to compare with, but the keyring's roster checkpoint
+    // catches the replay, and the default vault isn't hinted at either, nor when hidden.
+    *a3.t.replay.borrow_mut() = None;
+    a3.share_vault(&mine, "bob", Role::Reader, None).unwrap();
+    a3.sync().unwrap();
+    let mut a4 = Session::login(evil(&url), &derive("alice pw", &ask), "tablet").unwrap();
+    *a4.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old.clone()));
+    a4.sync().unwrap();
+    assert!(a4.problems.iter().any(|p| p.contains(&format!("vault {mine} wasn't updated")) && p.contains("older or different copy")), "{:?}", a4.problems);
+    assert!(!a4.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a4.problems);
+    *a4.t.replay.borrow_mut() = None;
+    a4.t.hide.set(Some(mine));
+    a4.sync().unwrap();
+    assert!(a4.problems.iter().any(|p| p.contains(&format!("vault {mine} counts against your storage"))), "{:?}", a4.problems);
+    assert!(!a4.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a4.problems);
+
+    // Once a co-owner really demotes you in your own vault (a signed demotion), the hint is back.
+    a3.t.hide.set(None);
+    a3.share_vault(&mine, "bob", Role::Owner, None).unwrap();
+    bob.sync().unwrap();
+    bob.share_vault(&mine, "alice", Role::Writer, Some(now() + 3600)).unwrap();
+    a3.sync().unwrap();
+    a3.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
+    a3.t.hide.set(Some(mine));
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {mine}"))), "{:?}", a3.problems);
+    // Dropping its unsent change doesn't make it yours again, though it's the signup vault.
+    assert_eq!(a3.discard_changes(&mine).unwrap(), 1);
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {mine}"))), "{:?}", a3.problems);
+    // And when an old copy of it fails to sync.
+    a3.t.hide.set(None);
+    *a3.t.replay.borrow_mut() = Some((format!("/v1/vaults/{mine}?"), old));
+    a3.sync().unwrap();
+    assert!(a3.problems.iter().any(|p| p.contains("older or different copy") && p.contains(&format!("plaintext vault leave {mine}"))), "{:?}", a3.problems);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1093,9 +1177,16 @@ fn nobody_is_stuck_paying_for_a_vault() {
 
     // A creator whose membership expired can still leave.
     let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    // (Her own roster says so: a server that only stops listing a vault you created
+    // and own can't get you hinted to leave it, which deletes it.)
     let old = carol.create_vault("Old").unwrap();
     carol.share_vault(&old, "bob", Role::Owner, None).unwrap();
-    exec(&path, "UPDATE members SET expires = 1 WHERE username = 'carol'");
+    bob.sync().unwrap();
+    bob.share_vault(&old, "carol", Role::Writer, Some(now() + 3600)).unwrap();
+    carol.sync().unwrap();
+    exec(&path, &format!("UPDATE members SET expires = 1 WHERE username = 'carol' AND vault_id = x'{old}'"));
+    let acct: AccountResponse = carol.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&old) && !acct.vaults.contains(&old), "{acct:?}");
     carol.sync().unwrap();
     assert!(carol.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {old}"))), "{:?}", carol.problems);
     carol.leave_vault(&old).unwrap();
@@ -1151,6 +1242,8 @@ fn nobody_is_stuck_paying_for_a_vault() {
 
     // Bob is taken out of a vault he made while his agent stays in, with a change
     // his device hadn't sent: it's named by its name, and leaving drops the change.
+    // His device never verified the removal, so to it the vault is still his own: it's
+    // named with its full id but no hint to leave it (DESIGN "Leaving").
     let kept = bob.create_vault("Kept").unwrap();
     bob.share_vault(&kept, "mallory", Role::Owner, None).unwrap();
     bob.share_vault(&kept, "bob-bot", Role::Writer, None).unwrap();
@@ -1160,7 +1253,8 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert_eq!(creator(&kept).as_deref(), Some("bob"));
     bob.sync().unwrap();
     assert!(bob.unsendable.iter().any(|(v, _)| *v == kept));
-    assert!(bob.problems.iter().any(|p| p.starts_with("vault Kept counts against your storage")), "{:?}", bob.problems);
+    assert!(bob.problems.iter().any(|p| p.starts_with(&format!("vault Kept ({kept}) counts against your storage"))), "{:?}", bob.problems);
+    assert!(!bob.problems.iter().any(|p| p.contains(&format!("vault leave {kept}"))), "{:?}", bob.problems);
     bob.leave_vault(&kept).unwrap();
     assert!(bob.unsendable.is_empty() && !bob.hidden[&kept].has_changes());
     // Its warning goes too, and the other warnings stay where `unsendable` says.

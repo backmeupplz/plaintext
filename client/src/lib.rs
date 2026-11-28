@@ -377,8 +377,9 @@ impl<T: AsyncTransport> Session<T> {
                 // Anyone can share a vault with you (or an agent); one that doesn't
                 // check out mustn't stop the others. Network and session errors still do.
                 Err(e @ (Error::Core(_) | Error::Server(403 | 404, _) | Error::NotFound(_) | Error::Refused(_))) => {
+                    let own = self.is_own(id);
                     // A vault opened before keeps its name, though it may never open again.
-                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| (v.meta.name.clone(), v.creator.clone()));
+                    let known = self.vaults.get(id).filter(|v| v.roster.is_some()).map(|v| v.meta.name.clone());
                     let read_only = matches!(e, Error::Core(plaintext_core::Error::ReadOnly));
                     // One reset while unlisted keeps its guard for the next try.
                     if known.is_none()
@@ -386,22 +387,19 @@ impl<T: AsyncTransport> Session<T> {
                     {
                         self.hidden.insert(*id, v);
                     }
-                    match known {
-                        // Your own vault: a server serving an old copy mustn't talk you into deleting it.
-                        // Nor does a change you can't send (you only read the vault) need you to
+                    let opened = known.is_some();
+                    let name = known.unwrap_or_else(|| id.to_string());
+                    match opened {
+                        // A change you can't send (you only read the vault) doesn't need you to
                         // leave; the vault itself synced, so it's named below if you pay for it.
-                        Some((name, creator)) if creator == self.keyring.username || read_only => {
+                        true if read_only => {
                             // Only pending changes make a reader's push fail.
-                            let hint = if read_only {
-                                self.unsendable.push((*id, self.problems.len()));
-                                ", so this device's changes to it can't be sent"
-                            } else {
-                                ""
-                            };
-                            self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"))
+                            self.unsendable.push((*id, self.problems.len()));
+                            self.problems.push(format!("vault {name} wasn't updated: {e}, so this device's changes to it can't be sent"))
                         }
-                        k => {
-                            let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
+                        // Your own vault: a server serving an old copy mustn't talk you into deleting it.
+                        _ if own => self.problems.push(format!("vault {name} wasn't updated: {e}")),
+                        _ => {
                             let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
                             // The app drops a trailing " (plaintext …" hint.
                             self.problems.push(format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"));
@@ -421,9 +419,9 @@ impl<T: AsyncTransport> Session<T> {
         }
         // Someone can make you an owner and leave, and the vault counts against you
         // from then on (DESIGN "Leaving"). Name every vault you pay for: one you aren't a
-        // current member of always, one you can open but didn't create only while storage
-        // is limited (or a vault you took over on purpose would be named on every sync for
-        // nothing). One that failed is named above.
+        // current member of always (your own without how to leave it), one you can open
+        // but didn't create only while storage is limited (or a vault you took over on
+        // purpose would be named on every sync for nothing). One that failed is named above.
         for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
             match self.vaults.get(id).filter(|v| v.roster.is_some()) {
                 Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
@@ -431,6 +429,11 @@ impl<T: AsyncTransport> Session<T> {
                     "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
                     v.meta.name, v.creator
                 )),
+                None if self.is_own(id) => {
+                    // The full id too: `vault leave` can't find a vault it doesn't list by name.
+                    let name = self.hidden.get(id).filter(|v| v.roster.is_some()).map_or_else(|| id.to_string(), |v| format!("{} ({id})", v.meta.name));
+                    self.problems.push(format!("vault {name} counts against your storage, but the server isn't listing it for you (unless you were taken out of it, don't leave it for that: a server can hide a vault on purpose)"));
+                }
                 None => {
                     // The name this device last saw, if it kept the vault (`hidden`).
                     let name = self.hidden.get(id).map(|v| v.meta.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
@@ -453,6 +456,19 @@ impl<T: AsyncTransport> Session<T> {
         }
         self.save_keyring_async().await?;
         full.map_or(Ok(()), Err)
+    }
+
+    /// Whether vault `id` is our own, as far as this device can tell: one we created
+    /// whose roster, as last verified here, lists us as an owner, or with no verified
+    /// roster, the one made at signup. Sync never suggests leaving (deleting) it.
+    fn is_own(&self, id: &Hex) -> bool {
+        let me = self.username();
+        match self.vaults.get(id).or_else(|| self.hidden.get(id)) {
+            Some(v) if v.roster.is_some() => v.creator == me && v.role(me, now()) == Some(Role::Owner),
+            // A vault reset to its rollback guard (`discard_changes`) names a creator only if
+            // it was ours; the signup vault counts only for a device that never had a copy.
+            v => v.filter(|v| v.counter > 0).map_or(self.keyring.default_vault == Some(*id), |v| v.creator == me),
+        }
     }
 
     async fn pull_async(&mut self, id: &Hex) -> Result<()> {
@@ -538,7 +554,8 @@ impl<T: AsyncTransport> Session<T> {
     /// download fails, nothing changes. Returns how many changes were dropped.
     ///
     /// A vault the server no longer lists can't be downloaded: it keeps only its
-    /// rollback guard, and is downloaded in full if it's listed again.
+    /// rollback guard (and whether it's ours), and is downloaded in full if
+    /// it's listed again.
     pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
         self.discard_async(id, false).await
     }
@@ -573,8 +590,17 @@ impl<T: AsyncTransport> Session<T> {
                     return Err(Error::Refused("This vault is shared with you again. Sync to see whether these changes can be sent.".into()));
                 }
             }
+            // Still ours after the reset, or the next sync would suggest leaving (deleting) it.
+            let me = self.is_own(id).then(|| self.username().to_owned());
             let v = self.hidden.get_mut(id).expect("checked above");
-            if v.has_changes() { v.forget() } else { 0 }
+            let n = v.changes();
+            if n > 0 {
+                v.forget();
+                if let Some(me) = me {
+                    v.creator = me;
+                }
+            }
+            n
         } else {
             self.pull_async(id).await?;
             // Today's roster, not the one the warning came from.
