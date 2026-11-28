@@ -1083,7 +1083,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     bob.sync().unwrap();
     assert!(!bob.vaults.contains_key(&trap));
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&trap.to_string())).collect();
-    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {trap}; it counts against your storage")), "{named:?}");
+    assert!(named.len() == 1 && named[0].contains(&format!("it counts against your storage (plaintext vault leave {trap} ")), "{named:?}");
     bob.leave_vault(&trap).unwrap();
     assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
     // The last one out deletes it.
@@ -1128,7 +1128,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     assert!(bob.vaults.contains_key(&stale));
     let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&stale.to_string())).collect();
     assert!(
-        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("plaintext vault leave {stale}; it counts against your storage")),
+        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("it counts against your storage (plaintext vault leave {stale} ")),
         "{named:?}"
     );
     bob.leave_vault(&stale).unwrap();

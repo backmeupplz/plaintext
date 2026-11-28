@@ -409,7 +409,8 @@ impl<T: Transport> Session<T> {
                         k => {
                             let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
                             let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
-                            self.problems.push(format!("vault {name} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"));
+                            // The app drops a trailing " (plaintext …" hint.
+                            self.problems.push(format!("vault {name} wasn't updated: {e}{paid} (plaintext vault leave {id} if you don't want it)"));
                         }
                     }
                     failed.push(*id);
@@ -426,11 +427,11 @@ impl<T: Transport> Session<T> {
             match self.vaults.get(id).filter(|v| v.roster.is_some()) {
                 Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => {}
                 Some(v) => self.problems.push(format!(
-                    "vault {} counts against your storage, though {} created it (to stop that: plaintext vault leave {id})",
+                    "vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)",
                     v.meta.name, v.creator
                 )),
                 None => self.problems.push(format!(
-                    "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"
+                    "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (plaintext vault leave {id} to stop that)"
                 )),
             }
         }

@@ -137,7 +137,7 @@ fn app_end_to_end() {
     assert_eq!(alice.download_file(a.clone(), work.clone(), moved.clone(), f).unwrap(), b"recovery codes");
 
     // 1PUX import.
-    assert_eq!(alice.import_items(a.clone(), ImportFormat::OnePux, onepux_fixture(), None).unwrap(), 8);
+    assert_eq!(alice.import_items(a.clone(), ImportFormat::OnePux, onepux_fixture(), None).unwrap().items, 8);
     assert!(alice.vaults().iter().any(|v| v.name == "Shared"));
 
     // Invite bob with a link: both sides end up verified.

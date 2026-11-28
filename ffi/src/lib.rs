@@ -176,6 +176,15 @@ pub struct SignupResult {
     pub warning: Option<String>,
 }
 
+/// What an import saved. Its items are on this device even with a warning.
+#[derive(uniffi::Record)]
+pub struct ImportResult {
+    pub items: u32,
+    /// A push or an upload failed: what went wrong, and that importing the
+    /// file again would add the items twice.
+    pub warning: Option<String>,
+}
+
 #[derive(uniffi::Record)]
 pub struct LoginResult {
     pub account: AccountInfo,
@@ -1365,9 +1374,9 @@ impl PlaintextApp {
 
     /// Parse and save imported data into one account. Source vaults land in its
     /// own vaults of the same name (made if needed) unless `vault` is given.
-    /// Returns the count. On an error the items that got in are still saved on
-    /// this device and go out with the next sync, without their remaining attachments.
-    pub fn import_items(&self, account: String, format: ImportFormat, data: Vec<u8>, vault: Option<String>) -> Res<u32> {
+    /// Every item is saved on this device before anything is pushed, so a failed
+    /// push or upload comes back as a warning.
+    pub fn import_items(&self, account: String, format: ImportFormat, data: Vec<u8>, vault: Option<String>) -> Res<ImportResult> {
         let data = Zeroizing::new(data);
         let imported = match format {
             ImportFormat::OnePux => import::onepux(&data)?,
@@ -1377,10 +1386,14 @@ impl PlaintextApp {
         let into = vault.as_deref().map(hex_id).transpose()?;
         self.with(&account, |s| {
             let r = s.import(imported, into)?;
-            match r.sync_error.or(r.upload_error) {
-                Some(e) => Err(e.into()),
-                None => Ok(r.items as u32),
+            let mut warning = Vec::new();
+            if let Some(e) = r.sync_error {
+                warning.push(format!("{} The items are saved on this device and go to the server with the next sync, so don't import this file again.", PlaintextError::from(e)));
             }
+            if let Some(e) = r.upload_error {
+                warning.push(format!("{} These attachments weren't uploaded; add them to their items: {}.", PlaintextError::from(e), r.skipped.join(", ")));
+            }
+            Ok(ImportResult { items: r.items as u32, warning: (!warning.is_empty()).then(|| warning.join("\n")) })
         })
     }
 
