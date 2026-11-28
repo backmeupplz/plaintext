@@ -151,7 +151,7 @@ and one counter per vault</pre>
 
 <section id="cli">
   <h2>Your vault in the terminal</h2>
-  <p class="sub">The <code>plaintext</code> command line keeps your Secret Key and unlocked session in your operating system's keychain. Unlocking lasts 12 hours and, on macOS and Linux, only in the terminal you unlocked in, the way <code>sudo</code> does, so scripts and AI tools use agent keys of their own instead. The installer works on macOS and Linux and checks the download against the release's checksums before it unpacks anything, and Homebrew works too.</p>
+  <p class="sub">The <code>plaintext</code> command line keeps your Secret Key and unlocked session in your operating system's keychain. Unlocking lasts 12 hours and, on macOS and Linux, only in the terminal you unlocked in, the way <code>sudo</code> does, so scripts and AI tools use agent keys of their own instead. The installer works on macOS and Linux, and Homebrew works too. Before the installer unpacks anything, it checks that the release's checksums are signed by the Plaintext release key and that the download matches them.</p>
 <pre>curl -fsSL https://getplaintext.org/install | sh
 <span class="c"># or</span>
 brew install backmeupplz/tap/plaintext</pre>
@@ -162,6 +162,10 @@ plaintext add GitHub --username alice --generate --url https://github.com
 plaintext get github
 plaintext vault create Family && plaintext vault share Family bob --role writer
 plaintext import 1pux ~/Downloads/export.1pux   <span class="c"># also bitwarden and csv</span></pre>
+  <p class="sub" style="margin-top:18px">Every release has a <code>SHA256SUMS</code> file signed with the release key, so you can check anything you download from it yourself. Download the archive you want together with <code>SHA256SUMS</code> and <code>SHA256SUMS.sig</code> into one folder and put the key in a file there. Then ask <code>ssh-keygen</code>, which comes with macOS and with OpenSSH on Linux, whether the signature is good, and check that your archive matches the sums with <code>shasum</code>, or with <code>sha256sum -c --ignore-missing SHA256SUMS</code> on a Linux system that doesn't have <code>shasum</code> (on Alpine, install coreutils first).</p>
+<pre>echo "release@getplaintext.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN/TcFdPnP6bWhdxrnNt1Ef2hEAmCgB+kRyGWOmpZqQC" > signers
+ssh-keygen -Y verify -f signers -I release@getplaintext.org -n plaintext-release -s SHA256SUMS.sig &lt; SHA256SUMS
+shasum -a 256 -c --ignore-missing SHA256SUMS</pre>
 </section>
 
 <section id="agents">

@@ -4,6 +4,9 @@
 set -eu
 
 repo=backmeupplz/plaintext
+# The release key: SHA256SUMS must carry its signature, so replacing a release's files isn't enough to change what this
+# installs. Its public half is also on https://getplaintext.org.
+key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN/TcFdPnP6bWhdxrnNt1Ef2hEAmCgB+kRyGWOmpZqQC'
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64) target=aarch64-apple-darwin ;;
   Darwin/x86_64) target=x86_64-apple-darwin ;;
@@ -17,15 +20,26 @@ case "$(uname -s)/$(uname -m)" in
     ;;
 esac
 
+command -v ssh-keygen >/dev/null 2>&1 || {
+  echo "The installer checks the release's signature with ssh-keygen, so install OpenSSH first (openssh-client on Debian and Ubuntu, openssh on Fedora, openssh-keygen on Alpine)." >&2
+  exit 1
+}
+
 dir="${PLAINTEXT_INSTALL_DIR:-$HOME/.plaintext/bin}"
-mkdir -p "$dir"
 base="https://github.com/$repo/releases/latest/download"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 echo "downloading $base/plaintext-$target.tar.gz"
 curl -fsSL -o "$tmp/plaintext-$target.tar.gz" "$base/plaintext-$target.tar.gz"
-# the release's SHA256SUMS: a download that doesn't match it never gets unpacked
+# the release's SHA256SUMS, signed by the release key: a download that doesn't match it never gets unpacked
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+curl -fsSL -o "$tmp/SHA256SUMS.sig" "$base/SHA256SUMS.sig"
+echo "release@getplaintext.org $key" > "$tmp/signers"
+ssh-keygen -Y verify -f "$tmp/signers" -I release@getplaintext.org -n plaintext-release -s "$tmp/SHA256SUMS.sig" \
+  < "$tmp/SHA256SUMS" >/dev/null 2>&1 || {
+  echo "The release's SHA256SUMS isn't signed by the Plaintext release key (this check needs OpenSSH 8.1 or newer), so nothing was installed." >&2
+  exit 1
+}
 if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; else sum="shasum -a 256"; fi
 # compared by hand: some sha256sum -c pass on empty input, so a missing line would skip the check
 want="$(grep " plaintext-$target.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
@@ -36,6 +50,7 @@ got="$($sum "$tmp/plaintext-$target.tar.gz" | cut -d' ' -f1)"
 }
 tar -xzf "$tmp/plaintext-$target.tar.gz" -C "$tmp" plaintext
 chmod +x "$tmp/plaintext"
+mkdir -p "$dir"
 mv "$tmp/plaintext" "$dir/plaintext"
 echo "installed $("$dir/plaintext" --version) to $dir/plaintext"
 
