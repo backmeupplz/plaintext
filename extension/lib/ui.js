@@ -42,6 +42,12 @@ export function explain(e) {
   }
 }
 
+/** A sync problem for people: without the CLI hint it can end with (the
+ *  popup has its own Leave). */
+export function problemText(text) {
+  return text.split(' (plaintext ')[0]
+}
+
 /** A tile with the title's first letter on a tint from the title (never a favicon). */
 export function monogram(title) {
   let h = 0

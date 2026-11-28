@@ -126,6 +126,14 @@ final class AppModel: ObservableObject {
     @Published var editor: EditorRequest?
     @Published var toast: Toast?
     @Published var banner: String?
+    /// The vault the banner's problem offers to leave, while that banner shows.
+    @Published var bannerLeave: (text: String, account: String, vault: String)?
+    /// A vault to leave, once the person confirms (`leaveDialog`).
+    struct LeaveRequest {
+        let account: String
+        let vault: String
+        let check: LeaveCheck
+    }
     @Published var syncing = false
     /// Hidden from lists while its delete is pending.
     private var deleting: Set<String> = []
@@ -520,10 +528,45 @@ final class AppModel: ObservableObject {
 
     /// What the last sync or sign-in couldn't do (vaults that didn't verify, a damaged copy).
     private func showProblems() {
-        guard banner == nil, let p = accounts.lazy.flatMap(\.problems).first else { return }
-        // The client's text can end with a CLI hint; the app has its own Verify screen.
-        banner = capitalized(p.components(separatedBy: " (plaintext ").first ?? p)
+        guard banner == nil, let (a, p, v) = accounts.lazy.flatMap({ a in zip(a.problems, a.problemVaults).map { (a.id, $0, $1) } }).first else { return }
+        let text = problemText(p)
+        banner = text
+        bannerLeave = v.map { (text, a, $0) }
     }
+
+    /// Ask the server what leaving would do, to confirm with `leaveDialog`.
+    func leaveRequest(account: String, vault: String) async -> LeaveRequest? {
+        do {
+            let check = try await call { try $0.leaveCheck(account: account, vault: vault) }
+            return LeaveRequest(account: account, vault: vault, check: check)
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    func leave(_ r: LeaveRequest) async {
+        // A problem about the vault shown on the banner goes with it (the client drops them all).
+        let shown = banner
+        let isProblem = { (b: String?) in self.account(r.account)?.problems.contains { self.problemText($0) == b } ?? false }
+        // (Or the banner offered this leave, though a sync since cleared its problem.)
+        let wasProblem = isProblem(shown) || bannerLeave.map { $0.text == shown && $0.account == r.account && $0.vault == r.vault } == true
+        do {
+            try await call { try $0.leaveVault(account: r.account, vault: r.vault) }
+            if case .vault(r.account, r.vault)? = nav { nav = .all }
+            reload()
+            if wasProblem, banner == shown, !isProblem(shown) { banner = nil }
+            showProblems()
+            flash("Left \(r.check.name ?? "the vault")")
+        } catch {
+            // The server may have taken the leave before a local save failed.
+            reload()
+            show(error)
+        }
+    }
+
+    /// The client's text can end with a CLI hint; the app has its own Verify screen and Leave action.
+    func problemText(_ p: String) -> String { capitalized(p.components(separatedBy: " (plaintext ").first ?? p) }
 
     private func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 

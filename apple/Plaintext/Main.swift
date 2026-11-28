@@ -41,6 +41,8 @@ struct PlaintextMain: App {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    /// Asked from the banner, which may go away before the person answers.
+    @State private var leaving: AppModel.LeaveRequest?
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
@@ -55,7 +57,8 @@ struct RootView: View {
             }
         }
         .overlay(alignment: .bottom) { ToastView() }
-        .overlay(alignment: .top) { BannerView() }
+        .overlay(alignment: .top) { BannerView(leaving: $leaving) }
+        .leaveDialog($leaving)
         .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
             if phase == .active { Task { await model.syncAll() } }
         }
@@ -166,8 +169,44 @@ struct ToastView: View {
     }
 }
 
+extension View {
+    /// Confirm leaving a vault, warning as the CLI does.
+    func leaveDialog(_ request: Binding<AppModel.LeaveRequest?>) -> some View {
+        modifier(LeaveDialog(request: request))
+    }
+}
+
+private struct LeaveDialog: ViewModifier {
+    @EnvironmentObject var model: AppModel
+    @Binding var request: AppModel.LeaveRequest?
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "Leave \(request?.check.name ?? "this vault")?",
+            isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }),
+            titleVisibility: .visible,
+            presenting: request
+        ) { r in
+            Button("Leave vault", role: .destructive) { Task { await model.leave(r) } }
+        } message: { r in
+            Text(warning(r))
+        }
+    }
+
+    private func warning(_ r: AppModel.LeaveRequest) -> String {
+        let c = r.check
+        // A vault this device can't open has no name here: say which one by its id.
+        var s = c.name == nil ? "Vault \(r.vault). " : ""
+        s += "This takes you and your agents out of the vault. If nobody else uses it, it's deleted with everything in it."
+        if c.onlyOwner { s += " You're its only owner: the others keep it, but nobody can add people to it or replace its key any more." }
+        if c.unsent { s += " Changes to it that haven't reached the server yet are lost." }
+        return s
+    }
+}
+
 struct BannerView: View {
     @EnvironmentObject var model: AppModel
+    @Binding var leaving: AppModel.LeaveRequest?
 
     var body: some View {
         if let text = model.banner {
@@ -175,6 +214,12 @@ struct BannerView: View {
                 Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Palette.warn)
                 Text(text).font(.subheadline).foregroundStyle(Palette.fg).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
+                if let l = model.bannerLeave, l.text == text {
+                    Button("Leave…") { Task { leaving = await model.leaveRequest(account: l.account, vault: l.vault) } }
+                        .font(.subheadline.weight(.semibold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Palette.accent)
+                }
                 Button { model.banner = nil } label: { Image(systemName: "xmark").foregroundStyle(Palette.muted) }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Dismiss")

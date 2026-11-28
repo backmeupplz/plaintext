@@ -16,7 +16,7 @@ use plaintext_client::plaintext_core::api::{Hex, Role};
 use plaintext_client::plaintext_core::crypto::{self, SecretKey};
 use plaintext_client::plaintext_core::item::Item;
 use plaintext_client::plaintext_core::{self as core, Account as Keys, Vault, site};
-use plaintext_client::{AsyncTransport, Error, Session, now, now_ms};
+use plaintext_client::{AsyncTransport, Error, Problem, Session, now, now_ms};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -228,17 +228,43 @@ pub async fn set_exact_host<T: AsyncTransport>(s: &mut Session<T>, vault: &str, 
 /// should see. As in the CLI, a vault that couldn't push (out of storage, or
 /// another device got there first) is a warning, not a failed sync: its change
 /// stays on this device and goes at the next sync, and the rest still count.
-pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<String>, Error> {
+/// A problem's `leave` names the vault it offers to leave with `leave`, never one of your own.
+pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<Problem>, Error> {
     let r = s.sync_async().await;
     let mut problems = s.problems.clone();
     match r {
         Ok(()) => {}
-        Err(Error::Server(507, msg)) => problems.push(format!("A change is kept on this device until there's room: {msg}")),
-        Err(Error::Server(413, msg)) => problems.push(format!("A change is kept on this device, but it's too big to send: {msg}")),
-        Err(Error::Server(409, msg)) => problems.push(format!("A change is kept on this device and sent at the next sync: {msg}")),
+        Err(Error::Server(507, msg)) => problems.push(format!("A change is kept on this device until there's room: {msg}").into()),
+        Err(Error::Server(413, msg)) => problems.push(format!("A change is kept on this device, but it's too big to send: {msg}").into()),
+        Err(Error::Server(409, msg)) => problems.push(format!("A change is kept on this device and sent at the next sync: {msg}").into()),
         Err(e) => return Err(e),
     }
     Ok(problems)
+}
+
+fn vault_id(vault: &str) -> Result<Hex, Error> {
+    vault.parse().map_err(|_| Error::NotFound("vault".into()))
+}
+
+/// What leaving a vault would do, to say before it happens: its name (null for
+/// one this device can't open), whether you're its only owner (the others keep
+/// it, but nobody can add people or replace its key any more), and whether it
+/// has changes that haven't reached the server, which are lost.
+pub async fn leave_check<T: AsyncTransport>(s: &Session<T>, vault: &str) -> Result<Value, Error> {
+    let id = vault_id(vault)?;
+    let v = s.vaults.get(&id).or_else(|| s.hidden.get(&id));
+    Ok(json!({
+        "name": v.filter(|v| v.roster.is_some() && !v.meta.name.is_empty()).map(|v| &v.meta.name),
+        "only_owner": s.leaves_ownerless_async(&id).await?,
+        "unsent": v.is_some_and(|v| v.has_changes()),
+    }))
+}
+
+/// Stop using a vault, with your agents, also one this device can't open (by
+/// the id a sync problem gave). It's deleted if nobody else uses it.
+pub async fn leave<T: AsyncTransport>(s: &mut Session<T>, vault: &str) -> Result<(), Error> {
+    let id = vault_id(vault)?;
+    s.leave_vault_async(&id).await
 }
 
 /// A short code JavaScript can branch on, next to the message for people.
@@ -379,7 +405,9 @@ impl Account {
         r.map_err(js_err)
     }
 
-    /// See `sync`: resolves to the problems, a JSON list of sentences.
+    /// See `sync`: resolves to the problems, a JSON list of `{text, leave, vault}`
+    /// (`leave`: the id of the vault it offers to leave, `vault`: the one it's
+    /// about; either may be null).
     pub async fn sync(&self) -> Result<String, JsValue> {
         let mut s = self.take()?;
         let r = sync(&mut s).await;
@@ -415,6 +443,24 @@ impl Account {
         let r = save_login(&mut s, &page, &username, &password).await;
         *self.0.borrow_mut() = Some(s);
         r.map(|v| v.to_string()).map_err(js_err)
+    }
+
+    /// See `leave_check`: resolves to `{name, only_owner, unsent}` as JSON.
+    #[wasm_bindgen(js_name = leaveCheck)]
+    pub async fn leave_check(&self, vault: String) -> Result<String, JsValue> {
+        let s = self.take()?;
+        let r = leave_check(&s, &vault).await;
+        *self.0.borrow_mut() = Some(s);
+        r.map(|v| v.to_string()).map_err(js_err)
+    }
+
+    /// See `leave`.
+    #[wasm_bindgen(js_name = leaveVault)]
+    pub async fn leave_vault(&self, vault: String) -> Result<(), JsValue> {
+        let mut s = self.take()?;
+        let r = leave(&mut s, &vault).await;
+        *self.0.borrow_mut() = Some(s);
+        r.map_err(js_err)
     }
 
     #[wasm_bindgen(js_name = setExactHost)]
