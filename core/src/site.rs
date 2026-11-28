@@ -20,7 +20,7 @@ fn rules() -> &'static HashSet<&'static str> {
 /// The site a host belongs to: its registrable domain, or the host itself for
 /// IP addresses, single labels (`localhost`) and public suffixes.
 pub fn site(host: &str) -> String {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let Some(host) = ascii_host(host) else { return host.trim_end_matches('.').to_ascii_lowercase() };
     if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
         return host;
     }
@@ -40,6 +40,25 @@ pub fn site(host: &str) -> String {
     }
     // Not in the list: the default rule `*` makes the last label the suffix.
     if labels.len() >= 2 { labels[labels.len() - 2..].join(".") } else { host }
+}
+
+/// A host the way the browser reports it: lowercase ASCII, Unicode labels in
+/// punycode (UTS #46, as the URL standard does it), so `Bücher.de` is
+/// `xn--bcher-kva.de`. `None` for what no browser would load. An ASCII host
+/// that idna refuses is only lowercased: a newer browser may load labels from a
+/// Unicode version these tables don't know yet.
+fn ascii_host(host: &str) -> Option<String> {
+    let host = if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        host.to_ascii_lowercase()
+    } else {
+        match idna::domain_to_ascii_cow(host.as_bytes(), idna::AsciiDenyList::URL) {
+            Ok(h) => h.into_owned(),
+            Err(_) if host.is_ascii() && !host.contains('%') => host.to_ascii_lowercase(),
+            Err(_) => return None,
+        }
+    };
+    let host = host.trim_end_matches('.');
+    (!host.split('.').any(str::is_empty) && !host.contains(char::is_whitespace)).then(|| host.into())
 }
 
 /// `(scheme, host, port)` of a URL as people save them: `https://a.com/x`,
@@ -62,10 +81,7 @@ fn parts(url: &str) -> Option<(String, String, Option<u16>)> {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (!h.contains(':') || h.ends_with(']')) => (h, Some(p.parse().ok()?)),
         _ => (authority, None),
     };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
+    let host = ascii_host(host)?;
     let port = port.or(match scheme.as_str() {
         "https" => Some(443),
         "http" => Some(80),
