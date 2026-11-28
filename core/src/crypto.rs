@@ -273,11 +273,9 @@ pub type KemKey = ml_kem::DecapsulationKey<ml_kem::MlKem768>;
 type KemPk = ml_kem::EncapsulationKey<ml_kem::MlKem768>;
 pub const KEM_PK_LEN: usize = 1184;
 const KEM_CT_LEN: usize = 1088;
-/// First byte of a hybrid sealed blob. Classical ones start with the ephemeral X25519 key.
-const PQ: u8 = 2;
 
 /// An account's ML-KEM-768 key, derived from the same random 32 bytes as its
-/// X25519 key, so accounts made before post-quantum sealing have one too.
+/// X25519 key, so the keyring holds one secret for both.
 pub fn kem_key(enc_sk: &[u8; 32]) -> KemKey {
     let mut seed = Zeroizing::new([0u8; 64]);
     Hkdf::<Sha256>::new(None, enc_sk).expand(b"plaintext/v1/ml-kem", &mut seed[..]).expect("valid length");
@@ -294,47 +292,29 @@ pub fn valid_kem_pk(pk: &[u8]) -> bool {
     pk.try_into().ok().is_some_and(|k| KemPk::new(k).is_ok())
 }
 
-/// Seal to someone's public keys. With their ML-KEM-768 key it's hybrid:
-/// `0x02 ‖ ephemeral_pk(32) ‖ ML-KEM ciphertext(1088) ‖ seal(k, ad, pt)`, with k
-/// from X-Wing's combiner over both shared secrets, so it stays sealed unless
-/// both X25519 and ML-KEM are broken. Without it (someone whose ML-KEM key we
-/// haven't seen yet), X25519 only: `ephemeral_pk(32) ‖ seal(k, ad, pt)`. Anyone
-/// can seal, so authenticity comes from whatever signs or commits to the result.
-pub fn seal_to(recipient: &[u8], kem: Option<&[u8]>, ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
+/// Seal to someone's X25519 and ML-KEM-768 public keys:
+/// `ephemeral_pk(32) ‖ ML-KEM ciphertext(1088) ‖ seal(k, ad, pt)`, with k from
+/// X-Wing's combiner over both shared secrets, so it stays sealed unless both
+/// are broken. Anyone can seal, so authenticity comes from whatever signs or
+/// commits to the result.
+pub fn seal_to(recipient: &[u8], kem: &[u8], ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
     let rpk: [u8; 32] = recipient.try_into().map_err(|_| Error::Tampered)?;
+    let ek = KemPk::new(kem.try_into().map_err(|_| Error::Tampered)?).map_err(|_| Error::Tampered)?;
     let eph = x25519_dalek::StaticSecret::from(random::<32>());
     let epk = x25519_dalek::PublicKey::from(&eph);
     let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(rpk));
     if !shared.was_contributory() {
         return Err(Error::Tampered);
     }
-    let Some(kem) = kem else {
-        let k = seal_to_key(shared.as_bytes(), epk.as_bytes(), &rpk);
-        return Ok([&epk.as_bytes()[..], &seal(&k, ad, pt)].concat());
-    };
-    let ek = KemPk::new(kem.try_into().map_err(|_| Error::Tampered)?).map_err(|_| Error::Tampered)?;
     let m = Zeroizing::new(random::<32>());
     let (ct, ss) = ek.encapsulate_deterministic(&(*m).into());
-    let k = xwing_key(&ss, shared.as_bytes(), epk.as_bytes(), &rpk);
-    Ok([&[PQ][..], epk.as_bytes(), &ct, &seal(&k, ad, pt)].concat())
+    let k = seal_to_key(&ss, shared.as_bytes(), epk.as_bytes(), &rpk);
+    Ok([epk.as_bytes(), &ct[..], &seal(&k, ad, pt)].concat())
 }
 
-/// Opens either form `seal_to` makes. A classical blob's first byte is random,
-/// so one starting with 0x02 that doesn't open as hybrid is tried as classical.
 pub fn open_from(sk: &x25519_dalek::StaticSecret, kem: &KemKey, ad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let rpk = x25519_dalek::PublicKey::from(sk);
-    if blob.first() == Some(&PQ) && blob.len() > 1 + 32 + KEM_CT_LEN {
-        use ml_kem::Decapsulate;
-        let epk: [u8; 32] = blob[1..33].try_into().expect("32 bytes");
-        let shared = sk.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
-        let ss = kem.decapsulate_slice(&blob[33..33 + KEM_CT_LEN]).expect("ciphertext size");
-        if shared.was_contributory()
-            && let Ok(pt) = open(&xwing_key(&ss, shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[33 + KEM_CT_LEN..])
-        {
-            return Ok(pt);
-        }
-    }
-    if blob.len() < 32 {
+    use ml_kem::Decapsulate;
+    if blob.len() < 32 + KEM_CT_LEN {
         return Err(Error::Tampered);
     }
     let epk: [u8; 32] = blob[..32].try_into().expect("32 bytes");
@@ -342,30 +322,24 @@ pub fn open_from(sk: &x25519_dalek::StaticSecret, kem: &KemKey, ad: &[u8], blob:
     if !shared.was_contributory() {
         return Err(Error::Tampered);
     }
-    open(&seal_to_key(shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[32..])
+    let ss = kem.decapsulate_slice(&blob[32..32 + KEM_CT_LEN]).expect("ciphertext size");
+    let rpk = x25519_dalek::PublicKey::from(sk);
+    open(&seal_to_key(&ss, shared.as_bytes(), &epk, rpk.as_bytes()), ad, &blob[32 + KEM_CT_LEN..])
 }
 
-fn seal_to_key(shared: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
-    let mut k = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(&[&epk[..], &rpk[..]].concat()), shared)
-        .expand(b"plaintext/v1/seal-to", &mut k[..])
-        .expect("valid length");
-    k
-}
-
-/// X-Wing's combiner (draft-connolly-cfrg-xwing-kem):
+/// X-Wing's combiner (draft-connolly-cfrg-xwing-kem-11):
 /// SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label), then HKDF for our own domain.
-fn xwing_key(ss_m: &[u8], ss_x: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
+fn seal_to_key(ss_m: &[u8], ss_x: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Key {
     use sha3::Digest as _;
     let ss = Zeroizing::new(<[u8; 32]>::from(sha3::Sha3_256::new().chain_update(ss_m).chain_update(ss_x).chain_update(epk).chain_update(rpk).chain_update(b"\\.//^\\").finalize()));
     let mut k = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(None, &ss[..]).expand(b"plaintext/v1/seal-to-pq", &mut k[..]).expect("valid length");
+    Hkdf::<Sha256>::new(None, &ss[..]).expand(b"plaintext/v1/seal-to", &mut k[..]).expect("valid length");
     k
 }
 
 /// What two people compare to be sure they see each other's real keys.
-pub fn fingerprint(username: &str, sign_pk: &[u8], enc_pk: &[u8]) -> String {
-    let h = sha256(&[b"plaintext/v1/fingerprint".as_slice(), username.as_bytes(), &[0], sign_pk, enc_pk].concat());
+pub fn fingerprint(username: &str, sign_pk: &[u8], enc_pk: &[u8], kem_pk: &[u8]) -> String {
+    let h = sha256(&[b"plaintext/v1/fingerprint".as_slice(), username.as_bytes(), &[0], sign_pk, enc_pk, kem_pk].concat());
     let s = base32(&h[..15]);
     (0..4).map(|i| &s[i * 6..i * 6 + 6]).collect::<Vec<_>>().join(" ")
 }

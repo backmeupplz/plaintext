@@ -152,7 +152,7 @@ fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<&Me>, invi
     // An agent starts out trusting its owner, and only its owner: the server
     // can't stand up a look-alike owner (or anyone else) for it to obey.
     if let Some(o) = owner {
-        keyring.pin(&o.username, &o.sign_pk(), &o.enc_pk())?;
+        keyring.pin(&o.username, &o.sign_pk(), &o.enc_pk(), &o.kem_pk())?;
         keyring.mark_verified(&o.username);
         keyring.owner = Some(o.username.clone());
     }
@@ -174,7 +174,6 @@ fn new_account(d: &Derived, username: &str, kind: Kind, owner: Option<&Me>, invi
         keyring: B64(keyring.seal(&account)),
         vault: new_vault,
         invite,
-        kem: Some(keyring.me().kem_doc()),
         setup: None,
     };
     Ok(Signup { request, account, keyring, vault })
@@ -195,9 +194,6 @@ pub fn create_agent(owner: &mut Keyring, name: &str) -> Result<(AgentKey, Signup
     let key = AgentKey::generate();
     let s = new_account(&derive_agent(&key), name, Kind::Agent, Some(&owner.me()), None)?;
     owner.pin_identity(&s.request.identity)?;
-    if let Some(k) = &s.request.kem {
-        owner.pin_kem(k)?;
-    }
     owner.mark_verified(name);
     Ok((key, s))
 }
@@ -261,8 +257,7 @@ pub fn send(me: &Me, keyring: &Keyring, to: &str, content: &Content, expires: Op
     };
     let mut json = Zeroizing::new(serde_json::to_vec(&content).expect("serializable"));
     pad(&mut json);
-    let kem = c.kem.as_ref().and_then(identity::kem_pk_of);
-    let sealed = seal_to(&c.enc_pk.0, kem.as_deref(), &message_ad(&id, &me.username, to), &json)?;
+    let sealed = seal_to(&c.enc_pk.0, &c.kem_pk.0, &message_ad(&id, &me.username, to), &json)?;
     Ok(me.sign_doc("message", &Message { id, to: to.into(), kind, expires, sealed: B64(sealed) }))
 }
 

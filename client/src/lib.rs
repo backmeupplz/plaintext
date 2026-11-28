@@ -278,10 +278,6 @@ pub struct Session<T: AsyncTransport> {
     /// read them now, or the server stopped listing them (`hidden`);
     /// `discard_changes` drops them.
     pub unsendable: Vec<Hex>,
-    /// The server lists our ML-KEM key, so it knows post-quantum sealing (an older
-    /// server refuses the larger wrapped keys): only then does sync replace vault
-    /// keys to make them post-quantum (`remove_members_async`).
-    pq_server: bool,
 }
 
 /// Something the last sync couldn't do, in words (which may end with a CLI hint).
@@ -342,7 +338,6 @@ impl<T: AsyncTransport> Session<T> {
             gone: BTreeMap::new(),
             problems: Vec::new(),
             unsendable: Vec::new(),
-            pq_server: false,
         })
     }
 
@@ -351,7 +346,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false })
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     /// Pick up a stored session with no network: the token and Account Key plus
@@ -360,7 +355,7 @@ impl<T: AsyncTransport> Session<T> {
     pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
         let keyring = Keyring::open(&account, keyring_blob)?;
         // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
-        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false })
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -379,10 +374,6 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn sync_async(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
         self.admin = acct.admin;
-        // Accounts made before post-quantum sealing publish their ML-KEM key, so
-        // others seal to it. Best effort: an older server just doesn't have it yet.
-        let kem = self.me().kem_doc();
-        self.pq_server = acct.kem.as_ref() == Some(&kem) || self.call_async::<()>("PUT", "/v1/account/kem", Some(&kem)).await.is_ok();
         // Another device (or this one, restored offline) changed the keyring: fold it in.
         if Some(acct.keyring_counter) != self.keyring_counter {
             self.merge_server_keyring(&acct)?;
@@ -748,12 +739,10 @@ impl<T: AsyncTransport> Session<T> {
             .map(|m| m.username.as_str())
             .collect();
         out.extend(who.filter(|w| !out.contains(w)));
-        // Nobody to remove, but the current key was sealed to someone with X25519
-        // alone and we now have their ML-KEM key: a new key, post-quantum for all.
-        if out.is_empty() && !(self.pq_server && v.needs_pq(&self.keyring, now())) {
+        if out.is_empty() {
             return Ok(());
         }
-        let update = v.revoke(&self.me(), &self.keyring, &out, now())?;
+        let update = v.revoke(&self.me(), &out, now())?;
         self.post_roster_async(id, update).await?;
         self.pull_async(id).await
     }
@@ -838,7 +827,7 @@ impl<T: AsyncTransport> Session<T> {
             return Some(self.me().fingerprint());
         }
         let c = self.keyring.contacts.get(username)?;
-        Some(plaintext_core::crypto::fingerprint(username, &c.sign_pk.0, &c.enc_pk.0))
+        Some(plaintext_core::crypto::fingerprint(username, &c.sign_pk.0, &c.enc_pk.0, &c.kem_pk.0))
     }
 
     /// Everyone on the server for admins and on invite-only servers; on open
@@ -996,14 +985,11 @@ impl<T: Transport> Session<T> {
         }
         let u = self.lookup(username)?;
         let id = plaintext_core::identity::check_identity(&u.identity)?;
-        if plaintext_core::crypto::fingerprint(&id.username, &id.sign_pk.0, &id.enc_pk.0).replace(' ', "") != want {
+        if plaintext_core::crypto::fingerprint(&id.username, &id.sign_pk.0, &id.enc_pk.0, &id.kem_pk.0).replace(' ', "") != want {
             return Err(plaintext_core::Error::KeyChanged(username.into()).into());
         }
         let replaced = self.keyring.contacts.contains_key(username);
         self.keyring.repin_verified(&u.identity)?;
-        if let Some(k) = &u.kem {
-            drop(self.keyring.pin_kem(k));
-        }
         self.keyring_dirty = true;
         self.save_keyring()?;
         Ok(replaced)
@@ -1026,7 +1012,7 @@ impl<T: Transport> Session<T> {
     pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
         let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
         let keyring = Keyring::open(&account, &blob)?;
-        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false };
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() };
         s.load_vaults(dir);
         Ok(s)
     }
@@ -1139,24 +1125,8 @@ impl<T: Transport> Session<T> {
         let before = self.keyring.contacts.contains_key(username);
         let id = self.keyring.pin_identity(&u.identity)?;
         self.keyring_dirty |= !before;
-        // Only one their pinned key signed; a different one than pinned is refused.
-        if let Some(k) = &u.kem {
-            self.keyring_dirty |= self.keyring.pin_kem(k)?;
-        }
         self.save_keyring()?;
         Ok(id)
-    }
-
-    /// Pin someone before sealing to them: from the directory if they're new, and
-    /// again if we don't have their ML-KEM key yet, so what we seal is post-quantum
-    /// once they published one (best effort then: their pinned keys still work).
-    fn pin_for_sealing(&mut self, username: &str) -> Result<()> {
-        if !self.keyring.contacts.contains_key(username) {
-            self.pin_user(username)?;
-        } else if self.keyring.kem_doc(username).is_none() {
-            drop(self.pin_user(username));
-        }
-        Ok(())
     }
 
     /// A user's directory entry, by exact username.
@@ -1264,7 +1234,9 @@ impl<T: Transport> Session<T> {
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
     pub fn share_vault(&mut self, id: &Hex, username: &str, role: Role, expires: Option<u64>) -> Result<()> {
-        self.pin_for_sealing(username)?;
+        if !self.keyring.contacts.contains_key(username) {
+            self.pin_user(username)?;
+        }
         // A change the server holds back (the account is full) waits; promoting
         // someone doesn't need it sent first.
         match self.sync_vault(id) {
@@ -1457,7 +1429,9 @@ impl<T: Transport> Session<T> {
 
     /// Send an item (or an access request) to one user's inbox, sealed to their pinned key.
     pub fn send(&mut self, to: &str, content: &Content, expires: Option<u64>) -> Result<()> {
-        self.pin_for_sealing(to)?;
+        if !self.keyring.contacts.contains_key(to) {
+            self.pin_user(to)?;
+        }
         let msg = plaintext_core::send(&self.me(), &self.keyring, to, content, expires)?;
         self.call("POST", "/v1/messages", Some(&msg))
     }
