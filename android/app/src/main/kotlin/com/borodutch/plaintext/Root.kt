@@ -150,6 +150,7 @@ private fun unsentSummary(c: UnsentChanges): String {
     val deleted = c.deleted.toInt()
     if (deleted > 0) lines += if (deleted == 1) "1 item deleted" else "$deleted items deleted"
     if (c.renamed) lines += "The vault's name or description changed"
+    if (lines.size == 1) lines[0] = lines[0].dropLast(1) + "."
     lines += "Dropping them downloads the vault again from the server. Copy out anything you want to keep first."
     return lines.joinToString("\n")
 }

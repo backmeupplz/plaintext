@@ -279,6 +279,11 @@ fn changes_a_reader_cant_send_are_shown_and_dropped() {
     // The browser suspended the background meanwhile: picked up from this device's copy.
     let mut back = restore(Later(Http::new(&url)), &session_state(&s), &local_state(&s)).unwrap();
     assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap(), json!({ "name": "Family", "changed": ["Bank"], "deleted": 0, "renamed": false }));
+    // Made a writer again after the preview: the drop asks the server and keeps it.
+    alice.share_vault(&fam, "hal", Role::Writer, None).unwrap();
+    assert_eq!(code(&run(discard_changes(&mut back, &fam.to_string())).unwrap_err()), "refused");
+    assert_eq!(back.vaults[&fam].changes(), 1);
+    alice.share_vault(&fam, "hal", Role::Reader, None).unwrap();
     assert_eq!(run(discard_changes(&mut back, &fam.to_string())).unwrap(), 1);
     assert_eq!(unsent_changes(&back, &fam.to_string()).unwrap()["changed"], json!([]));
     assert!(run(sync(&mut back)).unwrap().is_empty());

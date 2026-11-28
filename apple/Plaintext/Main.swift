@@ -199,6 +199,7 @@ private struct UnsentDialog: ViewModifier {
         }
         if c.deleted > 0 { lines.append(c.deleted == 1 ? "1 item deleted" : "\(c.deleted) items deleted") }
         if c.renamed { lines.append("The vault's name or description changed") }
+        if lines.count == 1 { lines[0] = String(lines[0].dropLast()) + "." }
         lines.append("Dropping them downloads the vault again from the server. Copy out anything you want to keep first.")
         return lines.joined(separator: "\n")
     }

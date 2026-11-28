@@ -333,6 +333,12 @@ fn unsendable_changes() {
     assert!(found.iter().all(|(p, _)| p.ends_with("can't be sent")), "{found:?}");
     assert_eq!(bob.unsent_changes(b.clone(), fam.clone()).unwrap(), UnsentChanges { name: "Family".into(), changed: vec!["Bank".into()], deleted: 1, renamed: false });
 
+    // Made a writer again after the preview: the drop asks the server and keeps them.
+    alice.share_vault(a.clone(), fam.clone(), "bob".into(), Role::Writer, None).unwrap();
+    assert!(matches!(bob.discard_changes(b.clone(), fam.clone()), Err(PlaintextError::Invalid { .. })));
+    assert!(bob.items(None, Some(fam.clone()), "".into(), false).iter().any(|i| i.title == "Bank"));
+    alice.share_vault(a.clone(), fam.clone(), "bob".into(), Role::Reader, None).unwrap();
+
     // Dropping the first warning's changes leaves the other warning on its own vault.
     let (first, second) = (found[0].1.clone(), found[1].1.clone());
     assert_eq!(bob.discard_changes(b.clone(), first.clone()).unwrap(), if first == fam { 2 } else { 1 });

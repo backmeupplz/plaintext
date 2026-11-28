@@ -393,6 +393,11 @@ impl<T: AsyncTransport> Session<T> {
         Ok(pulled)
     }
 
+    /// Pull a vault and refuse if we may only read it (`check_async`).
+    pub async fn writable_async(&mut self, id: &Hex) -> Result<()> {
+        self.check_async(id).await.map(drop)
+    }
+
     fn may_write(&self, id: &Hex) -> Result<()> {
         let v = self.vaults.get(id).ok_or(Error::NotFound("vault".into()))?;
         match v.role(self.username(), now()) {
@@ -815,7 +820,7 @@ impl<T: Transport> Session<T> {
 
     /// Pull a vault and refuse if we may only read it (`check_async`).
     pub fn writable(&mut self, id: &Hex) -> Result<()> {
-        block_on(self.check_async(id)).map(drop)
+        block_on(self.writable_async(id))
     }
 
     fn pull(&mut self, id: &Hex) -> Result<()> {

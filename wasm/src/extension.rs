@@ -98,6 +98,10 @@ fn load_vaults<T: AsyncTransport>(s: &mut Session<T>, state: &Value) {
     }
 }
 
+fn writer_again() -> Error {
+    Error::Refused("You can write to this vault again, so these changes go out with the next sync.".into())
+}
+
 fn writable<T: AsyncTransport>(s: &Session<T>, v: &Vault) -> bool {
     v.role(s.username(), now()).is_some_and(|r| r >= Role::Writer)
 }
@@ -252,14 +256,20 @@ fn vault_id(vault: &str) -> Result<Hex, Error> {
 pub fn unsent_changes<T: AsyncTransport>(s: &Session<T>, vault: &str) -> Result<Value, Error> {
     let v = s.vaults.get(&vault_id(vault)?).ok_or_else(|| Error::NotFound("that vault".into()))?;
     if writable(s, v) {
-        return Err(Error::Refused("You can write to this vault again, so these changes go out with the next sync.".into()));
+        return Err(writer_again());
     }
     Ok(json!({ "name": v.meta.name, "changed": v.changed().map(|(_, i)| &i.title).collect::<Vec<_>>(), "deleted": v.deleted(), "renamed": v.meta_changed() }))
 }
 
 /// Drop them (the vault is downloaded again) and the sync problem about them. Returns how many.
 pub async fn discard_changes<T: AsyncTransport>(s: &mut Session<T>, vault: &str) -> Result<usize, Error> {
-    s.discard_changes_async(&vault_id(vault)?).await
+    let id = vault_id(vault)?;
+    // The preview read the roster this device has: ask the server for today's.
+    match s.writable_async(&id).await {
+        Ok(()) => Err(writer_again()),
+        Err(Error::Core(core::Error::ReadOnly)) => s.discard_changes_async(&id).await,
+        Err(e) => Err(e),
+    }
 }
 
 /// A short code JavaScript can branch on, next to the message for people.

@@ -1258,7 +1258,11 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert!(bob.unsendable.is_empty());
     assert_eq!(bob.problems.len(), warnings - 1, "{:?}", bob.problems);
     assert!(!bob.problems.iter().any(|p| p.ends_with("can't be sent")), "{:?}", bob.problems);
+    // Nothing left to drop (say, another app's discard got there first): its warning still goes.
+    bob.problems.push("stale".into());
+    bob.unsendable.push((fam, bob.problems.len() - 1));
     assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
+    assert!(bob.unsendable.is_empty() && bob.problems.last().map(String::as_str) == Some("later"), "{:?}", bob.problems);
     let v = &bob.vaults[&fam];
     assert_eq!(v.get(&keep).unwrap().password, "k");
     assert!(v.get(&gone).is_some());

@@ -266,6 +266,7 @@ async function reviewUnsent(banner, p) {
     c.renamed && "The vault's name or description changed",
   ].filter(Boolean)
   const drop = el('button', { class: 'primary small', type: 'button', onclick: () => discard() }, 'Drop changes')
+  const keep = el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(banner) }, 'Keep')
   const box = el(
     'div',
     { class: 'banner problem unsent', role: 'group', 'aria-label': `Unsent changes to ${c.name}` },
@@ -273,23 +274,23 @@ async function reviewUnsent(banner, p) {
     el(
       'div',
       { class: 'row-text' },
-      el('div', {}, `You can only read ${c.name} now, so these changes on this device can't be sent:`),
+      el('div', {}, `You can only read ${c.name} now, so these changes on this device can't be sent${lines.length ? ':' : '.'}`),
       lines.length ? el('ul', {}, ...lines.map((l) => el('li', {}, l))) : null,
       el('div', { class: 'muted small-text' }, 'Dropping them downloads the vault again from the server. Copy out anything you want to keep first.'),
-      el('div', { class: 'row-actions' }, el('button', { class: 'small', type: 'button', onclick: () => box.replaceWith(banner) }, 'Keep'), drop),
+      el('div', { class: 'row-actions' }, keep, drop),
     ),
   )
   banner.replaceWith(box)
   drop.focus()
   async function discard() {
-    drop.disabled = true
+    drop.disabled = keep.disabled = true
     try {
       const n = await ask('discardChanges', { key: p.key, vault: p.unsent })
       box.remove()
       say(n ? `Dropped ${n} unsent change${n > 1 ? 's' : ''} to ${c.name}.` : `Nothing was left to drop in ${c.name}.`)
       render(document.getElementById('list'))
     } catch (e) {
-      drop.disabled = false
+      drop.disabled = keep.disabled = false
       say(explain(e), 'error')
     }
   }

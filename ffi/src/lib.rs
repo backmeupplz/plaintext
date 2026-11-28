@@ -965,6 +965,10 @@ fn not_found(what: &str) -> PlaintextError {
     PlaintextError::NotFound { message: what.into() }
 }
 
+fn writer_again() -> PlaintextError {
+    PlaintextError::Invalid { message: "You can write to this vault again, so these changes go out with the next sync.".into() }
+}
+
 fn writable(s: &S, vid: &Hex) -> Res<()> {
     match s.vaults.get(vid).ok_or_else(|| not_found("that vault"))?.role(s.username(), now()) {
         Some(r) if r >= CoreRole::Writer => Ok(()),
@@ -1169,7 +1173,7 @@ impl PlaintextApp {
         self.peek(&account, |s| {
             let v = s.vaults.get(&id).ok_or_else(|| not_found("that vault"))?;
             if writable(s, &id).is_ok() {
-                return Err(PlaintextError::Invalid { message: "You can write to this vault again, so these changes go out with the next sync.".into() });
+                return Err(writer_again());
             }
             Ok(UnsentChanges { name: v.meta.name.clone(), changed: v.changed().map(|(_, i)| i.title.clone()).collect(), deleted: v.deleted() as u32, renamed: v.meta_changed() })
         })
@@ -1179,7 +1183,12 @@ impl PlaintextApp {
     /// is downloaded again), and the sync problem about them. Returns how many.
     pub fn discard_changes(&self, account: String, vault: String) -> Res<u32> {
         let id = hex_id(&vault)?;
-        self.with(&account, |s| Ok(s.discard_changes(&id)? as u32))
+        // The preview read the roster this device has: ask the server for today's.
+        self.with(&account, |s| match s.writable(&id) {
+            Ok(()) => Err(writer_again()),
+            Err(ClientError::Core(core::Error::ReadOnly)) => Ok(s.discard_changes(&id)? as u32),
+            Err(e) => Err(e.into()),
+        })
     }
 
     // ----- Vaults and items -----
