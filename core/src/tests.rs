@@ -117,16 +117,19 @@ struct Log {
     manifests: Vec<Signed>,
     keys: Vec<WrappedKey>,
     items: BTreeMap<Hex, B64>,
+    /// The latest manifest's sealed part.
+    sealed: B64,
 }
 
 use std::collections::BTreeMap;
 
 impl Log {
     fn new(nv: &NewVault) -> Log {
-        Log { rosters: vec![nv.roster.clone()], manifests: vec![nv.manifest.clone()], keys: nv.keys.clone(), items: BTreeMap::new() }
+        Log { rosters: vec![nv.roster.clone()], manifests: vec![nv.manifest.clone()], keys: nv.keys.clone(), items: BTreeMap::new(), sealed: nv.sealed.clone() }
     }
     fn put(&mut self, p: &VaultPut) {
         self.manifests.push(p.manifest.clone());
+        self.sealed = p.sealed.clone();
         for u in &p.upserts {
             self.items.insert(u.id, u.blob.clone());
         }
@@ -149,6 +152,7 @@ impl Log {
             rosters: self.rosters.clone(),
             key: self.keys.iter().rev().find(|k| k.username == user).map(|k| k.key.clone()),
             items: self.items.iter().map(|(id, blob)| ItemBlob { id: *id, blob: blob.clone() }).collect(),
+            sealed: Some(self.sealed.clone()),
             ..Default::default()
         }
     }
@@ -215,7 +219,7 @@ fn sync_and_server_tampering() {
     log2.put(&pf);
     let mut next = Vault::new(v.id);
     next.apply(&good, &mut a, 0).unwrap();
-    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![], ..Default::default() };
+    let fork = VaultResponse { counter: 3, manifests: vec![pf.manifest.clone()], rosters: vec![], key: None, items: pf.upserts.clone(), gone: vec![], sealed: Some(pf.sealed.clone()), ..Default::default() };
     assert_eq!(next.apply(&fork, &mut a, 0), Err(Error::Rollback));
 }
 
@@ -244,7 +248,7 @@ fn sharing_roles_and_revocation() {
     // A server that lets the reader write anyway: everyone else refuses it.
     vb.roster.as_mut().unwrap().members.iter_mut().for_each(|m| m.role = Role::Owner);
     let forged = vb.push(&bm, 0).unwrap();
-    let mut log_forged = Log { rosters: log.rosters.clone(), manifests: log.manifests.clone(), keys: log.keys.clone(), items: log.items.clone() };
+    let mut log_forged = Log { rosters: log.rosters.clone(), manifests: log.manifests.clone(), keys: log.keys.clone(), items: log.items.clone(), sealed: log.sealed.clone() };
     log_forged.put(&forged);
     assert_eq!(Vault::new(v.id).apply(&log_forged.full("alice"), &mut a, 0).err(), Some(Error::BadSignature));
 
@@ -301,7 +305,7 @@ fn concurrent_edit_keeps_conflict_copy() {
     v1.pushed(&p1);
     log.put(&p1);
     v2.put(id, login("bank", "from device 2"));
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![], ..Default::default() };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: p1.upserts.clone(), gone: vec![], sealed: Some(p1.sealed.clone()), ..Default::default() };
     v2.apply(&resp, &mut a, 0).unwrap();
     assert_eq!(v2.get(&id).unwrap().password, "from device 2");
     let copy = v2.items().find(|(_, i)| i.title == "bank (conflict)").unwrap().1;
@@ -473,6 +477,80 @@ fn fresh_device_can_start_from_the_latest_manifest() {
     assert_eq!(e.apply(&skip, &mut a, 0).err(), Some(Error::Rollback));
 }
 
+/// Envelopes sign the hash of their sealed part, which travels beside them; ones
+/// written before that carry the part themselves and still verify, at the start
+/// of a new device's pull and in the middle of a chain.
+#[test]
+fn manifests_sign_the_hash_of_their_sealed_part() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    v.put(new_item_id(), login("old", "p"));
+    let mut p = v.push(&me, 0).unwrap();
+    // As an old client wrote it: the sealed part inside the signed envelope.
+    let mut env: ManifestEnvelope = serde_json::from_slice(&p.manifest.body.0).unwrap();
+    (env.sealed, env.sealed_hash) = (Some(p.sealed.clone()), None);
+    p.manifest = me.sign_doc("manifest", &env);
+    p.sealed = B64::default();
+    v.pushed(&p);
+    log.put(&p);
+    let mut latest = log.full("alice");
+    (latest.manifests, latest.sealed) = (vec![p.manifest.clone()], None);
+    let mut d = Vault::new(v.id);
+    d.apply(&latest, &mut a, 0).unwrap();
+    assert_eq!(d.items().count(), 1);
+
+    v.put(new_item_id(), login("new", "p"));
+    let p = v.push(&me, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+    let next = delta(&log, &p);
+    // The sealed part must be the one the envelope signed, and it must come.
+    let mut bad = next.clone();
+    bad.sealed = Some(B64(p.sealed.0.iter().map(|b| b ^ 1).collect()));
+    assert_eq!(d.apply(&bad, &mut a, 0), Err(Error::ManifestMismatch));
+    bad.sealed = None;
+    assert_eq!(d.apply(&bad, &mut a, 0), Err(Error::ManifestMismatch));
+    d.apply(&next, &mut a, 0).unwrap();
+    assert_eq!((d.items().count(), d.counter), (2, 3));
+
+    // An envelope with both forms, or neither, is refused.
+    let mut env: ManifestEnvelope = serde_json::from_slice(&p.manifest.body.0).unwrap();
+    env.sealed = Some(p.sealed.clone());
+    let both = VaultResponse { manifests: vec![me.sign_doc("manifest", &env)], ..log.full("alice") };
+    env.sealed_hash = None;
+    env.sealed = None;
+    let neither = VaultResponse { manifests: vec![me.sign_doc("manifest", &env)], ..log.full("alice") };
+    for resp in [both, neither] {
+        let mut e = Vault::new(v.id);
+        assert_eq!(e.apply(&resp, &mut a, 0), Err(Error::BadJson));
+    }
+}
+
+/// A pull's later pages continue each list after the last entry the device has,
+/// at the counter its first page showed.
+#[test]
+fn pull_query_pages() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let mut d = Vault::new(v.id);
+    assert_eq!(d.pull_query(None).unwrap(), "since=0&latest=true");
+    d.apply(&log.full("alice"), &mut a, 0).unwrap();
+    assert_eq!(d.pull_query(None).unwrap(), "since=1&roster=0");
+    let id = new_item_id();
+    v.put(id, login("i", "p"));
+    let p = v.push(&me, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+    let page = VaultResponse { counter: 2, manifests: vec![p.manifest.clone()], more: true, ..Default::default() };
+    assert_eq!(d.pull_query(Some(&page)).unwrap(), "since=1&roster=0&from=2&at=2");
+    let page = VaultResponse { rosters: vec![nv.roster.clone()], items: p.upserts.clone(), ..page };
+    assert_eq!(d.pull_query(Some(&page)).unwrap(), format!("since=1&roster=0&from=2&after={id}&at=2"));
+}
+
 /// Cross-checked by tools/kat.py.
 #[test]
 fn agent_and_fingerprint_vectors() {
@@ -561,7 +639,7 @@ fn audit_new_device_stays_on_pre_revocation_epoch() {
     let g = v.grant(&am, &a, "bob", Role::Writer, None, 0).unwrap();
     log.roster(&g);
     adopt(&mut v, &log, &g, &mut a);
-    let mut fork = Log { rosters: log.rosters.clone(), manifests: log.manifests.clone(), keys: log.keys.clone(), items: log.items.clone() };
+    let mut fork = Log { rosters: log.rosters.clone(), manifests: log.manifests.clone(), keys: log.keys.clone(), items: log.items.clone(), sealed: log.sealed.clone() };
     let mut vb = Vault::new(v.id);
     vb.apply(&fork.full("bob"), &mut b, 0).unwrap();
     // Alice removes bob: new epoch, new key, every item re-sealed. Her device
@@ -569,7 +647,7 @@ fn audit_new_device_stays_on_pre_revocation_epoch() {
     let r = v.revoke(&am, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], ..Default::default() };
+    let delta = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], sealed: Some(rot.sealed.clone()), ..Default::default() };
     v.apply(&delta, &mut a, 0).unwrap();
     // Removed bob writes on the old branch; the server serves that branch to alice's new phone.
     vb.put(new_item_id(), login("Bank", "planted-by-removed-bob"));
@@ -601,7 +679,7 @@ fn audit_server_drops_concurrent_edit_without_conflict_copy() {
     log.put(&p1);
     v2.put(id, login("bank", "stale-edit-on-device-2"));
     // Same response as concurrent_edit_keeps_conflict_copy, minus the changed item's blob.
-    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![], ..Default::default() };
+    let resp = VaultResponse { counter: 3, manifests: vec![p1.manifest.clone()], rosters: vec![], key: None, items: vec![], gone: vec![], sealed: Some(p1.sealed.clone()), ..Default::default() };
     // Refused: the other edit would otherwise vanish instead of becoming a conflict copy.
     assert_eq!(v2.apply(&resp, &mut a, 0), Err(Error::ManifestMismatch));
 }
@@ -740,7 +818,7 @@ fn audit_delayed_rotation_undoes_a_delete() {
     log.roster(&r);
     // Device 2 deletes the item, then pulls before pushing (as sync_vault does).
     d2.delete(id);
-    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![], ..Default::default() };
+    let resp = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![r.rotation.as_ref().unwrap().manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: r.rotation.as_ref().unwrap().upserts.clone(), gone: vec![], sealed: Some(r.rotation.as_ref().unwrap().sealed.clone()), ..Default::default() };
     d2.apply(&resp, &mut a, 0).unwrap();
     assert!(d2.get(&id).is_none() && d2.has_changes(), "delete undone by a re-seal: item back = {:?}, pending delete = {}", d2.get(&id).map(|i| &i.title), d2.has_changes());
 }
@@ -793,7 +871,7 @@ fn attachments_are_padded() {
 
 /// A pull with just this manifest and its blobs (what the server sends after `p`).
 fn delta(log: &Log, p: &VaultPut) -> VaultResponse {
-    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![], ..Default::default() }
+    VaultResponse { counter: log.manifests.len() as u64, manifests: vec![p.manifest.clone()], rosters: vec![], key: None, items: p.upserts.clone(), gone: vec![], sealed: Some(p.sealed.clone()), ..Default::default() }
 }
 
 fn titles(v: &Vault) -> Vec<String> {
@@ -858,7 +936,7 @@ fn pending_edit_and_delete_keep_syncing_after_a_rotation() {
     let r = v.revoke(&am, &["bob"], 0).unwrap();
     log.roster(&r);
     let rot = r.rotation.as_ref().unwrap();
-    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], ..Default::default() };
+    let rotation = VaultResponse { counter: log.manifests.len() as u64, manifests: vec![rot.manifest.clone()], rosters: vec![r.roster.clone()], key: log.full("alice").key, items: rot.upserts.clone(), gone: vec![], sealed: Some(rot.sealed.clone()), ..Default::default() };
     v.apply(&rotation, &mut a, 0).unwrap();
     d2.put(x, login("edit me", "new"));
     d2.delete(y);

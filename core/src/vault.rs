@@ -163,7 +163,7 @@ impl Vault {
         v.meta_dirty = true;
         let put = v.push(me, 0)?;
         v.pushed(&put);
-        Ok((v, NewVault { roster: signed, keys, manifest: put.manifest }))
+        Ok((v, NewVault { roster: signed, keys, manifest: put.manifest, sealed: put.sealed }))
     }
 
     fn key(&self) -> Result<Key, Error> {
@@ -374,6 +374,10 @@ impl Vault {
         let mut latest: Option<(ManifestEnvelope, String)> = None;
         for s in &resp.manifests {
             let env: ManifestEnvelope = serde_json::from_slice(&s.body.0).map_err(|_| Error::BadJson)?;
+            // The sealed part's hash, or (written before hashes) the sealed part itself.
+            if env.sealed.is_some() == env.sealed_hash.is_some() {
+                return Err(Error::BadJson);
+            }
             let fresh = latest.is_none() && self.counter == 0;
             if env.vault_id != self.id || (!fresh && (env.counter != counter + 1 || env.prev != last)) {
                 return Err(Error::Rollback);
@@ -411,7 +415,11 @@ impl Vault {
         if env.epoch != roster.epoch {
             return Err(Error::ManifestMismatch);
         }
-        let m: ManifestBody = open_json(&vk, &ad("manifest", &[&self.id.0]), &env.sealed.0)?;
+        let sealed = match (&env.sealed, &env.sealed_hash) {
+            (Some(sealed), _) => sealed,
+            (None, hash) => resp.sealed.as_ref().filter(|s| Some(&h(&s.0)) == hash.as_ref()).ok_or(Error::ManifestMismatch)?,
+        };
+        let m: ManifestBody = open_json(&vk, &ad("manifest", &[&self.id.0]), &sealed.0)?;
 
         let mut received = BTreeMap::new();
         for ib in &resp.items {
@@ -511,10 +519,19 @@ impl Vault {
         Ok(kr_changed)
     }
 
-    fn seal_manifest(&self, me: &Me, vk: &Key, epoch: u64, roster: u64, items: BTreeMap<Hex, B64>) -> Signed {
+    /// The next manifest: its signed envelope and its sealed part.
+    fn seal_manifest(&self, me: &Me, vk: &Key, epoch: u64, roster: u64, items: BTreeMap<Hex, B64>) -> (Signed, B64) {
         let sealed = seal_json(vk, &ad("manifest", &[&self.id.0]), &ManifestBody { meta: self.meta.clone(), items });
-        let env = ManifestEnvelope { vault_id: self.id, counter: self.counter + 1, epoch, roster, prev: self.last.clone(), sealed: B64(sealed) };
-        me.sign_doc("manifest", &env)
+        let env = ManifestEnvelope {
+            vault_id: self.id,
+            counter: self.counter + 1,
+            epoch,
+            roster,
+            prev: self.last.clone(),
+            sealed_hash: Some(h(&sealed)),
+            sealed: None,
+        };
+        (me.sign_doc("manifest", &env), B64(sealed))
     }
 
     /// Seal pending changes into a signed request. After a 2xx call `pushed`;
@@ -533,9 +550,11 @@ impl Vault {
         }
         let items = self.entries.iter().map(|(id, e)| (*id, h(&e.blob))).collect();
         let (epoch, version) = self.roster.as_ref().map_or((0, 0), |r| (r.epoch, r.version));
+        let (manifest, sealed) = self.seal_manifest(me, &vk, epoch, version, items);
         Ok(VaultPut {
             expected_counter: self.counter,
-            manifest: self.seal_manifest(me, &vk, epoch, version, items),
+            manifest,
+            sealed,
             upserts,
             deletes: self.deleted.iter().copied().collect(),
             staged: None,
@@ -622,7 +641,8 @@ impl Vault {
             items.insert(*id, h(&blob));
             upserts.push(ItemBlob { id: *id, blob: B64(blob) });
         }
-        let rotation = VaultPut { expected_counter: self.counter, manifest: self.seal_manifest(me, &vk, r.epoch, r.version, items), upserts, deletes: vec![], staged: None };
+        let (manifest, sealed) = self.seal_manifest(me, &vk, r.epoch, r.version, items);
+        let rotation = VaultPut { expected_counter: self.counter, manifest, sealed, upserts, deletes: vec![], staged: None };
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: Some(rotation) })
     }
 

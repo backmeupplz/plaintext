@@ -138,8 +138,15 @@ pub struct ManifestEnvelope {
     pub roster: u64,
     /// SHA-256 of the previous manifest's signed body; empty for the first.
     pub prev: B64,
-    /// Sealed `{meta, items: {id → hash}}` with the vault key.
-    pub sealed: B64,
+    /// SHA-256 of the sealed `{meta, items: {id → hash}}`, which travels beside the
+    /// envelope (`VaultPut::sealed`, `VaultResponse::sealed`): the server keeps it
+    /// only for the latest manifest, so the history it keeps stays small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_hash: Option<B64>,
+    /// Manifests from before `sealed_hash` carry the sealed part itself. Still read,
+    /// never written (the server refuses new ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<B64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -154,6 +161,9 @@ pub struct NewVault {
     pub roster: Signed,
     pub keys: Vec<WrappedKey>,
     pub manifest: Signed,
+    /// The first manifest's sealed part (`ManifestEnvelope::sealed_hash`).
+    #[serde(default)]
+    pub sealed: B64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -184,6 +194,10 @@ pub struct VaultResponse {
     /// the vault moved on: start over), and applies all pages as one response.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub more: bool,
+    /// The sealed part of the latest manifest, in the page that carries it
+    /// (`ManifestEnvelope::sealed_hash`; none for an older manifest, which holds its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<B64>,
 }
 
 /// `PUT /v1/vaults/{id}`: applied only if the server is still at `expected_counter`.
@@ -191,6 +205,9 @@ pub struct VaultResponse {
 pub struct VaultPut {
     pub expected_counter: u64,
     pub manifest: Signed,
+    /// The manifest's sealed part (`ManifestEnvelope::sealed_hash`).
+    #[serde(default)]
+    pub sealed: B64,
     pub upserts: Vec<ItemBlob>,
     pub deletes: Vec<Hex>,
     /// Item blobs sent ahead with `POST /v1/vaults/{id}/stage`, committed with this push.

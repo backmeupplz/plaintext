@@ -471,9 +471,9 @@ fn account_deletion() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// `PLAINTEXT_QUOTA_MB` counts items, files, rosters and the latest manifest of
-/// the vaults an account created. Writes that would add past it get 507; reads,
-/// edits, deletes and key replacement always work.
+/// `PLAINTEXT_QUOTA_MB` counts items, files, every roster and manifest of the
+/// vaults an account created. Writes that would add past it get 507; reads,
+/// deletes and key replacement always work.
 #[test]
 fn storage_quota() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
@@ -511,8 +511,12 @@ fn storage_quota() {
     assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000, "reads still work");
     assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 507);
     assert_eq!(status(alice.create_vault("More")), 507, "a vault's roster and manifest count");
-    // An edit that takes no more room goes through.
-    alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bonk", "b4nk") }).unwrap();
+    // Every push adds a manifest to the counted history, so over the quota a push
+    // must remove items: even an edit that takes no more room waits.
+    let mut copy = Vault::restore(&alice.account, personal, &alice.vaults[&personal].snapshot(&alice.account)).unwrap();
+    copy.put(id, Item { files: vec![big.clone()], ..item("Bonk", "b4nk") });
+    let put = copy.push(&alice.me(), now()).unwrap();
+    assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&put))), 507);
     // A writer's items count against the vault's creator, not the writer.
     let err = bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "x")).unwrap_err();
     assert!(matches!(&err, Error::Server(507, m) if m.contains("out of storage")), "{err}");
@@ -550,13 +554,14 @@ fn storage_quota() {
         status(s.call::<()>("POST", &format!("/v1/vaults/{mine}/roster"), Some(&u)))
     };
     assert_eq!(take_over(&mut alice), 507);
-    // Over the quota, a roster change (here an unchanged role) may keep its unknown
-    // fields but not grow them.
-    assert_eq!(padded(&mut alice, Role::Writer, 2000), 507);
-    assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
-    // Over the quota, a promotion and removing someone (a new key) still work;
-    // adding someone doesn't.
-    alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
+    // Over the quota, a roster change that takes nothing away (here an unchanged
+    // role, or a promotion) needs room: every version counts.
+    assert_eq!(padded(&mut alice, Role::Writer, 1000), 507);
+    // One that removes or demotes someone (a new key) goes through, and may keep
+    // its unknown fields but not grow them; adding someone doesn't.
+    assert_eq!(padded(&mut alice, Role::Reader, 2000), 507);
+    assert_eq!(padded(&mut alice, Role::Reader, 1000), 200);
+    assert_eq!(status(alice.share_vault(&personal, "bob", Role::Writer, None)), 507);
     alice.revoke(&personal, "bob").unwrap();
     assert_eq!(status(alice.share_vault(&personal, "bob", Role::Reader, None)), 507);
 
@@ -1625,7 +1630,7 @@ fn paged_pulls() {
     assert!(behind.problems.is_empty(), "{:?}", behind.problems);
     assert_eq!(behind.vaults[&personal].items().count(), 40);
     assert_eq!(behind.vaults[&personal].roster.as_ref().unwrap().version, 3);
-    assert!(behind.t.later.get() >= 5, "{} later pages", behind.t.later.get());
+    assert!(behind.t.later.get() >= 3, "{} later pages", behind.t.later.get());
 
     // A new device's pull, with bob pushing between its first and second page.
     let fresh = pages(personal);
@@ -1639,5 +1644,49 @@ fn paged_pulls() {
     // The 409 is a later page's only: a first page always answers.
     let q = format!("/v1/vaults/{personal}?since=0&latest=true&at=1");
     assert_eq!(status(alice.call::<VaultResponse>("GET", &q, NONE)), 409);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The server keeps only the latest manifest's sealed part, so a vault's history
+/// is a list of small envelopes, which count against the quota with every roster
+/// version. It refuses envelopes that carry the sealed part themselves.
+#[test]
+fn manifest_history_stays_small() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    join(Http::new(&url), "bob", "bob pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    for i in 0..5 {
+        alice.put_item(&personal, plaintext_core::new_item_id(), item(&format!("Site {i}"), "pw")).unwrap();
+    }
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.revoke(&personal, "bob").unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM manifests WHERE length(sealed) > 0"), 2, "one per vault, alice's and bob's");
+    assert!(count(&path, "SELECT MAX(octet_length(signed)) FROM manifests") < 600);
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    let stored = format!(
+        "SELECT (SELECT SUM(length(blob)) FROM items WHERE vault_id = x'{personal}') + (SELECT SUM(octet_length(signed)) FROM rosters WHERE vault_id = x'{personal}')
+              + (SELECT SUM(octet_length(signed) + length(sealed)) FROM manifests WHERE vault_id = x'{personal}')"
+    );
+    assert_eq!(acct.usage as i64, count(&path, &stored), "every roster and manifest counts");
+
+    // An envelope as old clients wrote it, or one padded past 1 KiB, is refused.
+    let me = alice.me();
+    let mut copy = Vault::restore(&alice.account, personal, &alice.vaults[&personal].snapshot(&alice.account)).unwrap();
+    copy.put(plaintext_core::new_item_id(), item("Late", "l8"));
+    let put = copy.push(&me, now()).unwrap();
+    let env: serde_json::Value = serde_json::from_slice(&put.manifest.body.0).unwrap();
+    let resigned = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut env = env.clone();
+        f(&mut env);
+        let put = VaultPut { manifest: me.sign_doc("manifest", &env), ..put.clone() };
+        status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&put)))
+    };
+    let sealed = serde_json::to_value(&put.sealed).unwrap();
+    assert_eq!(resigned(&|e| e["sealed"] = sealed.clone()), 400);
+    assert_eq!(resigned(&|e| drop(e.as_object_mut().unwrap().remove("sealed_hash"))), 400);
+    assert_eq!(resigned(&|e| e["pad"] = "A".repeat(1000).into()), 400);
+    assert_eq!(resigned(&|_| ()), 200);
     let _ = std::fs::remove_file(&path);
 }

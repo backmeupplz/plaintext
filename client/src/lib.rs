@@ -437,6 +437,7 @@ impl<T: AsyncTransport> Session<T> {
                         a.manifests.extend(page.manifests);
                         a.items.extend(page.items);
                         (a.key, a.gone, a.more) = (page.key, page.gone, page.more);
+                        a.sealed = page.sealed.or(a.sealed.take());
                         a
                     }
                 };
@@ -481,7 +482,7 @@ impl<T: AsyncTransport> Session<T> {
     /// server's staging area first, in parts, and the returned push commits them.
     async fn staged_async(&self, vault: &Hex, put: &VaultPut) -> Result<Option<VaultPut>> {
         let items: usize = put.upserts.iter().map(|u| u.blob.0.len()).sum();
-        if put.upserts.is_empty() || items + put.manifest.body.0.len() <= STAGE_PAST {
+        if put.upserts.is_empty() || items + put.sealed.0.len() <= STAGE_PAST {
             return Ok(None);
         }
         let stage = plaintext_core::new_item_id();
@@ -499,6 +500,7 @@ impl<T: AsyncTransport> Session<T> {
         Ok(Some(VaultPut {
             expected_counter: put.expected_counter,
             manifest: put.manifest.clone(),
+            sealed: put.sealed.clone(),
             upserts: vec![],
             deletes: put.deletes.clone(),
             staged: Some(Staged { id: stage, count: put.upserts.len() as u64 }),

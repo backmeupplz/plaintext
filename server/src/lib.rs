@@ -105,6 +105,12 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
              COMMIT;",
         )?;
     }
+    // A manifest's sealed part travels beside its envelope, which signs its hash, and
+    // is kept only while the manifest is the latest (then emptied to x''). NULL for
+    // manifests from before, which carry it inside `signed`.
+    if !has_col(&c, "manifests", "sealed")? {
+        c.execute_batch("ALTER TABLE manifests ADD COLUMN sealed BLOB;")?;
+    }
     // A disabled person's agents are disabled with them (databases from before that rule).
     c.execute("UPDATE accounts SET disabled = 1 WHERE disabled = 0 AND owner IN (SELECT username FROM accounts WHERE disabled = 1)", [])?;
     Ok(c)
@@ -454,7 +460,9 @@ fn max_body(domain: &str) -> usize {
         "roster" => 512 << 10,
         "leave" => 256,
         "message" => MAX_BLOB / 3 * 4 + (4 << 10),
-        "manifest" => MAX_MANIFEST / 3 * 4 + (4 << 10),
+        // Only the envelope, which signs the sealed part's hash (that part is kept
+        // only for the latest manifest; envelopes are kept for good).
+        "manifest" => 1 << 10,
         _ => 0,
     }
 }
@@ -924,20 +932,19 @@ async fn create_invite(State(db): State<Db>, axum::Extension(cfg): axum::Extensi
 
 // ---------- Vaults ----------
 
-/// Bytes `account` stores: items, files, staged items and the latest roster and
-/// manifest of the vaults it created, and the share links and messages it and its
-/// agents sent.
-// ponytail: earlier rosters and manifests aren't counted (see "Known limits" in DESIGN.md).
+/// Bytes `account` stores: items, files, staged items, every roster version and
+/// manifest (with the latest one's sealed part) of the vaults it pays for, and the
+/// share links and messages it and its agents sent. Manifests from before envelopes
+/// signed a hash count only while they're the latest: they can't shrink.
 fn usage(db: &Connection, account: Option<&str>) -> R<u64> {
     db.query_row(
         &format!(
             "SELECT (SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM files WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id IN (SELECT id FROM vaults WHERE creator = ?1))
-                  + (SELECT COALESCE(SUM(octet_length(r.signed)), 0) FROM rosters r JOIN vaults v ON v.id = r.vault_id AND v.roster_version = r.version
-                     WHERE v.creator = ?1)
-                  + (SELECT COALESCE(SUM(octet_length(m.signed)), 0) FROM manifests m JOIN vaults v ON v.id = m.vault_id AND v.counter = m.counter
-                     WHERE v.creator = ?1)
+                  + (SELECT COALESCE(SUM(octet_length(r.signed)), 0) FROM rosters r JOIN vaults v ON v.id = r.vault_id WHERE v.creator = ?1)
+                  + (SELECT COALESCE(SUM(octet_length(m.signed) + COALESCE(length(m.sealed), 0)), 0) FROM manifests m JOIN vaults v ON v.id = m.vault_id
+                     WHERE v.creator = ?1 AND (m.sealed IS NOT NULL OR m.counter = v.counter))
                   + (SELECT COALESCE(SUM(length(blob)), 0) FROM links WHERE {})
                   + (SELECT COALESCE(SUM(octet_length(signed)), 0) FROM messages WHERE {})",
             in_set("creator"),
@@ -992,27 +999,34 @@ fn roster_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], signer: 
     Ok(out)
 }
 
-/// Runs a push (or a key rotation's re-seal) into `vault` and keeps it if the
-/// account it counts against stays within the quota or, over it, if the vault's
-/// items take no more room and its sealed manifest is no larger than the one
-/// before. The signed envelope around it can grow by a digit as the counter does,
-/// so editing and deleting keep working when the account is full.
-fn push_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], write: impl FnOnce() -> R<T>) -> R<T> {
+/// Runs a push (or a key rotation's re-seal, `rekey`) into `vault` and keeps it if
+/// the account it counts against stays within the quota or, over it, if the push
+/// removes items, their bytes don't grow, and the sealed manifest and the bytes
+/// in its envelope beyond the known fields don't either. A new key's re-seal
+/// needn't remove anything. Each push adds an envelope to the counted history, so
+/// over the quota that history grows by at most one envelope per item removed.
+fn push_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], rekey: bool, write: impl FnOnce() -> R<T>) -> R<T> {
     let Some(quota) = cfg.quota else { return write() };
-    // Items, sealed manifest, and bytes in the signed envelope beyond its known fields.
-    let sizes = || -> R<(u64, usize, usize)> {
-        let items: u64 = tx.query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", [vault], |r| r.get(0)).map_err(db_err)?;
-        let manifest: String = tx
-            .query_row("SELECT m.signed FROM manifests m JOIN vaults v ON v.id = m.vault_id AND v.counter = m.counter WHERE v.id = ?", [vault], |r| r.get(0))
+    // Items (how many, bytes), sealed manifest, and envelope bytes beyond its known fields.
+    let sizes = || -> R<(u64, u64, usize, usize)> {
+        let (n, items): (u64, u64) = tx
+            .query_row("SELECT COUNT(*), COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", [vault], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?;
+        let (manifest, sealed): (String, Option<Vec<u8>>) = tx
+            .query_row("SELECT m.signed, m.sealed FROM manifests m JOIN vaults v ON v.id = m.vault_id AND v.counter = m.counter WHERE v.id = ?", [vault], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .map_err(db_err)?;
         let s: Signed = serde_json::from_str(&manifest).map_err(db_err)?;
         let env: ManifestEnvelope = parse(&s)?;
-        Ok((items, env.sealed.0.len(), padding(&s, &env)))
+        let sealed = sealed.map_or(env.sealed.as_ref().map_or(0, |b| b.0.len()), |b| b.len());
+        Ok((n, items, sealed, padding(&s, &env)))
     };
     let before = sizes()?;
     let out = write()?;
     let after = sizes()?;
-    if (after.0 > before.0 || after.1 > before.1 || after.2 > before.2) && usage(tx, creator(tx, vault)?.as_deref())? > quota {
+    let shrinks = (rekey || after.0 < before.0) && after.1 <= before.1 && after.2 <= before.2 && after.3 <= before.3;
+    if !shrinks && usage(tx, creator(tx, vault)?.as_deref())? > quota {
         return Err(FULL);
     }
     Ok(out)
@@ -1128,7 +1142,11 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     if env.vault_id.0[..] != *vault || env.counter != counter + 1 || env.epoch != epoch || env.roster > roster || env.prev.0 != last.unwrap_or_default() {
         return Err((BAD, "manifest doesn't extend the chain"));
     }
-    if env.sealed.0.is_empty() || env.sealed.0.len() > MAX_MANIFEST {
+    // Old clients' envelopes held the sealed part itself, and the history keeps them for good.
+    if env.sealed.is_some() || env.sealed_hash.as_ref().is_none_or(|h| h.0[..] != sha256(&put.sealed.0)[..]) {
+        return Err((BAD, "a manifest's envelope signs the hash of its sealed part, sent beside it (update the app)"));
+    }
+    if put.sealed.0.is_empty() || put.sealed.0.len() > MAX_MANIFEST {
         return Err((BAD, "manifest size"));
     }
     for u in &put.upserts {
@@ -1156,7 +1174,9 @@ fn store_put(tx: &Transaction, vault: &[u8], put: &VaultPut, username: &str) -> 
     for d in &put.deletes {
         tx.execute("DELETE FROM items WHERE vault_id = ? AND id = ?", params![vault, &d.0[..]]).map_err(db_err)?;
     }
-    tx.execute("INSERT INTO manifests(vault_id, counter, signed) VALUES(?,?,?)", params![vault, env.counter, json(&put.manifest)])
+    // Only the latest manifest's sealed part is ever served.
+    tx.execute("UPDATE manifests SET sealed = x'' WHERE vault_id = ? AND length(sealed) > 0", [vault]).map_err(db_err)?;
+    tx.execute("INSERT INTO manifests(vault_id, counter, signed, sealed) VALUES(?,?,?,?)", params![vault, env.counter, json(&put.manifest), put.sealed.0])
         .map_err(db_err)?;
     tx.execute(
         "UPDATE vaults SET counter = ?, manifest_hash = ? WHERE id = ?",
@@ -1177,7 +1197,7 @@ fn insert_vault(tx: &Transaction, nv: &NewVault, username: &str) -> R<()> {
         .map_err(|_| (StatusCode::CONFLICT, "vault exists"))?;
     store_roster(tx, &vault, &nv.roster, &r)?;
     store_keys(tx, &vault, &nv.keys)?;
-    let put = VaultPut { expected_counter: 0, manifest: nv.manifest.clone(), upserts: vec![], deletes: vec![], staged: None };
+    let put = VaultPut { expected_counter: 0, manifest: nv.manifest.clone(), sealed: nv.sealed.clone(), upserts: vec![], deletes: vec![], staged: None };
     store_put(tx, &vault, &put, username)
 }
 
@@ -1262,22 +1282,25 @@ async fn get_vault(
         rosters.push(serde_json::from_str(&s).map_err(db_err)?);
     }
     drop(rows);
-    let mut manifests = Vec::new();
+    let (mut manifests, mut sealed) = (Vec::new(), None);
     if !page.full {
         let from = q.from.unwrap_or(q.since).max(q.since) as i64;
         let sql = if q.latest {
-            "SELECT signed FROM manifests WHERE vault_id = ?1 AND counter > ?2 AND counter = (SELECT counter FROM vaults WHERE id = ?1)"
+            "SELECT signed, sealed FROM manifests WHERE vault_id = ?1 AND counter > ?2 AND counter = (SELECT counter FROM vaults WHERE id = ?1)"
         } else {
-            "SELECT signed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter"
+            "SELECT signed, sealed FROM manifests WHERE vault_id = ? AND counter > ? ORDER BY counter"
         };
         let mut st = db.prepare(sql).map_err(db_err)?;
         let mut rows = st.query(params![&vault[..], from]).map_err(db_err)?;
         while let Some(row) = rows.next().map_err(db_err)? {
             let s: String = row.get(0).map_err(db_err)?;
-            if !page.fits(s.len()) {
+            // Non-empty only for the latest manifest, and then in the same page.
+            let part = row.get::<_, Option<Vec<u8>>>(1).map_err(db_err)?.filter(|b| !b.is_empty());
+            if !page.fits(s.len() + part.as_ref().map_or(0, Vec::len)) {
                 break;
             }
             manifests.push(serde_json::from_str(&s).map_err(db_err)?);
+            sealed = part.map(B64).or(sealed);
         }
     }
     let mut items = Vec::new();
@@ -1319,7 +1342,7 @@ async fn get_vault(
             gone.push(m.username);
         }
     }
-    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone, more: page.full }))
+    Ok(Json(VaultResponse { counter, manifests, rosters, key, items, gone, more: page.full, sealed }))
 }
 
 async fn put_vault(
@@ -1335,7 +1358,7 @@ async fn put_vault(
     let res = (|| -> R<()> {
         let tx = db.transaction().map_err(db_err)?;
         need_role(&tx, &vault, &c.username, Role::Writer)?;
-        push_within_quota(&tx, &cfg, &vault, || store_put(&tx, &vault, &put, &c.username))?;
+        push_within_quota(&tx, &cfg, &vault, false, || store_put(&tx, &vault, &put, &c.username))?;
         let written = put.upserts.len() as u64 + put.staged.as_ref().map_or(0, |s| s.count);
         audit_log(&tx, &vault, &c.username, &format!("write {written} items, delete {}", put.deletes.len()))?;
         tx.commit().map_err(db_err)
@@ -1492,26 +1515,30 @@ async fn update_roster(
                 return Err((StatusCode::CONFLICT, "someone left the vault: remove them with a new key first"));
             }
         }
-        // Adding someone needs room in the account that pays afterwards: for the longer
-        // roster, or for the whole vault if it moves to the signer. Other changes (a
-        // promotion, removing someone with a new key) always go through, as long as the
-        // items don't grow. Measured after any new key's items are re-sealed, which
-        // uses up the staged copies.
+        // Every roster version counts against the quota. One that removes or demotes
+        // someone, and adds or promotes nobody, always goes through, as long as the
+        // items don't grow: a vault has only so many of those before it's empty. Any
+        // other needs room in the account that pays afterwards: for the new version, or
+        // for the whole vault if it moves to the signer. Measured after any new key's
+        // items are re-sealed, which uses up the staged copies.
         let store = || -> R<()> {
             store_roster(&tx, &vault, &u.roster, &r)?;
             store_keys(&tx, &vault, &u.keys)?;
             if let Some(put) = &u.rotation {
-                push_within_quota(&tx, &cfg, &vault, || {
+                push_within_quota(&tx, &cfg, &vault, true, || {
                     tx.execute("DELETE FROM items WHERE vault_id = ?", [&vault[..]]).map_err(db_err)?;
                     store_put(&tx, &vault, put, &c.username)
                 })?;
             }
             Ok(())
         };
-        if r.members.iter().any(|m| !had(&m.username)) {
-            roster_within_quota(&tx, &cfg, &vault, &c.username, store)?;
-        } else {
+        let was = |m: &Member| prev.members.iter().find(|p| p.username == m.username).map(|p| p.role);
+        let narrows = r.members.iter().all(|m| was(m).is_some_and(|o| m.role <= o))
+            && (r.members.len() < prev.members.len() || r.members.iter().any(|m| was(m).is_some_and(|o| m.role < o)));
+        if narrows {
             store()?;
+        } else {
+            roster_within_quota(&tx, &cfg, &vault, &c.username, store)?;
         }
         // As with a manifest, fields the server doesn't know may grow only while the
         // account paying for the vault (from now on, if the creator was removed; with any
@@ -1769,8 +1796,8 @@ mod tests {
         assert_eq!((n, oldest.as_str()), (1000, "write 5"));
     }
 
-    /// A database from before `vaults.creator`, `sessions.expires` and `messages.sender`
-    /// gets them. The creator is filled from roster
+    /// A database from before `vaults.creator`, `sessions.expires`, `messages.sender`
+    /// and `manifests.sealed` gets them; its manifests count only while they're the latest. The creator is filled from roster
     /// v0's signer while they're still a current member (else an enabled owner), and opening it again changes nothing.
     #[test]
     fn creator_migration() {
@@ -1791,7 +1818,8 @@ mod tests {
                INSERT INTO accounts(id, username, kind, owner, identity, auth_key, account_key, keyring, created)
                  VALUES (x'a3', 'aaron-ci', 'agent', 'aaron', '', x'', x'', x'', 0);
                INSERT INTO sessions(token_hash, account_id, device, created) VALUES (x'01', x'b1', 'phone', 0);
-               INSERT INTO messages(id, to_user, signed, created) VALUES (x'01', 'bob', '{"body":"","signer":"carol","sig":""}', 0);"#,
+               INSERT INTO messages(id, to_user, signed, created) VALUES (x'01', 'bob', '{"body":"","signer":"carol","sig":""}', 0);
+               INSERT INTO manifests(vault_id, counter, signed) VALUES (x'01', 0, printf('%.1000c', 'x')), (x'01', 1, '0123456789');"#,
         )
         .unwrap();
         drop(old);
@@ -1806,6 +1834,13 @@ mod tests {
             assert_eq!(sender, "carol");
             let disabled: bool = db.query_row("SELECT disabled FROM accounts WHERE username = 'aaron-ci'", [], |r| r.get(0)).unwrap();
             assert!(disabled, "a disabled person's agent");
+            let (old, rosters): (i64, u64) = db
+                .query_row("SELECT COUNT(*), (SELECT SUM(octet_length(signed)) FROM rosters WHERE vault_id = x'01') FROM manifests WHERE sealed IS NULL", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(old, 2);
+            assert_eq!(super::usage(&db, Some("alice")).unwrap(), rosters + 10, "every roster, and the latest manifest only");
         }
         let _ = std::fs::remove_file(&path);
     }
