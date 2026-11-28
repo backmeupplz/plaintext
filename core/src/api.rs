@@ -187,6 +187,40 @@ pub struct VaultPut {
     pub manifest: Signed,
     pub upserts: Vec<ItemBlob>,
     pub deletes: Vec<Hex>,
+    /// Item blobs sent ahead with `POST /v1/vaults/{id}/stage`, committed with this push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<Staged>,
+}
+
+/// The `count` item blobs this member staged under `id`; the push fails (409) if
+/// the server doesn't hold exactly that many.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Staged {
+    pub id: Hex,
+    pub count: u64,
+}
+
+/// Most item bytes one push (or key rotation) may write. Every member's next pull
+/// brings them in one response, which clients take up to 128 MiB of, in base64
+/// and with a manifest of up to 16 MiB (twice base64).
+pub const MAX_PUSH: usize = 64 << 20;
+
+/// `POST /v1/vaults/{id}/leave`, signed (domain `leave`) by the member leaving.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LeaveVault {
+    pub vault_id: Hex,
+    /// Unix milliseconds; the server takes it within ±120 s.
+    pub ts: u64,
+}
+
+/// `POST /v1/vaults/{id}/stage`: part of the items of a push (or a key rotation)
+/// too big for one request. The server holds them, uncommitted, until the push
+/// that names `stage`, or a day after the first part. Staging under a new id drops
+/// what the member staged before in that vault, and so does a refused part or push.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StageRequest {
+    pub stage: Hex,
+    pub upserts: Vec<ItemBlob>,
 }
 
 /// `POST /v1/vaults/{id}/roster`: a new roster version, plus keys for new members.
@@ -246,9 +280,17 @@ pub struct AccountResponse {
     /// Storage this account may use, in bytes (`None`: unlimited).
     #[serde(default)]
     pub quota: Option<u64>,
-    /// Bytes of items and files in the vaults this account created.
+    /// Bytes counted against the quota: the vaults in `paid` and the share links and
+    /// messages this account and its agents sent (DESIGN "Servers and accounts").
     #[serde(default)]
     pub usage: u64,
+    /// Every vault that counts against this account (`usage`): the ones it created,
+    /// and ones that moved to it from someone else (DESIGN "Servers and accounts"),
+    /// including ones it isn't a current member of (only an agent of its is, or its
+    /// membership expired).
+    /// `POST /v1/vaults/{id}/leave` takes it and its agents out of any of them.
+    #[serde(default)]
+    pub paid: Vec<Hex>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

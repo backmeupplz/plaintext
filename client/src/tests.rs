@@ -276,6 +276,8 @@ fn lying_server_and_hostile_users() {
     // Caught and reported; the vault keeps its last verified state.
     a3.sync().unwrap();
     assert!(a3.problems.iter().any(|p| p.contains("older or different copy")), "{:?}", a3.problems);
+    // Without a hint to leave (delete) the vault the server is attacking.
+    assert!(!a3.problems.iter().any(|p| p.contains("vault leave")), "{:?}", a3.problems);
     assert!(a3.vaults[&mine].items().any(|(_, i)| i.password == "added-later"));
     let _ = std::fs::remove_file(&path);
 }
@@ -470,8 +472,9 @@ fn account_deletion() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A quota counts items and files in the vaults an account created. Writes that
-/// would add past it get 413; reads, deletes and key replacement always work.
+/// `PLAINTEXT_QUOTA_MB` counts items, files, rosters and the latest manifest of
+/// the vaults an account created. Writes that would add past it get 507; reads,
+/// edits, deletes and key replacement always work.
 #[test]
 fn storage_quota() {
     let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
@@ -482,6 +485,18 @@ fn storage_quota() {
     let big = alice.upload_file(&personal, "scan.pdf", &vec![7u8; 300_000]).unwrap();
     let id = plaintext_core::new_item_id();
     alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bank", "b4nk") }).unwrap();
+    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
+    // A roster change carrying fields the server doesn't know (say, from a newer client).
+    let padded = |s: &mut Session<Http>, role: Role, pad: usize| {
+        let u = s.vaults[&personal].grant(&s.me(), &s.keyring, "bob", role, None, now()).unwrap();
+        let mut r: serde_json::Value = serde_json::from_slice(&u.roster.body.0).unwrap();
+        r["pad"] = "A".repeat(pad).into();
+        let u = RosterUpdate { roster: s.me().sign_doc("roster", &r), ..u };
+        let code = status(s.call::<()>("POST", &format!("/v1/vaults/{personal}/roster"), Some(&u)));
+        s.sync().unwrap();
+        code
+    };
+    assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert_eq!(acct.quota, None, "unlimited unless set");
     assert!(acct.usage > 300_000);
@@ -491,38 +506,88 @@ fn storage_quota() {
     let mut alice = login(&url, "alice pw", &ask);
     let mut bob = login(&url, "bob pw", &bsk);
     alice.sync().unwrap();
+    bob.sync().unwrap();
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
     assert_eq!(acct.quota, Some(256 << 10));
     assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000, "reads still work");
-    assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 413);
-    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
-    alice.revoke(&personal, "bob").unwrap();
-    alice.share_vault(&personal, "bob", Role::Writer, None).unwrap();
-    bob.sync().unwrap();
+    assert_eq!(status(alice.upload_file(&personal, "more.pdf", b"more")), 507);
+    assert_eq!(status(alice.create_vault("More")), 507, "a vault's roster and manifest count");
+    // An edit that takes no more room goes through.
+    alice.put_item(&personal, id, Item { files: vec![big.clone()], ..item("Bonk", "b4nk") }).unwrap();
     // A writer's items count against the vault's creator, not the writer.
     let err = bob.put_item(&personal, plaintext_core::new_item_id(), item("Bob's", "x")).unwrap_err();
-    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    assert!(matches!(&err, Error::Server(507, m) if m.contains("out of storage")), "{err}");
     let mine = bob.default_vault().unwrap();
     bob.upload_file(&mine, "bob.pdf", b"bob's own file").unwrap();
     // The refused change waits on bob's device without holding up his other vaults.
     bob.vaults.get_mut(&mine).unwrap().put(plaintext_core::new_item_id(), item("Bob's own", "y"));
-    assert_eq!(status(bob.sync()), 413);
+    assert_eq!(status(bob.sync()), 507);
     assert!(!bob.vaults[&mine].has_changes());
+    // Staged items count too: over the quota only an owner may stage, and only as
+    // much as the vault's items (a new key re-seals them).
+    let stage = |s: &Session<Http>, v: &Hex, id: Hex, n: usize| {
+        let upserts = vec![ItemBlob { id: plaintext_core::new_item_id(), blob: B64(vec![1; n]) }];
+        status(s.call::<()>("POST", &format!("/v1/vaults/{v}/stage"), Some(&StageRequest { stage: id, upserts })))
+    };
+    let st = plaintext_core::new_item_id();
+    assert_eq!(stage(&bob, &personal, st, 100), 507);
+    assert_eq!(stage(&alice, &personal, st, 100), 200);
+    assert_eq!(stage(&alice, &personal, st, 2000), 507);
+    // A refused part drops the parts before it, which would otherwise keep counting.
+    assert_eq!(stage(&bob, &mine, st, 100_000), 200);
+    assert_eq!(stage(&bob, &mine, st, 200_000), 507);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
+    // Removing the creator and adding someone in one roster change: the signer
+    // pays from then on, so the signer needs the room.
+    let _ = join(Http::new(&url), "carol", "carol pw", None, "t");
+    bob.share_vault(&mine, "alice", Role::Owner, None).unwrap();
+    alice.sync().unwrap();
+    let carol = alice.pin_user("carol").unwrap();
+    let take_over = |s: &mut Session<Http>| {
+        let u = s.vaults[&mine].revoke(&s.me(), &["bob"], now()).unwrap();
+        let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
+        r.members.push(Member { username: "carol".into(), sign_pk: carol.sign_pk.clone(), enc_pk: carol.enc_pk.clone(), role: Role::Reader, expires: None });
+        let u = RosterUpdate { roster: s.me().sign_doc("roster", &r), ..u };
+        status(s.call::<()>("POST", &format!("/v1/vaults/{mine}/roster"), Some(&u)))
+    };
+    assert_eq!(take_over(&mut alice), 507);
+    // Over the quota, a roster change (here an unchanged role) may keep its unknown
+    // fields but not grow them.
+    assert_eq!(padded(&mut alice, Role::Writer, 2000), 507);
+    assert_eq!(padded(&mut alice, Role::Writer, 1000), 200);
+    // Over the quota, a promotion and removing someone (a new key) still work;
+    // adding someone doesn't.
+    alice.share_vault(&personal, "bob", Role::Owner, None).unwrap();
+    alice.revoke(&personal, "bob").unwrap();
+    assert_eq!(status(alice.share_vault(&personal, "bob", Role::Reader, None)), 507);
 
     // Deleting an item leaves its attachment until the grace has passed, then
     // collecting it makes room.
     alice.delete_item(&personal, id).unwrap();
     // A change refused for lack of room doesn't stop that vault's collection.
-    alice.vaults.get_mut(&personal).unwrap().put(plaintext_core::new_item_id(), item("Waiting", "w"));
-    assert_eq!(status(alice.sync()), 413);
+    // An import refused for lack of room stays on the device.
+    let r = alice.import(vec![import::Imported { name: String::new(), items: vec![(item("Waiting", "w"), vec![])] }], None).unwrap();
+    assert!(matches!(r.sync_error, Some(Error::Server(507, _))), "{r:?}");
+    assert!(alice.vaults[&personal].has_changes());
+    assert_eq!(status(alice.sync()), 507);
     assert_eq!(alice.download_file(&personal, &big).unwrap().len(), 300_000);
     alice.collect_files(&personal, FILE_GRACE).unwrap();
     assert_eq!(status(alice.download_file(&personal, &big)), 404);
     alice.sync().unwrap();
     assert!(!alice.vaults[&personal].has_changes(), "the room went to the refused change");
     let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
-    assert!(acct.usage < 1000, "{}", acct.usage);
+    assert!(acct.usage < 20_000, "{}", acct.usage);
     alice.upload_file(&personal, "small.pdf", &vec![1u8; 100_000]).unwrap();
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.sync().unwrap();
+    assert_eq!(take_over(&mut alice), 200, "an owner with room");
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&mine), "alice pays for it now");
+    // Under the quota, a change that adds nobody still may not grow past it.
+    assert_eq!(padded(&mut alice, Role::Reader, 200_000), 507);
+    assert_eq!(padded(&mut alice, Role::Reader, 10_000), 200);
+    bob.sync().unwrap();
+    assert_eq!(stage(&bob, &personal, st, 100), 403, "readers can't stage");
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -823,6 +888,309 @@ fn strict_transport_security() {
     assert_eq!(hsts(&url), [(200, None), (404, None), (413, None)]);
 }
 
+/// A push or key rotation over the 32 MiB request limit goes up in parts (staged),
+/// and commits in one request.
+#[test]
+fn large_pushes() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    join(Http::new(&url), "bob", "bob pw", None, "t");
+    alice.sync().unwrap();
+    let personal = alice.default_vault().unwrap();
+    // 30 items of 900 KB: 27 MB sealed, 36 MB in base64.
+    let v = alice.vaults.get_mut(&personal).unwrap();
+    for i in 0..30 {
+        v.put(plaintext_core::new_item_id(), Item { notes: "n".repeat(900_000), ..item(&format!("Scan {i}"), "x") });
+    }
+    alice.sync_vault(&personal).unwrap();
+    let mut alice2 = login(&url, "alice pw", &ask);
+    alice2.sync().unwrap();
+    assert_eq!(alice2.vaults[&personal].items().count(), 30);
+    // Removing someone re-seals every item under a new key.
+    alice.share_vault(&personal, "bob", Role::Reader, None).unwrap();
+    alice.revoke(&personal, "bob").unwrap();
+    alice2.sync().unwrap();
+    assert_eq!(alice2.vaults[&personal].roster.as_ref().unwrap().epoch, 1);
+    assert_eq!(alice2.vaults[&personal].items().filter(|(_, i)| i.notes.len() == 900_000).count(), 30);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0);
+
+    // A push whose staged items another push from the account replaced is refused.
+    let me = alice.me();
+    let v = alice.vaults.get_mut(&personal).unwrap();
+    v.put(plaintext_core::new_item_id(), item("Late", "l8"));
+    let put = v.push(&me, now()).unwrap();
+    let (a, b) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    let stage = format!("/v1/vaults/{personal}/stage");
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: a, upserts: put.upserts.clone() })).unwrap();
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
+    // A stage expires a day after its first part, and its first part is audited.
+    let audited = "SELECT COUNT(*) FROM audit WHERE action = 'staging a big push'";
+    let (logged, t) = (count(&path, audited), count(&path, "SELECT created FROM staged"));
+    exec(&path, "UPDATE staged SET created = created - 1000");
+    alice.call::<()>("POST", &stage, Some(&StageRequest { stage: b, upserts: put.upserts.clone() })).unwrap();
+    assert_eq!(count(&path, "SELECT created FROM staged"), t - 1000);
+    assert_eq!(count(&path, audited), logged);
+    assert!(logged >= 3, "the first push, the new key and each stage above");
+    let stale = VaultPut { upserts: vec![], staged: Some(Staged { id: a, count: 1 }), ..put };
+    assert_eq!(status(alice.call::<()>("PUT", &format!("/v1/vaults/{personal}"), Some(&stale))), 409);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 1, "a failed push drops only the stage it named");
+    alice.sync_vault(&personal).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0, "and the next push drops what's left over");
+    assert!(!alice.vaults[&personal].has_changes());
+
+    // A request over the limit gets 413, unlike a full account (507).
+    use std::io::{Read, Write};
+    let host = url.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    write!(s, "PUT /v1/vaults/{personal} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\ncontent-type: application/json\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n", alice.token, 33 << 20).unwrap();
+    // The server stops reading once past the limit, so the end may not go through.
+    let _ = s.write_all(&vec![b' '; 33 << 20]);
+    let (mut resp, mut buf) = (String::new(), [0u8; 4096]);
+    while !resp.contains("bigger") {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+    assert!(resp.starts_with("HTTP/1.1 413") && resp.contains("length limit"), "{resp}");
+
+    // A vault too big to pull is reported on its own; the rest of the sync goes on.
+    struct TooBig(Http, Hex);
+    impl Transport for TooBig {
+        fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+            if method == "GET" && path.starts_with(&format!("/v1/vaults/{}?", self.1)) {
+                return Ok((413, b"too big".to_vec()));
+            }
+            self.0.send(method, path, token, body)
+        }
+        fn host(&self) -> String {
+            self.0.host()
+        }
+    }
+    let mut fresh = Session::login(TooBig(Http::new(&url), personal), &derive("alice pw", &ask), "t").unwrap();
+    fresh.sync().unwrap();
+    assert!(!fresh.vaults.contains_key(&personal));
+    assert!(fresh.problems.iter().any(|p| p.contains("too big to pull")), "{:?}", fresh.problems);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Members can leave a vault (their agents leave with them), so nobody is stuck
+/// paying for a vault someone handed them.
+#[test]
+fn leaving_a_vault() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    let (bsk, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let fam = alice.create_vault("Family").unwrap();
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Netflix", "n3tfl1x")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    let bot_key = bob.create_agent("bob-bot").unwrap();
+    alice.share_vault(&fam, "bob-bot", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&fam));
+
+    // Leaving is signed for the vault it names, so a session token alone can't.
+    let other = bob.me().sign_doc("leave", &LeaveVault { vault_id: bob.default_vault().unwrap(), ts: now_ms() });
+    assert_eq!(status(bob.call::<()>("POST", &format!("/v1/vaults/{fam}/leave"), Some(&other))), 400);
+    // Bob leaves, his agent with him, and alice's device replaces the key.
+    bob.leave_vault(&fam).unwrap();
+    bob.sync().unwrap();
+    assert!(!bob.vaults.contains_key(&fam));
+    let bot = Session::login(Http::new(&url), &derive_agent(&bot_key), "t").unwrap();
+    assert_eq!(status(bot.call::<VaultResponse>("GET", &format!("/v1/vaults/{fam}"), NONE)), 404);
+    // A roster alice's device built before it saw them leave can't bring them back.
+    alice.pin_user("carol").unwrap();
+    let stale = alice.vaults[&fam].grant(&alice.me(), &alice.keyring, "carol", Role::Reader, None, now()).unwrap();
+    assert_eq!(status(alice.call::<()>("POST", &format!("/v1/vaults/{fam}/roster"), Some(&stale))), 409);
+    alice.sync().unwrap();
+    let r = alice.vaults[&fam].roster.clone().unwrap();
+    assert_eq!((r.epoch, r.members.len()), (1, 1));
+    // Every roster keeps an owner and a real key check.
+    let me = alice.me();
+    let tweak = |f: &dyn Fn(&mut Roster)| {
+        let u = alice.vaults[&fam].grant(&me, &alice.keyring, "carol", Role::Reader, None, now()).unwrap();
+        let mut r: Roster = serde_json::from_slice(&u.roster.body.0).unwrap();
+        f(&mut r);
+        RosterUpdate { roster: me.sign_doc("roster", &r), ..u }
+    };
+    let demoted = tweak(&|r| r.members.iter_mut().for_each(|m| m.role = Role::Reader));
+    let expiring = tweak(&|r| r.members.iter_mut().filter(|m| m.role == Role::Owner).for_each(|m| m.expires = Some(now() + 3600)));
+    for u in [demoted, expiring, tweak(&|r| r.key_check = B64(vec![0; 1000]))] {
+        assert_eq!(status(alice.call::<()>("POST", &format!("/v1/vaults/{fam}/roster"), Some(&u))), 400);
+    }
+    // A creator who leaves hands the vault to an owner who stays.
+    let club = carol.create_vault("Club").unwrap();
+    carol.share_vault(&club, "alice", Role::Owner, None).unwrap();
+    carol.leave_vault(&club).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'alice'"), 3);
+
+    // An owner leaves rather than taking themselves out of the roster.
+    assert_eq!(status(alice.revoke(&fam, "alice")), 400);
+    // Bob makes carol an owner and deletes his account: the vault now counts
+    // against carol, who can leave it, which deletes it.
+    let gift = bob.create_vault("Gift").unwrap();
+    bob.share_vault(&gift, "carol", Role::Owner, None).unwrap();
+    bob.delete_account(&derive("bob pw", &bsk)).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 2);
+    carol.sync().unwrap();
+    carol.leave_vault(&gift).unwrap();
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults WHERE creator = 'carol'"), 1);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM vaults"), 4, "alice's three and carol's own");
+    let _ = std::fs::remove_file(&path);
+}
+
+fn exec(path: &std::path::Path, sql: &str) {
+    plaintext_server::open_db(path.to_str().unwrap()).unwrap().execute(sql, []).unwrap();
+}
+
+/// Whoever a vault ends up counting against can always leave it: even if their
+/// device can't open it, as its only owner, once their membership expired, or
+/// when only an agent of theirs is in it.
+#[test]
+fn nobody_is_stuck_paying_for_a_vault() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, quota: Some(4 << 20), ..Default::default() });
+    let (_, mut mallory) = join(Http::new(&url), "mallory", "mallory pw", None, "t");
+    let (_, mut mallory2) = join(Http::new(&url), "mallory2", "mallory2 pw", None, "t");
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    let creator = |v: &Hex| {
+        plaintext_server::open_db(path.to_str().unwrap())
+            .unwrap()
+            .query_row("SELECT creator FROM vaults WHERE id = ?", [&v.0[..]], |r| r.get::<_, String>(0))
+            .ok()
+    };
+
+    // Mallory makes bob an owner of a vault his device can't open (a garbage key),
+    // with her second account in it too, and leaves: it counts against bob.
+    let trap = mallory.create_vault("Trap").unwrap();
+    mallory.put_item(&trap, plaintext_core::new_item_id(), item("Junk", "x".repeat(10_000).as_str())).unwrap();
+    mallory.share_vault(&trap, "mallory2", Role::Writer, None).unwrap();
+    mallory.pin_user("bob").unwrap();
+    let me = mallory.me();
+    let mut u = mallory.vaults[&trap].grant(&me, &mallory.keyring, "bob", Role::Owner, None, now()).unwrap();
+    // Wrapped keys are only for roster members, at the roster's epoch.
+    let mut stray = u.clone();
+    stray.keys.push(WrappedKey { epoch: 7, ..u.keys[0].clone() });
+    assert_eq!(status(mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&stray))), 400);
+    stray.keys = vec![WrappedKey { username: "nobody".into(), ..u.keys[0].clone() }];
+    assert_eq!(status(mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&stray))), 400);
+    u.keys[0].key = B64(vec![1; 100]);
+    mallory.call::<()>("POST", &format!("/v1/vaults/{trap}/roster"), Some(&u)).unwrap();
+    mallory.sync().unwrap();
+    mallory.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap).as_deref(), Some("bob"));
+    // Bob's sync names the vault by id and how to leave it, and he can, as its only owner.
+    bob.sync().unwrap();
+    assert!(!bob.vaults.contains_key(&trap));
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&trap.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains(&format!("it counts against your storage (plaintext vault leave {trap} ")), "{named:?}");
+    bob.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
+    // The last one out deletes it.
+    mallory2.leave_vault(&trap).unwrap();
+    assert_eq!(creator(&trap), None);
+
+    // A creator whose membership expired can still leave.
+    let (_, mut carol) = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let old = carol.create_vault("Old").unwrap();
+    carol.share_vault(&old, "bob", Role::Owner, None).unwrap();
+    exec(&path, "UPDATE members SET expires = 1 WHERE username = 'carol'");
+    carol.sync().unwrap();
+    assert!(carol.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {old}"))), "{:?}", carol.problems);
+    carol.leave_vault(&old).unwrap();
+    assert_eq!(creator(&old).as_deref(), Some("bob"));
+
+    // Mallory makes bob an owner of a vault he can open and leaves: it counts against
+    // him, and his sync names it and how to leave it (his own vaults it doesn't name).
+    let big = mallory.create_vault("Big").unwrap();
+    mallory.share_vault(&big, "bob", Role::Owner, None).unwrap();
+    mallory.leave_vault(&big).unwrap();
+    assert_eq!(creator(&big).as_deref(), Some("bob"));
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&big));
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&big.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains("vault Big counts against your storage, though mallory created it"), "{named:?}");
+    let personal = bob.default_vault().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains(&personal.to_string()) || p.contains("vault Personal")), "{:?}", bob.problems);
+    bob.leave_vault(&big).unwrap();
+    assert_eq!(creator(&big), None);
+
+    // A vault bob opened before that no longer checks out is still named with how
+    // to leave it and that it counts against him, once.
+    let stale = mallory.create_vault("Stale").unwrap();
+    mallory.share_vault(&stale, "bob", Role::Owner, None).unwrap();
+    bob.sync().unwrap();
+    mallory.put_item(&stale, plaintext_core::new_item_id(), item("Later", "x")).unwrap();
+    mallory.sync().unwrap();
+    mallory.leave_vault(&stale).unwrap();
+    exec(&path, &format!("UPDATE manifests SET signed = replace(signed, '\"signer\":\"mallory\"', '\"signer\":\"bob\"') WHERE vault_id = x'{stale}'"));
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&stale));
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&stale.to_string())).collect();
+    assert!(
+        named.len() == 1 && named[0].starts_with("vault Stale wasn't updated") && named[0].contains(&format!("it counts against your storage (plaintext vault leave {stale} ")),
+        "{named:?}"
+    );
+    bob.leave_vault(&stale).unwrap();
+    assert_eq!(creator(&stale), None);
+
+    // Mallory makes bob's agent the owner of a vault and leaves: it counts against
+    // bob, his sync says so, and he takes the agent out, which deletes it.
+    bob.create_agent("bob-bot").unwrap();
+    let gift = mallory.create_vault("Gift").unwrap();
+    mallory.share_vault(&gift, "bob-bot", Role::Owner, None).unwrap();
+    mallory.leave_vault(&gift).unwrap();
+    assert_eq!(creator(&gift).as_deref(), Some("bob"));
+    let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&gift) && !acct.vaults.contains(&gift), "{acct:?}");
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {gift}"))), "{:?}", bob.problems);
+    bob.leave_vault(&gift).unwrap();
+    assert_eq!(creator(&gift), None);
+
+    // Bob is taken out of a vault he made while his agent stays in, with a change
+    // his device hadn't sent: it's named by its name, and leaving drops the change.
+    let kept = bob.create_vault("Kept").unwrap();
+    bob.share_vault(&kept, "mallory", Role::Owner, None).unwrap();
+    bob.share_vault(&kept, "bob-bot", Role::Writer, None).unwrap();
+    bob.vaults.get_mut(&kept).unwrap().put(plaintext_core::new_item_id(), item("Unsent", "u"));
+    mallory.sync().unwrap();
+    mallory.revoke(&kept, "bob").unwrap();
+    assert_eq!(creator(&kept).as_deref(), Some("bob"));
+    bob.sync().unwrap();
+    assert!(bob.unsendable.iter().any(|(v, _)| *v == kept));
+    assert!(bob.problems.iter().any(|p| p.starts_with("vault Kept counts against your storage")), "{:?}", bob.problems);
+    bob.leave_vault(&kept).unwrap();
+    assert!(bob.unsendable.is_empty() && !bob.hidden[&kept].has_changes());
+    // Its warning goes too, and the other warnings stay where `unsendable` says.
+    assert!(!bob.problems.iter().any(|p| p.contains("Kept isn't listed")), "{:?}", bob.problems);
+    bob.sync().unwrap();
+    assert!(!bob.problems.iter().any(|p| p.contains("Kept") || p.contains(&kept.to_string())), "{:?}", bob.problems);
+    let _ = std::fs::remove_file(&path);
+
+    // Without a quota, an openable vault someone handed you costs nothing and isn't
+    // named, but one only an agent of yours is in still is.
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (_, mut mallory) = join(Http::new(&url), "mallory", "mallory pw", None, "t");
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", None, "t");
+    bob.create_agent("bob-bot").unwrap();
+    let open = mallory.create_vault("Open").unwrap();
+    mallory.share_vault(&open, "bob", Role::Owner, None).unwrap();
+    mallory.leave_vault(&open).unwrap();
+    let gift = mallory.create_vault("Gift").unwrap();
+    mallory.share_vault(&gift, "bob-bot", Role::Owner, None).unwrap();
+    mallory.leave_vault(&gift).unwrap();
+    let acct: AccountResponse = bob.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&open) && acct.paid.contains(&gift), "{acct:?}");
+    bob.sync().unwrap();
+    assert!(bob.vaults.contains_key(&open));
+    assert!(!bob.problems.iter().any(|p| p.contains("vault Open") || p.contains(&open.to_string())), "{:?}", bob.problems);
+    let named: Vec<_> = bob.problems.iter().filter(|p| p.contains(&gift.to_string())).collect();
+    assert!(named.len() == 1 && named[0].contains(&format!("plaintext vault leave {gift}")), "{named:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
 // ---------- Attacks from the 2026-11 security audit, over real HTTP; each must stay fixed ----------
 
 use plaintext_core::api::{Kind, UserInfo, VaultPut};
@@ -1115,16 +1483,16 @@ fn server_hardening() {
     let url = server_at(&path, plaintext_server::Config { setup_code: Some("first-run-code".into()), quota: Some(512 << 10), ..Default::default() });
     let mut bob = login(&url, "bob pw", &bsk);
     let err = bob.send("alice", &Content::Request("A".repeat(1_000_000)), None).unwrap_err();
-    assert!(matches!(&err, Error::Server(413, m) if m.contains("out of storage")), "{err}");
+    assert!(matches!(&err, Error::Server(507, m) if m.contains("out of storage")), "{err}");
     let big = Item { notes: "n".repeat(900_000), ..item("Big", "b") };
-    assert_eq!(status(bob.create_link(LINK_PAGE, &url, &big, now() + 600, None)), 413);
+    assert_eq!(status(bob.create_link(LINK_PAGE, &url, &big, now() + 600, None)), 507);
     bob.send("alice", &Content::Request("small".into()), None).unwrap();
     // An agent's links count against its owner; a sender can take back an unread message.
     let msg = plaintext_core::send(&bob.me(), &bob.keyring, "alice", &Content::Request("A".repeat(250_000)), None).unwrap();
     bob.call::<()>("POST", "/v1/messages", Some(&msg)).unwrap();
     let ci = Session::login(Http::new(&url), &derive_agent(&bob_ci), "ci").unwrap();
     let mid = Item { notes: "n".repeat(200_000), ..item("Mid", "m") };
-    assert_eq!(status(ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None)), 413);
+    assert_eq!(status(ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None)), 507);
     bob.delete_message(&serde_json::from_slice::<Message>(&msg.body.0).unwrap().id).unwrap();
     ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -1499,7 +1867,7 @@ fn device_state_offline_and_import() {
     let mut alice = alice.unwrap();
     alice.sync().unwrap();
     let mine = alice.default_vault().unwrap();
-    assert_eq!(alice.import(import::onepux(&import::tests::onepux_fixture()).unwrap(), None).unwrap(), 8);
+    assert_eq!(alice.import(import::onepux(&import::tests::onepux_fixture()).unwrap(), None).unwrap().items, 8);
     let shared = alice.own_vault("Shared").expect("the 1PUX vault named Shared was made");
     let (vid, logo_id, logo) = alice.one("KeePassXC Logo", None).unwrap();
     assert_eq!(vid, mine);

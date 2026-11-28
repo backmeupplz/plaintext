@@ -566,6 +566,7 @@ impl Vault {
             manifest: self.seal_manifest(me, &vk, epoch, version, items),
             upserts,
             deletes: self.deleted.iter().copied().collect(),
+            staged: None,
         })
     }
 
@@ -649,7 +650,7 @@ impl Vault {
             items.insert(*id, h(&blob));
             upserts.push(ItemBlob { id: *id, blob: B64(blob) });
         }
-        let rotation = VaultPut { expected_counter: self.counter, manifest: self.seal_manifest(me, &vk, r.epoch, r.version, items), upserts, deletes: vec![] };
+        let rotation = VaultPut { expected_counter: self.counter, manifest: self.seal_manifest(me, &vk, r.epoch, r.version, items), upserts, deletes: vec![], staged: None };
         Ok(RosterUpdate { roster: me.sign_doc("roster", &r), keys, rotation: Some(rotation) })
     }
 

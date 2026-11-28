@@ -81,6 +81,7 @@ fn account_response(s: &Signup) -> AccountResponse {
         vaults: vec![],
         quota: None,
         usage: 0,
+        paid: vec![],
     }
 }
 

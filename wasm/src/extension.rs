@@ -237,7 +237,8 @@ pub async fn sync<T: AsyncTransport>(s: &mut Session<T>) -> Result<Vec<Value>, E
     let mut problems: Vec<Value> = s.problems.iter().enumerate().map(|(i, p)| json!({ "text": p, "unsent": unsent(i) })).collect();
     match r {
         Ok(()) => {}
-        Err(Error::Server(413, msg)) => problems.push(json!({ "text": format!("A change is kept on this device until there's room: {msg}") })),
+        Err(Error::Server(507, msg)) => problems.push(json!({ "text": format!("A change is kept on this device until there's room: {msg}") })),
+        Err(Error::Server(413, msg)) => problems.push(json!({ "text": format!("A change is kept on this device, but it's too big to send: {msg}") })),
         Err(Error::Server(409, msg)) => problems.push(json!({ "text": format!("A change is kept on this device and sent at the next sync: {msg}") })),
         Err(e) => return Err(e),
     }

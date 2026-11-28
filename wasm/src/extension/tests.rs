@@ -208,7 +208,7 @@ fn a_full_vault_is_a_warning_not_a_failed_sync() {
 
     // Too big for the quota: kept here, refused by the server.
     let big = Item { title: "Big".into(), notes: "x".repeat(200 << 10), ..Default::default() };
-    assert!(matches!(run(s.put_item_async(&vault, core::new_item_id(), big)), Err(Error::Server(413, _))));
+    assert!(matches!(run(s.put_item_async(&vault, core::new_item_id(), big)), Err(Error::Server(507, _))));
     cli.put_item(&vault, core::new_item_id(), Item { title: "From the CLI".into(), ..Default::default() }).unwrap();
 
     // The sync still counts: the other device's item arrives and the warning is a problem.
