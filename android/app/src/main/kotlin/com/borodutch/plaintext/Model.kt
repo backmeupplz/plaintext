@@ -123,6 +123,8 @@ class Model(val context: Context) {
     var toast by mutableStateOf<Toast?>(null)
     var banner by mutableStateOf<String?>(null)
     var bannerUnsent by mutableStateOf<Unsent?>(null)
+    /** The sync problem the banner showed last ([showProblems]). */
+    private var lastProblem: String? = null
     var reviewing by mutableStateOf<UnsentRequest?>(null)
     var syncing by mutableStateOf(false)
     /** Bumped on every reload, so screens reading Rust directly (item detail) re-read too. */
@@ -473,9 +475,11 @@ class Model(val context: Context) {
         // Sent after all (made a writer again) or dropped elsewhere: its banner goes.
         bannerUnsent?.let { u -> if (u.text == banner && accounts.none { it.id == u.account && u.vault in it.problemUnsent }) banner = null }
         val all = accounts.flatMap { a -> a.problems.zip(a.problemUnsent) { p, v -> Triple(a.id, p, v) } }
-        // The banner shows one at a time, in the client's order: one with an action
-        // mustn't hide a vault that didn't verify.
-        val (account, p, vault) = all.firstOrNull() ?: return
+        // The banner shows one at a time, each in turn: the same one every time would
+        // hide the rest (a vault that didn't verify, or another's Review).
+        if (all.isEmpty()) return
+        val (account, p, vault) = all[(all.indexOfFirst { it.second == lastProblem } + 1) % all.size]
+        lastProblem = p
         val text = p.substringBefore(" (plaintext ").replaceFirstChar { it.uppercase() }
         banner = text
         bannerUnsent = vault?.let { Unsent(text, account, it) }
