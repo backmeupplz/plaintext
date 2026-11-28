@@ -964,16 +964,17 @@ fn within_quota<T>(tx: &Transaction, cfg: &Config, account: Option<&str>, write:
 /// `within_quota` for a roster change into `vault` signed by `signer`, checked
 /// against whoever pays once it's stored: removing the creator moves the vault to
 /// the signer's account (its owner's, for an agent), which then mustn't end up over
-/// the quota with more than it had.
+/// the quota with more than it had. The signer's staged items for the vault don't
+/// count as room the change frees: a new key's re-seal (in `write`) uses them up.
 fn roster_within_quota<T>(tx: &Transaction, cfg: &Config, vault: &[u8], signer: &str, write: impl FnOnce() -> R<T>) -> R<T> {
     let Some(quota) = cfg.quota else { return write() };
+    let staged: u64 = tx
+        .query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", params![vault, signer], |r| r.get(0))
+        .map_err(db_err)?;
     let signer: Option<String> =
         tx.query_row("SELECT COALESCE(owner, username) FROM accounts WHERE username = ?", [signer], |r| r.get(0)).map_err(db_err)?;
-    let mut before = Vec::new();
-    for a in [creator(tx, vault)?, signer] {
-        let u = usage(tx, a.as_deref())?;
-        before.push((a, u));
-    }
+    let old = creator(tx, vault)?;
+    let before = [(old.clone(), usage(tx, old.as_deref())?.saturating_sub(staged)), (signer.clone(), usage(tx, signer.as_deref())?)];
     let out = write()?;
     let payer = creator(tx, vault)?;
     let after = usage(tx, payer.as_deref())?;
@@ -1675,6 +1676,32 @@ async fn delete_link(State(db): State<Db>, h: HeaderMap, Path(id): Path<String>)
 
 #[cfg(test)]
 mod tests {
+    /// Over the quota, adding someone with a new key whose items were staged first:
+    /// the staged copies the re-seal uses up aren't room the change frees.
+    #[test]
+    fn roster_room_leaves_out_the_signers_staged_items() {
+        let mut db = super::open_db(":memory:").unwrap();
+        db.execute_batch(
+            "INSERT INTO accounts(id, username, kind, identity, auth_key, account_key, keyring, created) VALUES (x'01', 'alice', 'human', '', x'', x'', x'', 0);
+             INSERT INTO vaults(id, counter, epoch, roster_version, creator) VALUES (x'01', 0, 0, 0, 'alice');
+             INSERT INTO items(vault_id, id, blob, counter) VALUES (x'01', x'01', zeroblob(1000), 0);
+             INSERT INTO staged(vault_id, username, stage, id, blob, created) VALUES (x'01', 'alice', x'01', x'01', zeroblob(1000), 0);",
+        )
+        .unwrap();
+        let cfg = super::Config { quota: Some(500), ..Default::default() };
+        // The re-seal, plus `extra` bytes for the longer roster.
+        let run = |db: &mut rusqlite::Connection, extra: usize| {
+            let tx = db.transaction().unwrap();
+            super::roster_within_quota(&tx, &cfg, &[1], "alice", || {
+                tx.execute_batch("DELETE FROM items; INSERT INTO items(vault_id, id, blob, counter) SELECT vault_id, id, blob, 1 FROM staged; DELETE FROM staged;")
+                    .map_err(super::db_err)?;
+                tx.execute("INSERT INTO items(vault_id, id, blob, counter) VALUES (x'01', x'02', zeroblob(?), 1)", [extra]).map_err(super::db_err)
+            })
+        };
+        assert_eq!(run(&mut db, 10).unwrap_err(), super::FULL);
+        assert!(run(&mut db, 0).is_ok(), "a re-seal that takes no more room");
+    }
+
     /// A vault's audit log keeps the newest 1000 rows, which is all owners see.
     #[test]
     fn audit_keeps_the_newest_1000() {
