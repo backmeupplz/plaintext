@@ -488,7 +488,7 @@ impl<T: AsyncTransport> Session<T> {
         // purpose would be named on every sync for nothing). One that failed is named above.
         for id in acct.paid.iter().filter(|id| !failed.contains(id)) {
             let text = match self.vaults.get(id).filter(|v| v.roster.is_some()) {
-                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() => continue,
+                Some(v) if v.creator == self.keyring.username || acct.quota.is_none() || self.is_own(id) => continue,
                 Some(v) => format!("vault {} counts against your storage, though {} created it (plaintext vault leave {id} to stop that)", v.meta.name, v.creator),
                 None if self.is_own(id) => {
                     // The full id too: `vault leave` can't find a vault it doesn't list by name.
@@ -533,15 +533,19 @@ impl<T: AsyncTransport> Session<T> {
     }
 
     /// Whether vault `id` is our own, as far as this device can tell: one we created
-    /// whose roster, as last verified here, lists us as an owner, or with no verified
-    /// roster, the one made at signup. Sync never suggests leaving (deleting) it.
+    /// whose roster, as last verified here, lists us as an owner, or the one made at
+    /// signup unless we created it and were demoted since (with another creator, or no
+    /// verified roster). Sync never suggests leaving (deleting) it.
     fn is_own(&self, id: &Hex) -> bool {
         let me = self.username();
+        let signup = self.keyring.default_vault == Some(*id);
         match self.vaults.get(id).or_else(|| self.hidden.get(id)) {
-            Some(v) if v.roster.is_some() => v.creator == me && v.role(me, now()) == Some(Role::Owner),
+            // We signed the signup vault's first roster, so a chain under its id that names
+            // another creator (served to a device without its checkpoint, #1001) is forged.
+            Some(v) if v.roster.is_some() => if v.creator == me { v.role(me, now()) == Some(Role::Owner) } else { signup },
             // A vault reset to its rollback guard (`discard_changes`) names a creator only if
             // it was ours; the signup vault counts only for a device that never had a copy.
-            v => v.filter(|v| v.counter > 0).map_or(self.keyring.default_vault == Some(*id), |v| v.creator == me),
+            v => v.filter(|v| v.counter > 0).map_or(signup, |v| v.creator == me),
         }
     }
 
