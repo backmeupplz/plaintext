@@ -18,7 +18,8 @@ idna = "1"
 # unicode-normalization crate we already ship. Turn down Renovate's PRs that bump it.
 idna_adapter = "=1.1.0"
 # ML-KEM-768, the post-quantum half of sealing to someone (crypto::seal_to).
-ml-kem = { version = "0.3.4", default-features = false, features = ["zeroize"] }
+# `hazmat` for encapsulate_deterministic, fed from getrandom like everything else here.
+ml-kem = { version = "0.3.4", default-features = false, features = ["hazmat", "zeroize"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 serde_json = "1"

@@ -345,6 +345,10 @@ impl Vault {
             for m in &r.members {
                 kr_changed |= keyring.pin(&m.username, &m.sign_pk, &m.enc_pk)?;
                 if let Some(k) = &m.kem {
+                    // Another user's key listed under this member would hide that their copy isn't post-quantum.
+                    if k.signer != m.username {
+                        return Err(Error::BadSignature);
+                    }
                     kr_changed |= keyring.pin_kem(k)?;
                 }
             }

@@ -278,6 +278,10 @@ pub struct Session<T: AsyncTransport> {
     /// read them now, or the server stopped listing them (`hidden`);
     /// `discard_changes` drops them.
     pub unsendable: Vec<Hex>,
+    /// The server lists our ML-KEM key, so it knows post-quantum sealing (an older
+    /// server refuses the larger wrapped keys): only then does sync replace vault
+    /// keys to make them post-quantum (`remove_members_async`).
+    pq_server: bool,
 }
 
 /// Something the last sync couldn't do, in words (which may end with a CLI hint).
@@ -338,6 +342,7 @@ impl<T: AsyncTransport> Session<T> {
             gone: BTreeMap::new(),
             problems: Vec::new(),
             unsendable: Vec::new(),
+            pq_server: false,
         })
     }
 
@@ -346,7 +351,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false })
     }
 
     /// Pick up a stored session with no network: the token and Account Key plus
@@ -355,7 +360,7 @@ impl<T: AsyncTransport> Session<T> {
     pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
         let keyring = Keyring::open(&account, keyring_blob)?;
         // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
-        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false })
     }
 
     pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -377,9 +382,7 @@ impl<T: AsyncTransport> Session<T> {
         // Accounts made before post-quantum sealing publish their ML-KEM key, so
         // others seal to it. Best effort: an older server just doesn't have it yet.
         let kem = self.me().kem_doc();
-        if acct.kem.as_ref() != Some(&kem) {
-            drop(self.call_async::<()>("PUT", "/v1/account/kem", Some(&kem)).await);
-        }
+        self.pq_server = acct.kem.as_ref() == Some(&kem) || self.call_async::<()>("PUT", "/v1/account/kem", Some(&kem)).await.is_ok();
         // Another device (or this one, restored offline) changed the keyring: fold it in.
         if Some(acct.keyring_counter) != self.keyring_counter {
             self.merge_server_keyring(&acct)?;
@@ -747,7 +750,7 @@ impl<T: AsyncTransport> Session<T> {
         out.extend(who.filter(|w| !out.contains(w)));
         // Nobody to remove, but the current key was sealed to someone with X25519
         // alone and we now have their ML-KEM key: a new key, post-quantum for all.
-        if out.is_empty() && !v.needs_pq(&self.keyring, now()) {
+        if out.is_empty() && !(self.pq_server && v.needs_pq(&self.keyring, now())) {
             return Ok(());
         }
         let update = v.revoke(&self.me(), &self.keyring, &out, now())?;
@@ -1023,7 +1026,7 @@ impl<T: Transport> Session<T> {
     pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
         let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
         let keyring = Keyring::open(&account, &blob)?;
-        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() };
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), pq_server: false };
         s.load_vaults(dir);
         Ok(s)
     }
