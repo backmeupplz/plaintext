@@ -517,7 +517,11 @@ impl Vault {
                     _ => true,
                 };
             if self.dirty.contains(id) {
-                if changed_remotely && let Some(e) = received.remove(id) {
+                // The same content as here: our own push, whose answer was lost.
+                if changed_remotely
+                    && let Some(e) = received.remove(id)
+                    && self.entries.get(id).is_none_or(|l| content_hash(&l.item) != content_hash(&e.item))
+                {
                     conflicts.push((*id, e.item));
                 }
                 continue;
@@ -670,6 +674,18 @@ impl Vault {
                 self.base.remove(&u.id);
                 self.base_content.remove(&u.id);
                 self.base_files.remove(&u.id);
+            } else if self.dirty.contains(&u.id) || self.deleted.contains(&u.id) {
+                // Changed again while this push was in flight: that change now
+                // starts from the copy this push left on the server.
+                match self.key().and_then(|k| open_json::<Item>(&k, &self.item_ad(&u.id), &u.blob.0)) {
+                    Ok(item) => {
+                        self.base.insert(u.id, h(&u.blob.0));
+                        self.base_content.insert(u.id, content_hash(&item));
+                        self.base_files.entry(u.id).or_default().extend(item.file_ids());
+                    }
+                    // Not under this vault's key: not a push of ours to begin with.
+                    Err(_) => self.exact_base = false,
+                }
             }
         }
         for d in &put.deletes {

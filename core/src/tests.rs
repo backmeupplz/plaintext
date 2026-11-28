@@ -1094,3 +1094,101 @@ fn pushes_in_parts() {
     assert_eq!(titles(&v2), titles(&v1));
     assert_eq!(titles(&v2), ["edit=new", "new0=n", "new1=n", "new2=n", "other=o"]);
 }
+
+/// An item changed again while its push was in flight: the next push (whole or
+/// in part) and the next pull start from what that push left on the server.
+#[test]
+fn a_change_during_a_push_starts_from_what_it_sent() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let (x, y) = (new_item_id(), new_item_id());
+    v1.put(x, login("x", "1"));
+    v1.put(y, login("y", "y"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    let mut v2 = Vault::new(v1.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v1.put(x, login("x", "2"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.put(x, login("x", "3"));
+    v1.pushed(&p);
+    log.put(&p);
+    v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    // Another device pushes; this one pulls that, then sends its delete alone.
+    v2.put(new_item_id(), login("z", "z"));
+    let p = v2.push(&me, 0).unwrap();
+    v2.pushed(&p);
+    log.put(&p);
+    v1.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    v1.delete(y);
+    let p = v1.push_part(&me, 0, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    let mut fresh = Vault::new(v1.id);
+    fresh.apply(&log.full("alice"), &mut a, 0).unwrap();
+    assert_eq!(titles(&v2), ["x=3", "z=z"]);
+    assert_eq!(titles(&fresh), titles(&v2));
+    assert_eq!(titles(&v1), titles(&v2));
+}
+
+/// A push whose answer was lost comes back with the next pull: that's no conflict.
+#[test]
+fn a_lost_answer_makes_no_conflict_copy() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let x = new_item_id();
+    v.put(x, login("x", "1"));
+    let p = v.push(&me, 0).unwrap();
+    v.pushed(&p);
+    log.put(&p);
+    v.put(x, login("x", "2"));
+    let p = v.push(&me, 0).unwrap();
+    log.put(&p);
+    v.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    assert_eq!(titles(&v), ["x=2"]);
+}
+
+/// A vault saved by an older app sends its changes whole until a pull brings a
+/// manifest, and in parts after that.
+#[test]
+fn older_snapshots_split_after_a_pull_with_a_manifest() {
+    let (mut a, _) = pair();
+    let me = a.me();
+    let (mut v1, nv) = Vault::create(&me, "x").unwrap();
+    let mut log = Log::new(&nv);
+    let (x, y) = (new_item_id(), new_item_id());
+    v1.put(x, login("x", "x"));
+    v1.put(y, login("y", "y"));
+    let p = v1.push(&me, 0).unwrap();
+    v1.pushed(&p);
+    log.put(&p);
+    let mut v2 = Vault::new(v1.id);
+    v2.apply(&log.full("alice"), &mut a, 0).unwrap();
+    v1.put(x, login("x", "edited"));
+    v1.delete(y);
+    let mut json = serde_json::to_value(&v1).unwrap();
+    json.as_object_mut().unwrap().remove("exact_base");
+    let mut old: Vault = serde_json::from_value(json).unwrap();
+    assert_eq!(old.push_part(&me, 0, 0).unwrap().upserts.len(), 1);
+    v2.put(new_item_id(), login("z", "z"));
+    let p = v2.push(&me, 0).unwrap();
+    v2.pushed(&p);
+    log.put(&p);
+    old.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    let p = old.push_part(&me, 0, 0).unwrap();
+    assert_eq!((p.upserts.len(), p.deletes.len()), (0, 1));
+    old.pushed(&p);
+    log.put(&p);
+    v2.apply(&delta(&log, &p), &mut a, 0).unwrap();
+    assert_eq!(titles(&v2), ["x=x", "z=z"]);
+}

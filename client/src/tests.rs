@@ -2232,3 +2232,30 @@ fn big_imports_go_out_in_several_pushes() {
     assert_eq!(alice2.vaults[&v].items().count(), 12);
     let _ = std::fs::remove_file(&path);
 }
+
+/// With a quota, a push isn't split: over it every push must remove items, and
+/// only the first part would carry the deletes.
+#[test]
+fn over_the_quota_a_big_push_goes_whole() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    roomy.sync().unwrap();
+    let v = roomy.default_vault().unwrap();
+    let ids: Vec<Hex> = (0..8).map(|_| plaintext_core::new_item_id()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        roomy.vaults.get_mut(&v).unwrap().put(*id, Item { notes: "n".repeat(600), ..item(&format!("Item {i}"), "x") });
+    }
+    roomy.sync().unwrap();
+    let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut alice = login(&full, "alice pw", &ask);
+    alice.sync().unwrap();
+    alice.stage_past = 1000;
+    let pending = alice.vaults.get_mut(&v).unwrap();
+    pending.delete(ids[0]);
+    for (i, id) in ids[1..].iter().enumerate() {
+        pending.put(*id, Item { notes: "e".repeat(600), ..item(&format!("Item {}", i + 1), "x") });
+    }
+    alice.sync().unwrap();
+    assert!(!alice.vaults[&v].has_changes());
+    let _ = std::fs::remove_file(&path);
+}

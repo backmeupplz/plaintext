@@ -73,9 +73,9 @@ pub struct ImportReport {
 
 /// Past this many bytes of items (and manifest), a push or key rotation stages its
 /// items in parts of about this size, well under the server's 32 MiB request limit.
-/// A push carries at most four such parts of added and edited items (64 MiB, what
-/// a server without a quota lets a member stage beyond the vault's items); more
-/// go in further pushes.
+/// Without a quota, a push carries at most four such parts of added and edited
+/// items (64 MiB, what such a server lets a member stage beyond the vault's
+/// items); more go in further pushes.
 const STAGE_PAST: usize = 16 << 20;
 
 /// Why a pull gave up: the vault kept changing between its pages (`pull_pages_async`).
@@ -285,6 +285,10 @@ pub struct Session<T: AsyncTransport> {
     pub unsendable: Vec<Hex>,
     /// `STAGE_PAST`; tests use less.
     stage_past: usize,
+    /// The server has a storage quota (as of the last account fetch). Then a push
+    /// isn't split (`push_async`): over the quota every push must remove items,
+    /// and only the first part would carry the deletes.
+    quota: bool,
 }
 
 /// The logic, written once. Browsers call these through an `AsyncTransport`;
@@ -310,6 +314,7 @@ impl<T: AsyncTransport> Session<T> {
             problems: Vec::new(),
             unsendable: Vec::new(),
             stage_past: STAGE_PAST,
+            quota: acct.quota.is_some(),
         })
     }
 
@@ -318,7 +323,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST })
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST, quota: acct.quota.is_some() })
     }
 
     /// Pick up a stored session with no network: the token and Account Key plus
@@ -327,7 +332,7 @@ impl<T: AsyncTransport> Session<T> {
     pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
         let keyring = Keyring::open(&account, keyring_blob)?;
         // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
-        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST })
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST, quota: false })
     }
 
     pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -346,6 +351,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn sync_async(&mut self) -> Result<()> {
         let acct: AccountResponse = self.call_async("GET", "/v1/account", NONE).await?;
         self.admin = acct.admin;
+        self.quota = acct.quota.is_some();
         // Another device (or this one, restored offline) changed the keyring: fold it in.
         if Some(acct.keyring_counter) != self.keyring_counter {
             self.merge_server_keyring(&acct)?;
@@ -625,7 +631,7 @@ impl<T: AsyncTransport> Session<T> {
             if !v.has_changes() {
                 return Ok(());
             }
-            let put = v.push_part(&me, now(), 4 * self.stage_past)?;
+            let put = v.push_part(&me, now(), if self.quota { usize::MAX } else { 4 * self.stage_past })?;
             match self.send_put_async(id, &put).await {
                 // Every push carries a change, so this ends.
                 Ok(()) => self.vaults.get_mut(id).expect("exists").pushed(&put),
@@ -950,7 +956,7 @@ impl<T: Transport> Session<T> {
     pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
         let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
         let keyring = Keyring::open(&account, &blob)?;
-        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST };
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new(), stage_past: STAGE_PAST, quota: false };
         s.load_vaults(dir);
         Ok(s)
     }
