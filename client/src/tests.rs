@@ -1032,7 +1032,7 @@ fn nobody_is_stuck_paying_for_a_vault() {
     // Bob's sync names the vault by id and how to leave it, and he can, as its only owner.
     bob.sync().unwrap();
     assert!(!bob.vaults.contains_key(&trap));
-    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {trap}"))), "{:?}", bob.problems);
+    assert!(bob.problems.iter().any(|p| p.contains(&format!("plaintext vault leave {trap}; it counts against your storage"))), "{:?}", bob.problems);
     bob.leave_vault(&trap).unwrap();
     assert_eq!(creator(&trap).as_deref(), Some("mallory2"));
     // The last one out deletes it.

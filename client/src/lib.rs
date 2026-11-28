@@ -324,7 +324,10 @@ impl<T: Transport> Session<T> {
                     }
                     match known {
                         Some(name) => self.problems.push(format!("vault {name} wasn't updated: {e}")),
-                        None => self.problems.push(format!("vault {id} wasn't updated: {e} (if you don't want it: plaintext vault leave {id})")),
+                        None => {
+                            let paid = if acct.paid.contains(id) { "; it counts against your storage" } else { "" };
+                            self.problems.push(format!("vault {id} wasn't updated: {e} (if you don't want it: plaintext vault leave {id}{paid})"))
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -339,7 +342,7 @@ impl<T: Transport> Session<T> {
                     "vault {} counts against your storage, though {} created it (to stop that: plaintext vault leave {id})",
                     v.meta.name, v.creator
                 )),
-                // Named above, with the error that kept it from opening.
+                // Named above, with the error that kept it from opening and that it counts against you.
                 None if acct.vaults.contains(id) => {}
                 None => self.problems.push(format!(
                     "vault {id} counts against your storage, but only an agent of yours is in it, or your access expired (to stop that: plaintext vault leave {id})"

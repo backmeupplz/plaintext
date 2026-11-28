@@ -284,8 +284,9 @@ pub struct AccountResponse {
     #[serde(default)]
     pub usage: u64,
     /// Every vault that counts against this account (`usage`): the ones it created,
-    /// and ones handed to it when their creator left, including ones it isn't a
-    /// current member of (only an agent of its is, or its membership expired).
+    /// and ones that moved to it from someone else (DESIGN "Servers and accounts"),
+    /// including ones it isn't a current member of (only an agent of its is, or its
+    /// membership expired).
     /// `POST /v1/vaults/{id}/leave` takes it and its agents out of any of them.
     #[serde(default)]
     pub paid: Vec<Hex>,
