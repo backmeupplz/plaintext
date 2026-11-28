@@ -65,7 +65,7 @@ const BAD: StatusCode = StatusCode::BAD_REQUEST;
 const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
 /// 507, not 413: clients tell a full account from a request that's too big.
 const FULL: (StatusCode, &str) =
-    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items, share links or sent messages, or leave a vault someone handed you, to make room (attachments are freed about a week later, by a device that syncs the vault)");
+    (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items (several in one sync, since each sync that sends changes stores a little), share links or sent messages, or leave a vault someone handed you, to make room (attachments are freed about a week later, by a device that syncs the vault)");
 
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
@@ -1279,6 +1279,10 @@ async fn get_vault(
 ) -> R<Json<VaultResponse>> {
     let vault = hex_id(&id)?;
     let after = q.after.as_deref().map(hex_id).transpose()?;
+    // SQLite stores i64: a larger cursor would wrap (and return everything) or fail.
+    if [Some(q.since), q.roster, q.from, q.at].into_iter().flatten().any(|n| i64::try_from(n).is_err()) {
+        return Err((StatusCode::BAD_REQUEST, "bad cursor"));
+    }
     let db = lock(&db);
     let c = caller(&db, &h)?;
     need_role(&db, &vault, &c.username, Role::Reader)?;

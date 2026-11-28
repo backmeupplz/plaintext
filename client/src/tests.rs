@@ -543,7 +543,7 @@ fn storage_quota() {
     assert_eq!(count(&path, "SELECT COUNT(*) FROM staged WHERE username IN ('alice', 'bob')"), 0);
     // Removing the creator and adding someone in one roster change: the signer
     // pays from then on, so the signer needs the room.
-    let _ = join(Http::new(&url), "carol", "carol pw", None, "t");
+    let (_, mut cs) = join(Http::new(&url), "carol", "carol pw", None, "t");
     bob.share_vault(&mine, "alice", Role::Owner, None).unwrap();
     alice.sync().unwrap();
     let carol = alice.pin_user("carol").unwrap();
@@ -593,6 +593,17 @@ fn storage_quota() {
     assert_eq!(padded(&mut alice, Role::Reader, 10_000), 200);
     bob.sync().unwrap();
     assert_eq!(stage(&bob, &personal, st, 100), 403, "readers can't stage");
+    // Over the quota, an owner can still remove a vault's creator (adding nobody):
+    // the vault moves onto that owner's account, though it takes them further over.
+    cs.sync().unwrap();
+    let theirs = cs.default_vault().unwrap();
+    cs.share_vault(&theirs, "alice", Role::Owner, None).unwrap();
+    let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut alice = login(&url, "alice pw", &ask);
+    alice.sync().unwrap();
+    alice.revoke(&theirs, "carol").unwrap();
+    let acct: AccountResponse = alice.call("GET", "/v1/account", NONE).unwrap();
+    assert!(acct.paid.contains(&theirs) && acct.usage > 1, "{acct:?}");
     // Being out of storage doesn't stop anyone deleting their account.
     bob.delete_account(&derive("bob pw", &bsk)).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -1967,6 +1978,20 @@ fn paged_pulls() {
     stuck.sync().unwrap();
     assert!(!stuck.vaults.contains_key(&personal) && !stuck.problems.is_empty(), "{:?}", stuck.problems);
     assert!(stuck.t.later.get() <= 2);
+    // A vault reset while unlisted (`discard_changes`) and listed again is pulled
+    // afresh in pages; a push midway makes it start over, and the guard still holds.
+    let mut v = behind.vaults.remove(&personal).unwrap();
+    let guard = v.counter;
+    v.forget();
+    behind.hidden.insert(personal, v);
+    behind.t.hooks.borrow_mut().push(push("After reset"));
+    let later = behind.t.later.get();
+    behind.sync().unwrap();
+    assert!(behind.problems.is_empty(), "{:?}", behind.problems);
+    assert!(behind.t.hooks.borrow().is_empty() && behind.t.later.get() >= later + 2, "bob pushed midway, then it started over");
+    let v = &behind.vaults[&personal];
+    assert!(v.counter > guard && v.items().any(|(_, i)| i.title == "After reset"));
+    assert_eq!(v.items().count(), 47);
     // An agent's read is audited once per pull, whichever page the server is asked for.
     let key = alice.create_agent("bot").unwrap();
     alice.share_vault(&personal, "bot", Role::Reader, None).unwrap();
@@ -1981,6 +2006,10 @@ fn paged_pulls() {
     // The 409 is a later page's only: a first page always answers.
     let q = format!("/v1/vaults/{personal}?since=0&latest=true&at=1");
     assert_eq!(status(alice.call::<VaultResponse>("GET", &q, NONE)), 409);
+    // Cursors past what SQLite stores are refused rather than wrapped (`from=-1` would be everything).
+    for q in ["since=0&from=18446744073709551615", "since=9223372036854775808", "roster=18446744073709551615"] {
+        assert_eq!(status(alice.call::<VaultResponse>("GET", &format!("/v1/vaults/{personal}?{q}"), NONE)), 400, "{q}");
+    }
     let _ = std::fs::remove_file(&path);
 }
 
@@ -2061,7 +2090,8 @@ fn manifests_from_older_apps() {
 
     // Restarted with a quota alice is over: a new device starts from that manifest,
     // and a delete still goes through on top of it, though an addition doesn't.
-    let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    // Pages of one entry each, so that manifest comes in a page of its own.
+    let url = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), pull_page: Some(1), ..Default::default() });
     let mut fresh = login(&url, "alice pw", &ask);
     fresh.sync().unwrap();
     assert!(fresh.problems.is_empty(), "{:?}", fresh.problems);
