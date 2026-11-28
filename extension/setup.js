@@ -1,5 +1,5 @@
 // Settings: add and remove accounts, auto-lock, the fill shortcut.
-import { ask, el, explain, problemText } from './lib/ui.js'
+import { ask, el, explain, keyStep, problemText } from './lib/ui.js'
 
 const $ = (id) => document.getElementById(id)
 const FIREFOX = chrome.runtime.getURL('').startsWith('moz-extension:')
@@ -44,8 +44,13 @@ $('add').addEventListener('submit', (e) => {
   msg.className = 'muted'
   msg.textContent = 'Signing in… this takes a few seconds.'
   ask('add', { server: url.href, secretKey: $('sk').value, password: $('pw').value })
-    .then((r) => {
+    .then(function signedIn(r) {
       msg.className = ''
+      // The account needs its security key: approve in a new tab, then continue here.
+      if (r.error === 'key_needed') {
+        msg.textContent = ''
+        return $('key-step').replaceChildren(keyStep(r, (done) => ($('key-step').replaceChildren(), signedIn(done))))
+      }
       msg.textContent = `Signed in as ${r.username}.${r.problems.length ? ` ${r.problems.map((p) => problemText(p.text)).join(' ')}` : ''}`
       $('add').reset()
       refresh()

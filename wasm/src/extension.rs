@@ -16,7 +16,7 @@ use plaintext_client::plaintext_core::api::{Hex, Role};
 use plaintext_client::plaintext_core::crypto::{self, SecretKey};
 use plaintext_client::plaintext_core::item::Item;
 use plaintext_client::plaintext_core::{self as core, Account as Keys, Vault, site};
-use plaintext_client::{AsyncTransport, Error, Problem, Session, now, now_ms};
+use plaintext_client::{AsyncTransport, Error, Pending, Problem, Session, SignIn, now, now_ms};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -24,18 +24,20 @@ use zeroize::Zeroizing;
 // ---------- Plain functions (tested natively) ----------
 
 /// Sign in with the password and Secret Key, giving the Secret Key sealed under
-/// the password, which is all the extension keeps between unlocks.
-pub async fn add<T: AsyncTransport>(t: T, password: &str, secret_key: &str, device: &str) -> Result<(Session<T>, Vec<u8>), Error> {
+/// the password, which is all the extension keeps between unlocks. An account
+/// that needs a security key comes back `Pending` (DESIGN "Signing in with a
+/// security key"), unless `trust` (this browser's token) spares it.
+pub async fn add<T: AsyncTransport>(t: T, password: &str, secret_key: &str, device: &str, trust: Option<&str>) -> Result<(SignIn<T>, Vec<u8>), Error> {
     let sk = SecretKey::parse(secret_key)?;
-    let s = Session::login_async(t, &crypto::derive(password, &sk), device).await?;
+    let s = Session::sign_in_async(t, &crypto::derive(password, &sk), device, trust).await?;
     Ok((s, crypto::seal_secret_key(password, &sk)))
 }
 
 /// Unlock with just the password. `Tampered` means it didn't match; a 401
 /// means it opened the Secret Key but was changed on another device since.
-pub async fn unlock<T: AsyncTransport>(t: T, password: &str, sealed_secret_key: &[u8], device: &str) -> Result<Session<T>, Error> {
+pub async fn unlock<T: AsyncTransport>(t: T, password: &str, sealed_secret_key: &[u8], device: &str, trust: Option<&str>) -> Result<SignIn<T>, Error> {
     let sk = crypto::open_secret_key(password, sealed_secret_key)?;
-    Session::login_async(t, &crypto::derive(password, &sk), device).await
+    Session::sign_in_async(t, &crypto::derive(password, &sk), device, trust).await
 }
 
 /// What `storage.session` holds while unlocked, so the background can pick the
@@ -342,14 +344,14 @@ fn parse(json: &str) -> Result<Value, JsValue> {
 impl Account {
     /// Sign in for the first time on this browser. Resolves to the account;
     /// `sealedSecretKey()` then gives what to keep in `storage.local`.
-    pub async fn add(fetch: js_sys::Function, server: String, password: String, secret_key: String, device: String) -> Result<AddResult, JsValue> {
-        let (s, sealed) = add(transport(&server, fetch), &password, &secret_key, &device).await.map_err(js_err)?;
-        Ok(AddResult { account: Some(Account(Rc::new(RefCell::new(Some(s))))), sealed: STANDARD.encode(sealed) })
+    pub async fn add(fetch: js_sys::Function, server: String, password: String, secret_key: String, device: String, trust: Option<String>) -> Result<SignInResult, JsValue> {
+        let (s, sealed) = add(transport(&server, fetch), &password, &secret_key, &device, trust.as_deref()).await.map_err(js_err)?;
+        Ok(SignInResult::new(s, &server, STANDARD.encode(sealed)))
     }
 
-    pub async fn unlock(fetch: js_sys::Function, server: String, password: String, sealed_secret_key: String, device: String) -> Result<Account, JsValue> {
-        let sealed = STANDARD.decode(sealed_secret_key).map_err(|_| js_err(core::Error::Tampered.into()))?;
-        let s = unlock(transport(&server, fetch), &password, &sealed, &device).await.map_err(|e| match e {
+    pub async fn unlock(fetch: js_sys::Function, server: String, password: String, sealed_secret_key: String, device: String, trust: Option<String>) -> Result<SignInResult, JsValue> {
+        let sealed = STANDARD.decode(&sealed_secret_key).map_err(|_| js_err(core::Error::Tampered.into()))?;
+        let s = unlock(transport(&server, fetch), &password, &sealed, &device, trust.as_deref()).await.map_err(|e| match e {
             // The password opened the Secret Key, so it's the one this browser
             // knew, but the server refused it: most likely changed on another
             // device (a clock that's off or a disabled account look the same).
@@ -360,7 +362,7 @@ impl Account {
             }
             e => js_err(e),
         })?;
-        Ok(Account(Rc::new(RefCell::new(Some(s)))))
+        Ok(SignInResult::new(s, &server, sealed_secret_key))
     }
 
     pub async fn resume(fetch: js_sys::Function, server: String, session_state: String) -> Result<Account, JsValue> {
@@ -473,20 +475,95 @@ impl Account {
 }
 
 #[wasm_bindgen]
-pub struct AddResult {
+pub struct SignInResult {
     account: Option<Account>,
+    pending: Option<PendingSignIn>,
     sealed: String,
 }
 
+impl SignInResult {
+    fn new(s: SignIn<Fetch>, server: &str, sealed: String) -> Self {
+        match s {
+            SignIn::Done(s) => SignInResult { account: Some(Account(Rc::new(RefCell::new(Some(s))))), pending: None, sealed },
+            SignIn::Key(p) => SignInResult { account: None, pending: Some(PendingSignIn::new(p, server)), sealed },
+        }
+    }
+}
+
 #[wasm_bindgen]
-impl AddResult {
-    /// The account; can be taken once.
+impl SignInResult {
+    /// The account, unless it needs a security key; can be taken once.
     pub fn account(&mut self) -> Option<Account> {
         self.account.take()
+    }
+    /// The sign-in waiting for a security key, if the account needs one; can be taken once.
+    pub fn pending(&mut self) -> Option<PendingSignIn> {
+        self.pending.take()
     }
     #[wasm_bindgen(js_name = sealedSecretKey)]
     pub fn sealed_secret_key(&self) -> String {
         self.sealed.clone()
+    }
+}
+
+/// A sign-in waiting for the account's security key (DESIGN "Signing in with a
+/// security key"): the approval page (`page`) takes the key's answer, then
+/// `finish` signs in; or `finish` with a recovery code.
+#[wasm_bindgen]
+pub struct PendingSignIn {
+    p: Rc<RefCell<Option<Pending<Fetch>>>>,
+    base: String,
+    trust: RefCell<String>,
+}
+
+impl PendingSignIn {
+    fn new(p: Pending<Fetch>, server: &str) -> Self {
+        PendingSignIn { p: Rc::new(RefCell::new(Some(p))), base: server.trim().trim_end_matches('/').into(), trust: RefCell::default() }
+    }
+}
+
+#[wasm_bindgen]
+impl PendingSignIn {
+    /// What to keep in `storage.session` (memory only: it holds the Account Unlock
+    /// Key) so the background can finish after the browser stopped it.
+    pub fn state(&self) -> Result<String, JsValue> {
+        Ok(self.p.borrow().as_ref().ok_or_else(busy)?.state().to_string())
+    }
+
+    pub fn restore(fetch: js_sys::Function, server: String, state: String) -> Result<PendingSignIn, JsValue> {
+        let p = Pending::restore(transport(&server, fetch), &parse(&state)?).map_err(js_err)?;
+        Ok(PendingSignIn::new(p, &server))
+    }
+
+    /// The approval page's address.
+    pub fn page(&self) -> Result<String, JsValue> {
+        Ok(format!("{}{}", self.base, self.p.borrow().as_ref().ok_or_else(busy)?.page()))
+    }
+
+    /// Sign in once the approval page has the key's answer (until then this
+    /// fails with `not_approved`), or with a recovery code.
+    pub async fn finish(&self, recovery: Option<String>) -> Result<Account, JsValue> {
+        let mut p = self.p.borrow_mut().take().ok_or_else(busy)?;
+        let r = p.finish_async(None, recovery.as_deref().filter(|c| !c.trim().is_empty())).await;
+        *self.p.borrow_mut() = Some(p);
+        let (s, trust) = r.map_err(|e| {
+            let (name, text) = match &e {
+                Error::Server(409, _) => ("not_approved", "Your security key hasn't approved this sign-in yet. Open the approval page, touch your key there, then continue.".into()),
+                Error::Server(401, m) if m.contains("recovery code") => ("bad_code", "That recovery code is wrong or already used.".into()),
+                Error::Server(401, m) if m.contains("too long") => ("expired", "This sign-in took too long. Unlock again to start over.".into()),
+                _ => (code(&e), e.to_string()),
+            };
+            let err = js_sys::Error::new(&text);
+            err.set_name(name);
+            JsValue::from(err)
+        })?;
+        *self.trust.borrow_mut() = trust;
+        Ok(Account(Rc::new(RefCell::new(Some(s)))))
+    }
+
+    /// After `finish`: the token that spares this browser the key next time.
+    pub fn trust(&self) -> String {
+        self.trust.borrow().clone()
     }
 }
 

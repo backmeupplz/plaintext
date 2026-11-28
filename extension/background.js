@@ -3,12 +3,14 @@
 // things by message; it checks who is asking before answering.
 //
 // Storage:
-//   local    accounts [{key, server, username, sealed}]  (Secret Key sealed under the password)
+//   local    accounts [{key, server, username, sealed, trust}]  (Secret Key sealed under the password;
+//            trust: the token that spares this browser the account's security key, if it needs one)
 //            local:<key>  this device's vault and keyring copies, sealed with the Account Key
 //            settings {lockMinutes}
 //   session  session:<key>  token + Account Key while unlocked (memory only, gone when the browser closes)
 //            lockAt, lastSync, pending:<tabId> (a submitted login waiting for the user to save it)
-import init, { Account, generate, insecureUrl, strength, totp } from './pkg/plaintext_wasm.js'
+//            signin:<key> a sign-in waiting for the account's security key (holds the Account Unlock Key)
+import init, { Account, PendingSignIn, generate, insecureUrl, strength, totp } from './pkg/plaintext_wasm.js'
 import { send } from './lib/net.js'
 
 const ready = init({ module_or_path: chrome.runtime.getURL('pkg/plaintext_wasm_bg.wasm') })
@@ -16,6 +18,8 @@ const FIREFOX = chrome.runtime.getURL('').startsWith('moz-extension:')
 const DEVICE = `${FIREFOX ? 'Firefox' : 'Chrome'} extension`
 const CLEAR_AFTER_S = 90
 const PENDING_FOR_MS = 3 * 60_000
+/** The server forgets a sign-in waiting for its security key after 5 minutes. */
+const SIGNIN_FOR_MS = 5 * 60_000
 
 chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' })
 
@@ -297,6 +301,10 @@ async function fromPage(msg) {
       return add(msg)
     case 'unlock':
       return unlock(msg.password, msg.key)
+    case 'awaitingKey':
+      return awaitingKey()
+    case 'finishKey':
+      return finishKey(msg)
     case 'lock':
       return lock()
     case 'remove': {
@@ -427,21 +435,85 @@ async function add({ server, secretKey, password }) {
   }
   let added
   try {
-    added = await Account.add(send, base, password, secretKey, DEVICE)
+    // Adding an account this browser had before keeps its security-key trust.
+    const trust = (await accounts()).find((x) => x.server === base && x.trust)?.trust
+    added = await Account.add(send, base, password, secretKey, DEVICE, trust)
   } catch (e) {
     // The account is found by the Secret Key alone, so a wrong password comes back as a 401.
     if (e.name === 'tampered' || e.name === 'signed_out') throw fail('tampered', "That password and Secret Key don't match an account on this server. Check both, then try again.")
     throw e
   }
-  const acct = added.account()
+  const pending = added.pending()
+  if (pending) return awaitKey(`new@${hostOf(base)}`, base, pending, { add: { sealed: added.sealedSecretKey() } })
+  return addAccount(added.account(), base, added.sealedSecretKey())
+}
+
+async function addAccount(acct, base, sealed, trust) {
   const username = acct.username()
-  const a = { key: `${username}@${hostOf(base)}`, server: base, username, sealed: added.sealedSecretKey() }
+  const a = { key: `${username}@${hostOf(base)}`, server: base, username, sealed, ...(trust && { trust }) }
   const rest = (await accounts()).filter((x) => x.key !== a.key)
   await chrome.storage.local.set({ accounts: [...rest, a] })
   await signOut(a)
   const problems = await settle(a, acct)
   await touch()
   return { username, problems }
+}
+
+// ---------- Signing in with a security key (DESIGN "Signing in with a security key") ----------
+
+/** Keep a sign-in waiting for the account's security key in memory-only storage
+ *  (the browser may stop this background while the approval page is open), and
+ *  tell the page to open the approval page. */
+async function awaitKey(key, server, pending, extra = {}) {
+  const page = pending.page()
+  await chrome.storage.session.set({ [`signin:${key}`]: { server, state: pending.state(), page, at: Date.now(), ...extra } })
+  pending.free()
+  return { key, server, ok: false, error: 'key_needed', page, message: 'This account needs your security key to sign in on this browser.' }
+}
+
+/** Sign-ins still waiting for a security key: [{key, page}]. */
+async function awaitingKey() {
+  const all = await chrome.storage.session.get(null)
+  const out = []
+  for (const [k, v] of Object.entries(all)) {
+    if (!k.startsWith('signin:')) continue
+    if (Date.now() - v.at > SIGNIN_FOR_MS) await chrome.storage.session.remove(k)
+    else out.push({ key: k.slice(7), page: v.page, server: v.server })
+  }
+  return out
+}
+
+/** Finish once the approval page has the key's answer, or with a recovery code. */
+async function finishKey({ key, recovery }) {
+  await ready
+  const k = `signin:${key}`
+  const p = (await chrome.storage.session.get(k))[k]
+  if (!p || Date.now() - p.at > SIGNIN_FOR_MS) {
+    await chrome.storage.session.remove(k)
+    throw fail('expired', 'This sign-in took too long. Unlock again to start over.')
+  }
+  const pending = PendingSignIn.restore(send, p.server, p.state)
+  let acct, trust
+  try {
+    acct = await pending.finish(recovery || undefined)
+    trust = pending.trust()
+  } catch (e) {
+    if (e.name === 'expired') await chrome.storage.session.remove(k)
+    throw e
+  } finally {
+    pending.free()
+  }
+  await chrome.storage.session.remove(k)
+  if (p.add) return addAccount(acct, p.server, p.add.sealed, trust)
+  const all = await accounts()
+  const a = all.find((x) => x.key === key)
+  if (!a) throw fail('refused', 'That account was removed from this browser meanwhile.')
+  a.trust = trust
+  await chrome.storage.local.set({ accounts: all })
+  await signOut(a)
+  const problems = await settle(a, acct)
+  await touch()
+  return { username: a.username, problems }
 }
 
 /** After signing in: this device's copies, then a sync. Neither failing undoes the sign-in. */
@@ -478,7 +550,13 @@ async function unlock(password, key) {
     // password leaves one that still works alone.
     let acct
     try {
-      acct = await Account.unlock(send, a.server, password, a.sealed, DEVICE)
+      const r = await Account.unlock(send, a.server, password, a.sealed, DEVICE, a.trust)
+      const pending = r.pending()
+      if (pending) {
+        results.push(await awaitKey(a.key, a.server, pending))
+        continue
+      }
+      acct = r.account()
     } catch (e) {
       results.push({ key: a.key, ok: false, error: e.name, message: e.message })
       continue

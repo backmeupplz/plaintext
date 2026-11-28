@@ -50,7 +50,7 @@ try {
 } catch (e) {
   out.wrongPassword = e.name
 }
-const again = await Account.unlock(send, server, password, sealed, 'Node test')
+const again = (await Account.unlock(send, server, password, sealed, 'Node test')).account()
 out.unlocked = again.username()
 const [status] = await send('POST', `${server}/v1/logout`, JSON.parse(again.sessionState()).token)
 out.logout = status

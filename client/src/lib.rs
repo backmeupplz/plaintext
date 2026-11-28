@@ -260,14 +260,33 @@ pub enum SignIn<T: AsyncTransport> {
 }
 
 /// A signed login waiting a few minutes for the account's security key: its
-/// answer, a recovery code, or the approval page (`page`) finishes it.
+/// answer, a recovery code, or the approval page (`page`) finishes it. It keeps
+/// the Account Unlock Key, to open the Account Key once signed in, but not the
+/// login key.
 pub struct Pending<T: AsyncTransport> {
     t: Option<T>,
-    d: Derived,
+    account_id: plaintext_core::crypto::Id,
+    unlock_key: plaintext_core::crypto::Key,
     pub needed: KeyNeeded,
 }
 
 impl<T: AsyncTransport> Pending<T> {
+    /// What to keep to pick this up in another process (the browser extension's
+    /// background can be stopped while the approval page is open). As sensitive
+    /// as the Account Key: keep it only in memory.
+    pub fn state(&self) -> serde_json::Value {
+        serde_json::json!({ "account_id": hex::encode(self.account_id), "unlock_key": hex::encode(&self.unlock_key[..]), "needed": self.needed })
+    }
+
+    pub fn restore(t: T, state: &serde_json::Value) -> Result<Self> {
+        let bad = || Error::Refused("this sign-in's saved state is damaged; sign in again".into());
+        let hex32 = |k: &str| -> Option<Vec<u8>> { hex::decode(state.get(k)?.as_str()?).ok() };
+        let account_id = hex32("account_id").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
+        let unlock_key: [u8; 32] = hex32("unlock_key").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
+        let needed = serde_json::from_value(state.get("needed").cloned().ok_or_else(bad)?).map_err(|_| bad())?;
+        Ok(Pending { t: Some(t), account_id, unlock_key: zeroize::Zeroizing::new(unlock_key), needed })
+    }
+
     /// Where the approval page is, after the server's address, for apps that
     /// can't talk to the key themselves: it asks the key in the browser.
     pub fn page(&self) -> String {
@@ -290,7 +309,7 @@ impl<T: AsyncTransport> Pending<T> {
         match call_async::<_, LoginResponse>(&t, "POST", "/v1/login/finish", None, Some(&req)).await {
             Ok(resp) => {
                 let trust = resp.trust.unwrap_or_default();
-                Ok((Session::open_async(t, &self.d, resp.token).await?, trust))
+                Ok((Session::open_async(t, &self.account_id, &self.unlock_key, resp.token).await?, trust))
             }
             Err(e) => {
                 self.t = Some(t);
@@ -378,7 +397,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn login_async(t: T, d: &Derived, device: &str) -> Result<Self> {
         let req = plaintext_core::login_request(d, now_ms(), device, &t.login_host());
         let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
-        Self::open_async(t, d, resp.token).await
+        Self::open_async(t, &d.account_id, &d.unlock_key, resp.token).await
     }
 
     /// Sign in with (password, Secret Key). If the account needs a security key
@@ -390,15 +409,15 @@ impl<T: AsyncTransport> Session<T> {
         req.trust = trust.map(String::from);
         let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
         match resp.key {
-            Some(needed) => Ok(SignIn::Key(Pending { t: Some(t), d: d.clone(), needed })),
-            None => Ok(SignIn::Done(Self::open_async(t, d, resp.token).await?)),
+            Some(needed) => Ok(SignIn::Key(Pending { t: Some(t), account_id: d.account_id, unlock_key: d.unlock_key.clone(), needed })),
+            None => Ok(SignIn::Done(Self::open_async(t, &d.account_id, &d.unlock_key, resp.token).await?)),
         }
     }
 
-    async fn open_async(t: T, d: &Derived, token: String) -> Result<Self> {
+    async fn open_async(t: T, account_id: &plaintext_core::crypto::Id, unlock_key: &plaintext_core::crypto::Key, token: String) -> Result<Self> {
         let resp = LoginResponse { token, key: None, trust: None };
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&resp.token), NONE).await?;
-        let (account, keyring) = plaintext_core::unlock(d, &acct)?;
+        let (account, keyring) = plaintext_core::unlock_with(account_id, unlock_key, &acct)?;
         Ok(Session {
             t,
             token: resp.token,

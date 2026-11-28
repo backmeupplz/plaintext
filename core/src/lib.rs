@@ -205,8 +205,14 @@ pub fn login_request(d: &Derived, ts_ms: u64, device: &str, host: &str) -> Login
 
 /// Decrypt the Account Key and keyring. Fails on a wrong password or Secret Key.
 pub fn unlock(d: &Derived, resp: &AccountResponse) -> Result<(Account, Keyring), Error> {
-    let account_key = open_key(&d.unlock_key, &ad("account-key", &[&d.account_id]), &resp.account_key.0)?;
-    let account = Account { id: d.account_id, account_key };
+    unlock_with(&d.account_id, &d.unlock_key, resp)
+}
+
+/// `unlock` with just the Account Unlock Key, which is all a sign-in waiting for
+/// its security key keeps (not the login key).
+pub fn unlock_with(account_id: &Id, unlock_key: &Key, resp: &AccountResponse) -> Result<(Account, Keyring), Error> {
+    let account_key = open_key(unlock_key, &ad("account-key", &[account_id]), &resp.account_key.0)?;
+    let account = Account { id: *account_id, account_key };
     let keyring = Keyring::open(&account, &resp.keyring.0)?;
     if keyring.username != resp.username {
         return Err(Error::Tampered);

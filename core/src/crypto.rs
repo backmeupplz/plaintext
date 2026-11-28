@@ -116,7 +116,6 @@ fn base32(data: &[u8]) -> String {
 // ---------- Key derivation ----------
 
 /// Everything derived from (password, Secret Key).
-#[derive(Clone)]
 pub struct Derived {
     pub account_id: Id,
     /// Account Unlock Key: wraps the Account Key.

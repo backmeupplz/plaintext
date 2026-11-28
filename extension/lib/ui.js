@@ -70,3 +70,39 @@ export async function copy(text, say) {
     return false
   }
 }
+
+/** A sign-in waiting for the account's security key (DESIGN "Signing in with a
+ *  security key"): open the server's approval page, touch the key there, then
+ *  continue here; or type a recovery code. `done(result)` runs once signed in. */
+export function keyStep(w, done) {
+  const host = new URL(w.server).host
+  const who = w.key.startsWith('new@') ? `Your account on ${host}` : `${w.key.split('@')[0]} on ${host}`
+  const code = el('input', { type: 'text', id: 'recovery', class: 'mono', autocomplete: 'off', spellcheck: 'false', placeholder: 'xxxxx-xxxxx-xxxxx-xxxxx' })
+  const err = el('p', { class: 'error', role: 'alert' })
+  const go = el('button', { class: 'primary', type: 'submit' }, 'Continue')
+  return el(
+    'form',
+    {
+      class: 'key-step',
+      onsubmit: async (e) => {
+        e.preventDefault()
+        go.disabled = true
+        err.textContent = ''
+        try {
+          done(await ask('finishKey', { key: w.key, recovery: code.value.trim() }))
+        } catch (x) {
+          err.textContent = explain(x)
+        } finally {
+          go.disabled = false
+        }
+      },
+    },
+    el('p', {}, `${who} needs your security key to sign in on this browser.`),
+    el('button', { type: 'button', onclick: () => chrome.tabs.create({ url: w.page }) }, icon('key-round'), 'Approve with my security key'),
+    el('p', { class: 'muted small-text' }, "That opens a page on your server that asks your key. Touch the key there, then come back here and continue. This browser won't ask again."),
+    el('label', { for: 'recovery' }, 'Or use a recovery code'),
+    code,
+    err,
+    go,
+  )
+}

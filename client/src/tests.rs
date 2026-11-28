@@ -2068,6 +2068,8 @@ fn security_key_for_sign_in() {
     assert_eq!(t.send("POST", &format!("/v1/login/approve/{c}"), None, Some(a.clone())).unwrap().0, 204);
     assert_eq!(t.send("POST", &format!("/v1/login/approve/{c}"), None, Some(a)).unwrap().0, 404, "approved once");
     assert!(p.page().ends_with(&c));
+    // Picked up again elsewhere (the extension's background may have been stopped meanwhile).
+    let mut p = Pending::restore(Http::new(&url), &p.state()).unwrap();
     p.finish(None, None).unwrap();
 
     // A recovery code works once.

@@ -8,6 +8,23 @@ use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
+/// An account that needs no security key signs in straight away.
+fn done<T: AsyncTransport>(s: SignIn<T>) -> Session<T> {
+    match s {
+        SignIn::Done(s) => s,
+        SignIn::Key(_) => panic!("needs a security key"),
+    }
+}
+
+async fn add<T: AsyncTransport>(t: T, password: &str, secret_key: &str, device: &str) -> Result<(Session<T>, Vec<u8>), Error> {
+    let (s, sealed) = super::add(t, password, secret_key, device, None).await?;
+    Ok((done(s), sealed))
+}
+
+async fn unlock<T: AsyncTransport>(t: T, password: &str, sealed: &[u8], device: &str) -> Result<Session<T>, Error> {
+    Ok(done(super::unlock(t, password, sealed, device, None).await?))
+}
+
 /// Like the browser: every request is still pending on the first poll.
 struct Later(Http);
 
@@ -291,4 +308,33 @@ fn leaving_a_vault_a_problem_names() {
     assert_eq!(run(leave_check(&s, &team.to_string())).unwrap()["unsent"], false);
     assert!(run(sync(&mut s)).unwrap().is_empty());
     assert_eq!(code(&run(leave(&mut s, "not a vault")).unwrap_err()), "not_found");
+}
+
+/// An account that needs a security key: the extension gets a pending sign-in,
+/// keeps its state, finishes after the approval page, and isn't asked again.
+#[test]
+fn security_key_sign_in() {
+    use plaintext_client::plaintext_core::api::{B64, SigninKeyAction};
+    let url = server();
+    let (sk, cli) = Session::signup(Http::new(&url), "alice", "pw", None, "cli").unwrap();
+    let cli = cli.unwrap();
+    let d = crypto::derive("pw", &sk);
+    let rp = crypto::rp_id(&Http::new(&url).host());
+    let mut key = plaintext_server::SoftKey::new();
+    let ts = now_ms();
+    let proof = key.assert(&rp, &crypto::signin_key_add_challenge(&d.account_id, ts), &url);
+    cli.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof }).unwrap();
+
+    let (s, sealed) = run(super::add(Later(Http::new(&url)), "pw", &sk.encode(), "Chrome", None)).unwrap();
+    let SignIn::Key(p) = s else { panic!("signed in without the key") };
+    // The background may be stopped while the approval page is open.
+    let mut p = Pending::restore(Later(Http::new(&url)), &serde_json::from_str(&p.state().to_string()).unwrap()).unwrap();
+    let c = hex::encode(&p.needed.challenge.0);
+    assert!(p.page().ends_with(&c));
+    let a = serde_json::to_vec(&key.assert(&rp, &p.needed.challenge.0, &url)).unwrap();
+    assert_eq!(Http::new(&url).send("POST", &format!("/v1/login/approve/{c}"), None, Some(a)).unwrap().0, 204);
+    let (s, trust) = run(p.finish_async(None, None)).unwrap();
+    assert_eq!(s.username(), "alice");
+    assert!(matches!(run(super::unlock(Later(Http::new(&url)), "pw", &sealed, "Chrome", Some(&trust))).unwrap(), SignIn::Done(_)));
+    assert!(matches!(run(super::unlock(Later(Http::new(&url)), "pw", &sealed, "Chrome", None)).unwrap(), SignIn::Key(_)));
 }

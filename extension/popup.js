@@ -1,7 +1,7 @@
 // The toolbar popup: unlock, the current site's logins first, fill, copy, the
 // generator and an item view. Secrets come from the background one item at a
 // time, only when the user opens or copies them.
-import { ask, copy, el, explain, icon, iconButton, monogram, problemText } from './lib/ui.js'
+import { ask, copy, el, explain, icon, iconButton, keyStep, monogram, problemText } from './lib/ui.js'
 
 const main = document.getElementById('main')
 const status = document.getElementById('status')
@@ -29,6 +29,9 @@ async function start() {
     return main.replaceChildren(el('p', { class: 'error pad' }, explain(e)))
   }
   if (!st.accounts.length) return welcome()
+  // A sign-in left waiting for its security key while the approval page was open.
+  const waits = (await ask('awaitingKey').catch(() => [])).filter((w) => st.accounts.some((a) => a.key === w.key && !a.unlocked))
+  if (waits.length) return keyPanel(waits)
   if (!st.accounts.some((a) => a.unlocked)) return locked(st.accounts)
   return landing()
 }
@@ -75,6 +78,15 @@ function locked(accounts) {
   pw.focus()
 }
 
+/** Accounts waiting for their security key, one at a time. */
+function keyPanel(waits) {
+  const next = async (r) => {
+    const rest = (await ask('awaitingKey').catch(() => [])).filter((w) => waits.some((x) => x.key === w.key))
+    return rest.length ? keyPanel(rest) : landing(r?.problems ?? [])
+  }
+  main.replaceChildren(header(iconButton('settings', 'Settings', openSettings)), el('div', { class: 'center' }, keyStep(waits[0], next)))
+}
+
 async function unlock(e, pw, go, err) {
   e.preventDefault()
   go.disabled = true
@@ -82,6 +94,8 @@ async function unlock(e, pw, go, err) {
   err.textContent = ''
   try {
     const results = await ask('unlock', { password: pw.value })
+    const waits = results.filter((r) => r.error === 'key_needed')
+    if (waits.length) return keyPanel(waits)
     const failed = results.filter((r) => !r.ok)
     // A password the browser knew but the server refused says more than "didn't match".
     const changed = failed.find((r) => r.error === 'password_changed')
@@ -212,6 +226,7 @@ async function lockedAccounts(note) {
           err.textContent = ''
           try {
             const [r] = await ask('unlock', { password: pw.value, key: a.key })
+            if (r?.error === 'key_needed') return keyPanel([r])
             if (!r?.ok) return (err.textContent = explain({ name: r?.error, message: r?.message }))
             home(r.problems ?? [])
           } catch (x) {
