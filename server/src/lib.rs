@@ -60,9 +60,18 @@ const STAGE_TTL: u64 = 86400;
 /// of up to 16 MiB in base64 twice, or an item) and the latest manifest's sealed
 /// part, a page stays well under the 128 MiB clients read.
 const PULL_PAGE: usize = 16 << 20;
+/// A pull page's items, in id order: ids only, so nothing sorts or reads blobs it
+/// won't send (the `items_page` index), then each blob by its key (`ITEM_BLOB`).
+/// Without a quota, a member may stage the vault's item bytes (a key change of
+/// any size) plus this much (a big push), and no more, unseen for a day.
+const STAGE_SLACK: u64 = 64 << 20;
+const ITEM_PAGE: &str = "SELECT id FROM items WHERE vault_id = ?1 AND counter > ?2 AND id > ?3 ORDER BY id";
+const ITEM_BLOB: &str = "SELECT blob FROM items WHERE vault_id = ?1 AND id = ?2";
 
 const BAD: StatusCode = StatusCode::BAD_REQUEST;
 const DENIED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "not allowed");
+/// A stage past `STAGE_SLACK` on a server without a quota.
+const TOO_BIG: (StatusCode, &str) = (StatusCode::PAYLOAD_TOO_LARGE, "too much waiting to be added to this vault at once: send fewer changes at a time");
 /// 507, not 413: clients tell a full account from a request that's too big.
 const FULL: (StatusCode, &str) =
     (StatusCode::INSUFFICIENT_STORAGE, "the account this counts against is out of storage: delete items (larger ones first: each deletion stores a small record, so deleting a tiny item may free nothing), share links or sent messages, or leave a vault someone handed you, to make room (attachments are freed about a week later, by a device that syncs the vault)");
@@ -189,6 +198,9 @@ pub struct Config {
     /// Bytes of rosters, manifests and items one pull response carries before
     /// the client asks for the next page. `None`: `PULL_PAGE` (tests page sooner).
     pub pull_page: Option<usize>,
+    /// Without a quota, how far past the vault's items a member's staged bytes may
+    /// go (`stage`). `None`: `STAGE_SLACK` (tests use less).
+    pub stage_slack: Option<u64>,
 }
 
 /// Whether any comma-separated `PLAINTEXT_URL` entry is an `https://` address
@@ -1342,14 +1354,18 @@ async fn get_vault(
     }
     let mut items = Vec::new();
     if !page.full {
-        let mut st = db.prepare("SELECT id, blob FROM items WHERE vault_id = ?1 AND counter > ?2 AND (?3 IS NULL OR id > ?3) ORDER BY id").map_err(db_err)?;
-        let mut rows = st.query(params![&vault[..], q.since, after.as_ref().map(|a| &a[..])]).map_err(db_err)?;
+        // ponytail: an incremental pull scans the vault's index entries (~70 bytes an
+        // item) for changed ones; a (vault_id, counter, id) index if that ever shows.
+        let mut st = db.prepare(ITEM_PAGE).map_err(db_err)?;
+        let mut blob = db.prepare(ITEM_BLOB).map_err(db_err)?;
+        let mut rows = st.query(params![&vault[..], q.since, after.as_ref().map_or(&[][..], |a| &a[..])]).map_err(db_err)?;
         while let Some(row) = rows.next().map_err(db_err)? {
-            let blob: Vec<u8> = row.get(1).map_err(db_err)?;
-            if !page.fits(blob.len()) {
+            let id = Hex(row.get(0).map_err(db_err)?);
+            let b: Vec<u8> = blob.query_row(params![&vault[..], &id.0[..]], |r| r.get(0)).map_err(db_err)?;
+            if !page.fits(b.len()) {
                 break;
             }
-            items.push(ItemBlob { id: Hex(row.get(0).map_err(db_err)?), blob: B64(blob) });
+            items.push(ItemBlob { id, blob: B64(b) });
         }
     }
     let key = db
@@ -1471,8 +1487,8 @@ async fn stage(
     // still stage up to the size of the vault's items, which is what re-sealing
     // them all for a new key takes: once per vault, whichever owner it is.
     let sum = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> R<u64> { tx.query_row(sql, p, |r| r.get(0)).map_err(db_err) };
+    let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
     let refused = if let Some(quota) = cfg.quota {
-        let items = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM items WHERE vault_id = ?", &[&&vault[..]])?;
         // Owners' stages only: a writer's stage stays within the quota anyway, and mustn't use up the allowance.
         let all = sum(
             "SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ?1 AND username IN (SELECT username FROM members WHERE vault_id = ?1 AND role = 'owner')",
@@ -1481,7 +1497,8 @@ async fn stage(
         let rekey = role(&tx, &vault, &c.username)? == Some(Role::Owner) && all <= items;
         (!rekey && usage(&tx, creator(&tx, &vault)?.as_deref())? > quota).then_some(FULL)
     } else {
-        None
+        let mine = sum("SELECT COALESCE(SUM(length(blob)), 0) FROM staged WHERE vault_id = ? AND username = ?", &[&&vault[..], &c.username])?;
+        (mine > items.saturating_add(cfg.stage_slack.unwrap_or(STAGE_SLACK))).then_some(TOO_BIG)
     };
     if let Some(e) = refused {
         // The push this was part of can't go through: drop its earlier parts too.
@@ -1815,6 +1832,22 @@ mod tests {
         };
         assert_eq!(run(&mut db, 10).unwrap_err(), super::FULL);
         assert!(run(&mut db, 0).is_ok(), "a re-seal that takes no more room");
+    }
+
+    /// A pull page's items come in id order without a sort, and from the index
+    /// alone (no blob is read but the ones sent); a reviewer measured the sorting
+    /// plan at half a second a page, under the lock every request takes.
+    #[test]
+    fn item_pages_neither_sort_nor_read_blobs() {
+        let db = super::open_db(":memory:").unwrap();
+        let plan = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> String {
+            let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            st.query_map(p, |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect::<Vec<_>>().join("; ")
+        };
+        let page = plan(super::ITEM_PAGE, &[&vec![1u8], &0, &Vec::<u8>::new()]);
+        assert!(page.contains("COVERING INDEX items_page") && !page.contains("TEMP B-TREE"), "{page}");
+        let blob = plan(super::ITEM_BLOB, &[&vec![1u8], &vec![1u8]]);
+        assert!(blob.contains("(vault_id=? AND id=?)"), "{blob}");
     }
 
     /// Over the quota, a roster change goes through only if it takes access away.

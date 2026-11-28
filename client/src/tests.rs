@@ -2104,3 +2104,77 @@ fn manifests_from_older_apps() {
     assert_eq!(behind.vaults[&personal].items().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Two"]);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Over the quota, a delete goes through even while an addition the server
+/// refused waits on the device: the deletes go on their own, the rest stays pending.
+#[test]
+fn deletes_go_out_past_a_refused_addition() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, ..Default::default() });
+    let (ask, mut roomy) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    roomy.sync().unwrap();
+    let v = roomy.default_vault().unwrap();
+    let [big, kept, gone] = [(); 3].map(|_| plaintext_core::new_item_id());
+    roomy.put_item(&v, big, Item { notes: "x".repeat(5000), ..item("Big", "b") }).unwrap();
+    roomy.put_item(&v, kept, item("Kept", "k")).unwrap();
+    roomy.put_item(&v, gone, item("Gone", "g")).unwrap();
+    // The same database behind a server with no room at all.
+    let full = server_at(&path, plaintext_server::Config { open_signup: true, quota: Some(1), ..Default::default() });
+    let mut alice = login(&full, "alice pw", &ask);
+    alice.sync().unwrap();
+    let added = plaintext_core::new_item_id();
+    assert_eq!(status(alice.put_item(&v, added, item("New", "n"))), 507);
+    let pending = alice.vaults.get_mut(&v).unwrap();
+    pending.put(kept, item("Kept", "edited"));
+    pending.put(gone, item("Gone", "edited"));
+    pending.delete(big);
+    // Meanwhile another device deletes the item edited here.
+    let mut other = login(&full, "alice pw", &ask);
+    other.sync().unwrap();
+    other.delete_item(&v, gone).unwrap();
+    assert_eq!(status(alice.sync()), 507, "the addition still doesn't fit");
+    let pending = &alice.vaults[&v];
+    assert_eq!(pending.deleted(), 0, "the delete went out");
+    assert_eq!(pending.changed().map(|(id, _)| *id).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([added, kept, gone]));
+    // Every device reads the vault: the server has the delete and the old edit.
+    let mut third = login(&full, "alice pw", &ask);
+    third.sync().unwrap();
+    other.sync().unwrap();
+    for s in [&third, &other] {
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let items: Vec<_> = s.vaults[&v].items().map(|(_, i)| (i.title.clone(), i.password.clone())).collect();
+        assert_eq!(items, [("Kept".to_string(), "k".to_string())]);
+    }
+    assert_eq!(status(alice.sync()), 507);
+    assert!(alice.problems.is_empty(), "{:?}", alice.problems);
+    // With room again, the rest goes out (the edit brings back the deleted item).
+    roomy.vaults.insert(v, Vault::restore(&alice.account, v, &alice.vaults[&v].snapshot(&alice.account)).unwrap());
+    roomy.sync().unwrap();
+    other.sync().unwrap();
+    let mut titles: Vec<_> = other.vaults[&v].items().map(|(_, i)| format!("{} {}", i.title, i.password)).collect();
+    titles.sort();
+    assert_eq!(titles, ["Gone edited", "Kept edited", "New n"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Without a quota, a member may stage the vault's item bytes plus a slack, no more.
+#[test]
+fn staging_is_capped_without_a_quota() {
+    let (url, path) = server_with(plaintext_server::Config { open_signup: true, stage_slack: Some(1000), ..Default::default() });
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", None, "t");
+    alice.sync().unwrap();
+    let v = alice.default_vault().unwrap();
+    let stage = |s: &Session<Http>, st: Hex, n: usize| {
+        let upserts = vec![ItemBlob { id: plaintext_core::new_item_id(), blob: B64(vec![1; n]) }];
+        status(s.call::<()>("POST", &format!("/v1/vaults/{v}/stage"), Some(&StageRequest { stage: st, upserts })))
+    };
+    let st = plaintext_core::new_item_id();
+    assert_eq!(stage(&alice, st, 600), 200);
+    assert_eq!(stage(&alice, st, 600), 413);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM staged"), 0, "a refused part drops the parts before it");
+    // The vault's items add to the allowance (a new key re-seals them all).
+    alice.put_item(&v, plaintext_core::new_item_id(), Item { notes: "x".repeat(3000), ..item("Big", "b") }).unwrap();
+    let items = count(&path, "SELECT SUM(length(blob)) FROM items") as usize;
+    assert_eq!(stage(&alice, st, items + 900), 200);
+    assert_eq!(stage(&alice, st, 200), 413);
+    let _ = std::fs::remove_file(&path);
+}

@@ -21,6 +21,7 @@ async fn main() {
         trust_proxy: env("PLAINTEXT_TRUST_PROXY").is_some_and(|v| v == "1"),
         hsts: env("PLAINTEXT_URL").is_some_and(|v| plaintext_server::https_url(&v)),
         pull_page: None,
+        stage_slack: None,
     };
     let empty = db.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0)).expect("read database") == 0;
     if cfg.open_signup && cfg.setup_code.is_none() && empty {

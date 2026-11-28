@@ -531,6 +531,15 @@ impl Vault {
                 next.insert(*id, e.clone());
             }
         }
+        // An item edited here that the server no longer has: a deletes-only push
+        // mustn't list it, and if it comes back it's a change (a conflict copy).
+        for id in &self.dirty {
+            if !m.items.contains_key(id)
+                && let Some(b) = self.base.get_mut(id)
+            {
+                b.0.clear();
+            }
+        }
         self.entries = next;
         self.deleted = deleted;
         for (id, hash, content, files) in rebase {
@@ -582,18 +591,38 @@ impl Vault {
     /// Seal pending changes into a signed request. After a 2xx call `pushed`;
     /// after a 409, pull (`apply`) and push again.
     pub fn push(&mut self, me: &Me, now: u64) -> Result<VaultPut, Error> {
+        self.seal_push(me, now, false)
+    }
+
+    /// Like `push`, but only the pending deletes (and the name, if changed): added
+    /// and edited items stay pending, as the server has them. Over the quota a push
+    /// must remove items, so a refused addition mustn't hold deletes up.
+    pub fn push_deletes(&mut self, me: &Me, now: u64) -> Result<VaultPut, Error> {
+        self.seal_push(me, now, true)
+    }
+
+    fn seal_push(&mut self, me: &Me, now: u64, deletes_only: bool) -> Result<VaultPut, Error> {
         if self.role(&me.username, now).is_none_or(|r| r < Role::Writer) {
             return Err(Error::ReadOnly);
         }
         let vk = self.key()?;
         let mut upserts = Vec::new();
-        for id in &self.dirty {
+        for id in self.dirty.iter().filter(|_| !deletes_only) {
             let ad = self.item_ad(id);
             let e = self.entries.get_mut(id).expect("dirty entries exist");
             e.blob = seal_json(&vk, &ad, &e.item);
             upserts.push(ItemBlob { id: *id, blob: B64(e.blob.clone()) });
         }
-        let items = self.entries.iter().map(|(id, e)| (*id, h(&e.blob))).collect();
+        // Left out of a deletes-only push, an edited item stays at the server's copy
+        // (`base`, empty once the server dropped it); an added one isn't there yet.
+        let items = self
+            .entries
+            .iter()
+            .filter_map(|(id, e)| match self.dirty.contains(id) && deletes_only {
+                false => Some((*id, h(&e.blob))),
+                true => self.base.get(id).filter(|b| !b.0.is_empty()).map(|b| (*id, b.clone())),
+            })
+            .collect();
         let (epoch, version) = self.roster.as_ref().map_or((0, 0), |r| (r.epoch, r.version));
         let (manifest, sealed) = self.seal_manifest(me, &vk, epoch, version, items);
         Ok(VaultPut {

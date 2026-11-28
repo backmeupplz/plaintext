@@ -75,7 +75,10 @@ CREATE TABLE IF NOT EXISTS items(
   blob BLOB NOT NULL,
   counter INTEGER NOT NULL,
   PRIMARY KEY(vault_id, id));
-CREATE INDEX IF NOT EXISTS items_since ON items(vault_id, counter);
+-- Pull pages go through items in id order, filtering by counter in the index:
+-- neither sorts nor reads a blob it doesn't send (`ITEM_PAGE`).
+DROP INDEX IF EXISTS items_since;
+CREATE INDEX IF NOT EXISTS items_page ON items(vault_id, id, counter);
 
 CREATE TABLE IF NOT EXISTS files(
   vault_id BLOB NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,

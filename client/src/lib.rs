@@ -618,18 +618,36 @@ impl<T: AsyncTransport> Session<T> {
                 return Ok(());
             }
             let put = v.push(&me, now())?;
-            let wire = self.staged_async(id, &put).await?;
-            let body = serde_json::to_vec(wire.as_ref().unwrap_or(&put)).expect("serializable");
-            match raw_async(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(body)).await {
-                Ok(_) => {
+            match self.send_put_async(id, &put).await {
+                Ok(()) => {
                     self.vaults.get_mut(id).expect("exists").pushed(&put);
                     return Ok(());
                 }
                 Err(Error::Server(409, _)) => self.pull_async(id).await?,
+                // Over the quota a push must remove items: send the deletes on their
+                // own, so an addition that doesn't fit doesn't hold them up. Best
+                // effort; the addition still waits, so the 507 is what's reported.
+                Err(e @ Error::Server(507, _)) => {
+                    let v = self.vaults.get_mut(id).expect("exists");
+                    if v.deleted() > 0 && v.changed().next().is_some() {
+                        let put = v.push_deletes(&me, now())?;
+                        if self.send_put_async(id, &put).await.is_ok() {
+                            self.vaults.get_mut(id).expect("exists").pushed(&put);
+                        }
+                    }
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
         Err(Error::Server(409, "the vault kept changing; try again".into()))
+    }
+
+    /// Sends a push, staging its items first if they're too big for one request.
+    async fn send_put_async(&self, id: &Hex, put: &VaultPut) -> Result<()> {
+        let wire = self.staged_async(id, put).await?;
+        let body = serde_json::to_vec(wire.as_ref().unwrap_or(put)).expect("serializable");
+        raw_async(&self.t, "PUT", &format!("/v1/vaults/{id}"), Some(&self.token), Some(body)).await.map(drop)
     }
 
     /// `put` as it goes on the wire. Items too big for one request go to the
