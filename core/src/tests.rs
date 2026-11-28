@@ -876,3 +876,39 @@ fn pending_edit_and_delete_keep_syncing_after_a_rotation() {
     fresh.apply(&log.full("alice"), &mut a, 0).unwrap();
     assert_eq!(titles(&fresh), ["edit me=new", "later=z"]);
 }
+
+#[test]
+fn unicode_hosts_match_their_punycode() {
+    let on = |url: &str, page: &str, exact_host: bool| {
+        Item { urls: vec![url.into()], exact_host, ..login("x", "pw") }.matches_page(page)
+    };
+    for exact in [false, true] {
+        assert!(on("https://bücher.de/login", "https://xn--bcher-kva.de/", exact));
+        assert!(on("https://xn--bcher-kva.de", "https://bücher.de/", exact));
+        assert!(on("BÜCHER.de", "https://xn--bcher-kva.de", exact));
+        assert!(on("https://bücher。de", "https://xn--bcher-kva.de", exact)); // ideographic full stop
+        assert!(!on("https://bücher.de", "https://bucher.de", exact));
+        // Non-transitional, as browsers do it: ß stays ß, not ss.
+        assert!(on("https://faß.de", "https://xn--fa-hia.de", exact));
+        assert!(!on("https://faß.de", "https://fass.de", exact));
+        // U+1FAEA is newer than the idna tables: the same punycode still matches itself.
+        assert!(on("https://xn--c39h.la", "https://XN--C39H.la/", exact));
+        // The URL deny list, not STD3: underscores are fine in Unicode hosts too.
+        assert!(on("https://my_bücher.de", "https://MY_BÜCHER.de", exact));
+        // Undecoded escapes and empty labels name no real host.
+        assert!(!on("https://bucket%2es3.amazonaws.com", "https://foo.amazonaws.com", exact));
+        assert!(!on("https://a..com", "https://b..com", exact));
+    }
+    assert!(on("https://login.bücher.de", "https://www.xn--bcher-kva.de", false));
+    // The public suffix list names 公司.cn in punycode: two sites under it stay apart.
+    assert!(!on("https://a.公司.cn", "https://b.xn--55qx5d.cn", false));
+    assert!(on("https://x.a.公司.cn", "https://y.a.xn--55qx5d.cn", false));
+    assert_eq!(site::site("a.公司.cn"), "a.xn--55qx5d.cn");
+    // ℀ maps to `a/c`: a host no browser loads matches nothing.
+    assert!(!on("https://a℀.com", "https://a", false));
+    assert!(!on("https://a℀.com", "https://c.com", false));
+    // What matched before still does; full-width digits are the same IP to the browser.
+    assert!(on("https://my_host.example.com", "https://my_host.example.com", true));
+    assert!(on("http://１２７．０．０．１:8080", "http://127.0.0.1:8080/", true));
+    assert_eq!(site::host("https://www.Bücher.de/x").as_deref(), Some("xn--bcher-kva.de"));
+}

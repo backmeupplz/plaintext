@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "server", "client", "cli", "wasm", "ffi"]
+members = ["core", "server", "client", "cli", "wasm", "ffi", "android/bindgen"]
 resolver = "3"
 
 [workspace.package]
