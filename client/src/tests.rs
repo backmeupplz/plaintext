@@ -114,7 +114,8 @@ fn family_agent_and_sharing() {
     assert!(agent.find("netflix", None).is_empty());
     // Read-only: the client refuses, and so does the server if the client misbehaves.
     agent.vaults.get_mut(&ci).unwrap().put(plaintext_core::new_item_id(), item("x", "y"));
-    agent.sync().unwrap(); // a reader's sync never pushes
+    agent.sync().unwrap(); // a reader's sync never pushes, and says why
+    assert!(agent.problems.iter().any(|p| p.contains("only read")), "{:?}", agent.problems);
     let agent_me = agent.me();
     let av = agent.vaults.get_mut(&ci).unwrap();
     assert_eq!(av.push(&agent_me, now()).err(), Some(plaintext_core::Error::ReadOnly));
@@ -1125,7 +1126,7 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     let (url, _) = server();
     let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
     let code = alice.invite().unwrap();
-    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default()), "bob", "bob pw", Some(&code), "phone");
     alice.sync().unwrap();
     let fam = alice.create_vault("Family").unwrap();
     let nid = plaintext_core::new_item_id();
@@ -1148,11 +1149,43 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     assert_eq!(v.items().count(), 2);
     assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
     assert_eq!(v.meta.name, "Family");
-    assert!(bob.writable(&fam).is_err());
+    assert!(read_only(bob.writable(&fam)));
 
     // A writer again, he can.
     alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
     bob.delete_item(&fam, nid).unwrap();
     alice.sync().unwrap();
     assert!(alice.vaults[&fam].get(&nid).is_none());
+
+    // Offline, an edit waits on the device and goes out with the next sync...
+    let offline = |bob: &mut Session<Flaky>, title: &str| {
+        bob.t.1.set(true);
+        assert!(matches!(bob.put_item(&fam, plaintext_core::new_item_id(), item(title, "o")), Err(Error::Network(_))));
+        bob.t.1.set(false);
+        assert!(bob.vaults[&fam].has_changes());
+    };
+    offline(&mut bob, "Offline");
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.vaults[&fam].items().filter(|(_, i)| i.title == "Offline").count(), 1);
+    // ...but if he's made a reader meanwhile, every sync says it can't be sent.
+    offline(&mut bob, "Too late");
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    assert!(bob.problems.iter().any(|p| p.contains("only read")), "{:?}", bob.problems);
+}
+
+/// A transport whose network can be switched off.
+struct Flaky(Http, std::cell::Cell<bool>);
+
+impl Transport for Flaky {
+    fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        if self.1.get() {
+            return Err(Error::Network("offline".into()));
+        }
+        self.0.send(method, path, token, body)
+    }
+    fn host(&self) -> String {
+        self.0.host()
+    }
 }

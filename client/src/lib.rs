@@ -358,13 +358,15 @@ impl<T: Transport> Session<T> {
     /// roster we already have says we only read.
     fn change(&mut self, id: &Hex, f: impl FnOnce(&mut Vault)) -> Result<()> {
         let pulled = self.pull(id);
-        self.may_write(id)?;
+        if matches!(pulled, Err(ref e) if !matches!(e, Error::Network(_) | Error::Server(500..=599, _))) {
+            return pulled;
+        }
+        if let Err(e) = self.may_write(id) {
+            return pulled.and(Err(e));
+        }
         f(self.vaults.get_mut(id).expect("checked above"));
         pulled?;
-        self.push(id)?;
-        // Made a reader between the pull and the push (a 409's pull saw it): the
-        // change wasn't sent, so say so.
-        self.may_write(id)
+        self.push(id)
     }
 
     /// Push pending changes (a pull came just before); on a conflict pull again and retry.
@@ -372,7 +374,10 @@ impl<T: Transport> Session<T> {
         for _ in 0..5 {
             let me = self.me();
             let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
-            if !v.has_changes() || v.role(&me.username, now()).is_none_or(|r| r < Role::Writer) {
+            // Changes made while we could still write (offline, or just before a
+            // demotion) can't go to a reader's vault: `push` says ReadOnly, on every
+            // sync, rather than keep them without a word.
+            if !v.has_changes() {
                 return Ok(());
             }
             let put = v.push(&me, now())?;
