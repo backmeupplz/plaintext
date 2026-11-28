@@ -649,7 +649,7 @@ impl Vault {
         for (id, e) in &self.entries {
             // The stored bytes, not this client's serialisation of them: a copy that
             // came out a padding step bigger would be refused over the quota (and
-            // fields this client doesn't know would be lost).
+            // unknown fields in parts without an `extra`, such as attachments, would be lost).
             let ad = self.item_ad(id);
             let blob = open(&old, &ad, &e.blob).map_or_else(|_| seal_json(&vk, &ad, &e.item), |raw| seal(&vk, &ad, &raw));
             items.insert(*id, h(&blob));
