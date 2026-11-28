@@ -332,9 +332,27 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
-    /// Pull, then push pending changes; on a conflict pull again and retry.
+    /// Pull, then push pending changes.
     pub fn sync_vault(&mut self, id: &Hex) -> Result<()> {
         self.pull(id)?;
+        self.push(id)
+    }
+
+    /// Pull a vault and hand it back only if we may write to it. Every change goes
+    /// through here first: a reader's sync never pushes, so a change made anyway
+    /// would stay on this device without a word.
+    pub fn writable(&mut self, id: &Hex) -> Result<&mut Vault> {
+        self.pull(id)?;
+        let me = self.username().to_string();
+        let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
+        if v.role(&me, now()).is_none_or(|r| r < Role::Writer) {
+            return Err(plaintext_core::Error::ReadOnly.into());
+        }
+        Ok(v)
+    }
+
+    /// Push pending changes (a pull came just before); on a conflict pull again and retry.
+    fn push(&mut self, id: &Hex) -> Result<()> {
         for _ in 0..5 {
             let me = self.me();
             let v = self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?;
@@ -562,8 +580,8 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn rename_vault(&mut self, id: &Hex, meta: VaultMeta) -> Result<()> {
-        self.vaults.get_mut(id).ok_or(Error::NotFound("vault".into()))?.set_meta(meta);
-        self.sync_vault(id)
+        self.writable(id)?.set_meta(meta);
+        self.push(id)
     }
 
     /// Give `username` access to a vault. Pins them first if they're new to us.
@@ -661,16 +679,16 @@ impl<T: Transport> Session<T> {
 
     /// Add or replace an item and push it.
     pub fn put_item(&mut self, vault: &Hex, id: Hex, item: Item) -> Result<()> {
-        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.put(id, item);
-        self.sync_vault(vault)
+        self.writable(vault)?.put(id, item);
+        self.push(vault)
     }
 
     /// Delete an item and push. Its attachments stay on the server until a later
     /// sync collects them (`collect_files`), so another device that brings the item
     /// back with an edit it hadn't pushed doesn't find its files gone.
     pub fn delete_item(&mut self, vault: &Hex, id: Hex) -> Result<()> {
-        self.vaults.get_mut(vault).ok_or(Error::NotFound("vault".into()))?.delete(id);
-        self.sync_vault(vault)
+        self.writable(vault)?.delete(id);
+        self.push(vault)
     }
 
     // ---------- Files ----------

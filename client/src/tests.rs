@@ -1119,3 +1119,40 @@ fn server_hardening() {
     ci.create_link(LINK_PAGE, &url, &mid, now() + 600, None).unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
+    let (url, _) = server();
+    let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
+    let code = alice.invite().unwrap();
+    let (_, mut bob) = join(Http::new(&url), "bob", "bob pw", Some(&code), "phone");
+    alice.sync().unwrap();
+    let fam = alice.create_vault("Family").unwrap();
+    let nid = plaintext_core::new_item_id();
+    alice.put_item(&fam, nid, item("Netflix", "n3tfl1x-pass")).unwrap();
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.sync().unwrap();
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Bob's", "while-a-writer")).unwrap();
+
+    // Alice makes bob a reader; his device still thinks he's a writer.
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    let read_only = |r: Result<()>| matches!(r, Err(Error::Core(plaintext_core::Error::ReadOnly)));
+    assert!(read_only(bob.put_item(&fam, plaintext_core::new_item_id(), item("Disney", "d1sney"))));
+    assert!(read_only(bob.put_item(&fam, nid, item("Netflix", "changed"))));
+    assert!(read_only(bob.delete_item(&fam, nid)));
+    let mut meta = bob.vaults[&fam].meta.clone();
+    meta.name = "Bob's now".into();
+    assert!(read_only(bob.rename_vault(&fam, meta)));
+    let v = &bob.vaults[&fam];
+    assert!(!v.has_changes(), "nothing is left waiting on bob's device");
+    assert_eq!(v.items().count(), 2);
+    assert_eq!(v.get(&nid).unwrap().password, "n3tfl1x-pass");
+    assert_eq!(v.meta.name, "Family");
+    assert!(bob.writable(&fam).is_err());
+
+    // A writer again, he can.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.delete_item(&fam, nid).unwrap();
+    alice.sync().unwrap();
+    assert!(alice.vaults[&fam].get(&nid).is_none());
+}
