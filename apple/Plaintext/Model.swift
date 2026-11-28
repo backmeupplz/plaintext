@@ -139,7 +139,7 @@ final class AppModel: ObservableObject {
         let vault: String
         let changes: UnsentChanges
         /// The vault's warning when this was asked for.
-        let warning: String?
+        let warning: String
     }
     @Published var syncing = false
     /// Hidden from lists while its delete is pending.
@@ -563,7 +563,9 @@ final class AppModel: ObservableObject {
         do {
             let changes = try await call { try $0.unsentChanges(account: account, vault: vault) }
             if lockedSince(gen) { return nil }
-            return UnsentRequest(account: account, vault: vault, changes: changes, warning: warning(account: account, vault: vault))
+            // Its warning gone meanwhile (a sync cleared it): nothing to review.
+            guard let w = warning(account: account, vault: vault) else { return nil }
+            return UnsentRequest(account: account, vault: vault, changes: changes, warning: w)
         } catch {
             // Locked meanwhile: no error over the lock screen either.
             if !lockedSince(gen) { show(error) }

@@ -86,7 +86,7 @@ sealed interface Route {
 data class Unsent(val text: String, val account: String, val vault: String)
 
 /** Changes to drop, once the person confirms; [warning] is the vault's sync warning when they were asked for. */
-data class UnsentRequest(val account: String, val vault: String, val changes: UnsentChanges, val warning: String?)
+data class UnsentRequest(val account: String, val vault: String, val changes: UnsentChanges, val warning: String)
 
 data class Toast(val text: String, val undo: (() -> Unit)? = null, val id: Long = System.nanoTime())
 
@@ -494,7 +494,9 @@ class Model(val context: Context) {
             // Locked meanwhile: nothing opens over the lock screen, an error neither.
             try {
                 val changes = call { it.unsentChanges(u.account, u.vault) }
-                if (epoch == e) reviewing = UnsentRequest(u.account, u.vault, changes, warning(u.account, u.vault))
+                // Its warning gone meanwhile (a sync cleared it): nothing to review.
+                val w = warning(u.account, u.vault)
+                if (epoch == e && w != null) reviewing = UnsentRequest(u.account, u.vault, changes, w)
             } catch (x: Exception) {
                 if (epoch == e) show(x)
             }
