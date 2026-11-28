@@ -91,7 +91,12 @@ struct UnlockView: View {
             // signing out of every account there brings back first run.
             if Biometrics.available {
                 Button("Sign in with your Emergency Kit") {
-                    Task { if await model.confirmOwnerToAdd() { signingIn = true } }
+                    Task {
+                        if await model.confirmOwnerToAdd() {
+                            model.cancelKeyStep()
+                            signingIn = true
+                        }
+                    }
                 }
                 .font(.footnote)
                 .foregroundStyle(Palette.muted)

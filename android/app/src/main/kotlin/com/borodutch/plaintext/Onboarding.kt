@@ -418,6 +418,8 @@ private fun PasswordStep(flow: Flow) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The Secret Key of a sign-in this step left waiting for the account's security key.
+    var keySk by remember { mutableStateOf<String?>(null) }
     // The account may already exist once the server answers: stay until it does.
     BackHandler(enabled = busy) {}
     val insecure = runCatching { serverAddress(flow.server).insecure }.getOrDefault(false)
@@ -433,6 +435,7 @@ private fun PasswordStep(flow: Flow) {
                 flow.go(Step.Biometrics)
             } catch (_: PlaintextException.KeyNeeded) {
                 flow.password = ""
+                keySk = sk
                 model.keyPage = model.core.pendingKeyPage()
             } catch (e: Exception) {
                 error = setupError(e)
@@ -445,8 +448,9 @@ private fun PasswordStep(flow: Flow) {
         "Enter your password", accountLabel(flow.server, flow.username), onBack = if (busy) null else ({ flow.back() }),
         actions = { PrimaryButton("Sign in", ::signIn, enabled = flow.password.isNotEmpty(), busy = busy) },
     ) {
-        if (model.keyPage != null) KeyStep { code ->
-            val sk = flow.secretKey
+        val waiting = keySk
+        if (waiting != null && model.keyPage != null) KeyStep { code ->
+            val sk = waiting
             flow.login = model.addAccount({ it.finishLogin(code) }) { Triple(it.account, sk, it.unlock) }
             flow.go(Step.Biometrics)
         } else Field("Password", flow.password, { flow.password = it }, kind = Input.Password, onDone = ::signIn)

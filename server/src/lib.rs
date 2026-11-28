@@ -808,6 +808,7 @@ async fn change_signin_keys(
     let action: SigninKeyAction = serde_json::from_slice(&req.action.0).map_err(|_| (BAD, "malformed request"))?;
     let tx = db.transaction().map_err(db_err)?;
     let had = tx.query_row("SELECT COUNT(*) FROM signin_keys WHERE account_id = ?", [&c.id], |r| r.get::<_, i64>(0)).map_err(db_err)?;
+    let mut trust = None;
     let new_codes = match action {
         SigninKeyAction::Add { name, rp_id: rp, registration, proof } => {
             if name.trim().is_empty() || name.len() > 64 {
@@ -815,6 +816,12 @@ async fn change_signin_keys(
             }
             if !hosts.iter().any(|h| rp_id(h) == rp) {
                 return Err((BAD, "add the key for this server's own address"));
+            }
+            let taken: i64 = tx
+                .query_row("SELECT COUNT(*) FROM signin_keys WHERE account_id = ? AND name = ?", params![c.id, name.trim()], |r| r.get(0))
+                .map_err(db_err)?;
+            if taken > 0 {
+                return Err((StatusCode::CONFLICT, "you already have a security key with that name"));
             }
             if had >= MAX_SIGNIN_KEYS {
                 return Err((StatusCode::CONFLICT, "an account can have at most 10 security keys"));
@@ -834,6 +841,11 @@ async fn change_signin_keys(
             if n == 0 {
                 return Err((StatusCode::CONFLICT, "that security key is already added"));
             }
+            // The password and the key just proved themselves here, as a sign-in with the key would.
+            let t = hex::encode(random::<32>()?);
+            tx.execute("INSERT INTO trusted_devices(token_hash, account_id, created) VALUES(?,?,?)", params![&sha256(t.as_bytes())[..], c.id, now()])
+                .map_err(db_err)?;
+            trust = Some(t);
             had == 0
         }
         SigninKeyAction::Remove { id: cred } => {
@@ -844,6 +856,7 @@ async fn change_signin_keys(
             if had == 1 {
                 tx.execute("DELETE FROM recovery_codes WHERE account_id = ?", [&c.id]).map_err(db_err)?;
                 tx.execute("DELETE FROM trusted_devices WHERE account_id = ?", [&c.id]).map_err(db_err)?;
+                tx.execute("DELETE FROM pending_logins WHERE account_id = ?", [&c.id]).map_err(db_err)?;
             }
             false
         }
@@ -861,7 +874,7 @@ async fn change_signin_keys(
         }
     }
     tx.commit().map_err(db_err)?;
-    Ok(Json(RecoveryCodes { codes }))
+    Ok(Json(RecoveryCodes { codes, trust }))
 }
 
 const RECOVERY_CODES: usize = 10;
@@ -944,6 +957,7 @@ async fn change_password(State(db): State<Db>, h: HeaderMap, Json(req): Json<Pas
     // Every other device signs in again with the new password, and with a security key if the account needs one.
     db.execute("DELETE FROM sessions WHERE account_id = ? AND token_hash != ?", params![c.id, c.token_hash]).map_err(db_err)?;
     db.execute("DELETE FROM trusted_devices WHERE account_id = ?", [&c.id]).map_err(db_err)?;
+    db.execute("DELETE FROM pending_logins WHERE account_id = ?", [&c.id]).map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

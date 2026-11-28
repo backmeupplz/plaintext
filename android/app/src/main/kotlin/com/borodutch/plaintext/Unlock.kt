@@ -97,6 +97,8 @@ fun UnlockScreen() {
     var error by remember { mutableStateOf<String?>(null) }
     var signingIn by rememberSaveable { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    // This screen's unlock is waiting for the account's security key.
+    var keyStep by remember { mutableStateOf(false) }
     val target = model.known(accountId) ?: model.lockedAccounts.firstOrNull()
     val canBiometric = model.vault.biometrics && model.vault.anySession() && Vault.biometricsAvailable(context)
 
@@ -112,6 +114,7 @@ fun UnlockScreen() {
                 model.unlock(k, pw)
                 password = ""
             } catch (_: PlaintextException.KeyNeeded) {
+                keyStep = true
                 password = ""
             } catch (e: Exception) {
                 error = errorText(e)
@@ -165,7 +168,7 @@ fun UnlockScreen() {
                     }
                 }
             }
-            if (model.keyPage != null) KeyStep { model.finishUnlock(it) }
+            if (keyStep && model.keyPage != null) KeyStep { model.finishUnlock(it) }
             else Field(
                 if (model.known.size > 1) "Password for ${target?.username ?: ""}" else "Password", password, { password = it },
                 kind = Input.Password, onDone = ::unlock,
@@ -180,7 +183,7 @@ fun UnlockScreen() {
         // Only after the owner's fingerprint, face or PIN: otherwise anyone holding the phone could add an account and reach Settings.
         // Not on a phone without a screen lock: signing out of every account there brings back first run.
         if (context.getSystemService(KeyguardManager::class.java).isDeviceSecure) TextButton(onClick = {
-            confirmOwner(activity, "Confirm it's you to add an account") { model.ownerConfirmed(); signingIn = true }
+            confirmOwner(activity, "Confirm it's you to add an account") { model.cancelKeyStep(); model.ownerConfirmed(); signingIn = true }
         }) { Text("Sign in with your Emergency Kit", color = P.muted) }
     }
 }

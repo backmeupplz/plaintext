@@ -17,7 +17,8 @@ async function load() {
   const a = await r.json()
   const keys = a.keys.filter((k) => k.rp_id === location.hostname)
   if (!keys.length) return say(`None of ${a.username}'s security keys was added for ${location.hostname}. Sign in at the address you added them for, or use a recovery code.`)
-  say(`${a.username} is signing in on “${a.device}”. Plug in or hold your security key near the device, then continue.`)
+  const device = a.device.length > 60 ? `${a.device.slice(0, 60)}…` : a.device
+  say(`${a.username} is signing in on a device that calls itself “${device}”. Plug in or hold your security key near this device, then continue.`)
   go.hidden = false
   go.onclick = () => approve(keys).catch((e) => { say(`That didn't work (${e.message}). Try again, or use a recovery code in Plaintext.`); go.hidden = false })
 }

@@ -106,9 +106,10 @@ fn password(cfg: &Config, ask: Ask) -> Res<Derived> {
 }
 
 /// A session of its own for a key's sealed copy, named after the key in
-/// `plaintext sessions`.
-fn login(cfg: &Config, d: &Derived, name: &str) -> Res<(S, String)> {
-    let s = sign_in(cfg, d, &format!("{} (security key: {name})", state::device()), &mut Hid::default(), &mut |m: &str| state::prompt(m))?;
+/// `plaintext sessions`. If the account needs a key to sign in, `auth` answers
+/// (the same one: macOS opens a security key for one user at a time).
+fn login(cfg: &Config, auth: &mut dyn Authenticator, ask: Ask, d: &Derived, name: &str) -> Res<(S, String)> {
+    let s = sign_in(cfg, d, &format!("{} (security key: {name})", state::device()), auth, ask)?;
     match s.sessions().map(|l| l.into_iter().find(|x| x.current).map(|x| x.id)) {
         Ok(Some(id)) => Ok((s, id)),
         r => {
@@ -141,7 +142,8 @@ pub fn add(cfg: &Config, auth: &mut dyn Authenticator, name: &str, ask: Ask) -> 
     if !auth.has_pin()? {
         return Err("this security key has no PIN. Set one first (for a YubiKey: ykman fido access change-pin; or fido2-token -S), so that a touch alone can't unlock".into());
     }
-    let (s, session) = login(cfg, &password(cfg, ask)?, name)?;
+    let d = password(cfg, ask)?;
+    let (s, session) = login(cfg, auth, ask, &d, name)?;
     let made = (|| -> Res<_> {
         let pin = ask("Security key PIN: ")?;
         eprintln!("Touch your security key to add it.");
@@ -190,7 +192,8 @@ pub fn unlock(cfg: &Config, auth: &mut dyn Authenticator, ask: Ask) -> Res<S> {
     let s = match Session::resume(state::http(&cfg.server)?, token.to_string(), Account { id, account_key }) {
         Err(Error::Server(401, _)) => {
             eprintln!("This key's session has ended (they last 30 days, and a password change ends them). Your password renews it.");
-            let (s, session) = login(cfg, &password(cfg, ask)?, &keys.keys[i].name)?;
+            let d = password(cfg, ask)?;
+            let (s, session) = login(cfg, auth, ask, &d, &keys.keys[i].name)?;
             if s.account.id != id {
                 let _ = s.end_session(&session);
                 return Err("that password signs in to a different account".into());
@@ -282,7 +285,12 @@ pub fn add_for_sign_in(cfg: &Config, s: &S, auth: &mut dyn Authenticator, name: 
     let cred = cred_id(&registration).ok_or("the security key's answer is malformed")?;
     let (id, auth_data, signature) = auth.assert(&rp, &[cred], &cd)?;
     let proof = Assertion { id: B64(id), client_data: B64(cd), auth_data: B64(auth_data), signature: B64(signature) };
-    Ok(s.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: name.into(), rp_id: rp, registration: B64(registration), proof })?)
+    let r = s.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: name.into(), rp_id: rp, registration: B64(registration), proof })?;
+    // This computer just proved the key, so signing in here won't ask for it.
+    if let Some(t) = r.trust {
+        let _ = state::entry(cfg, "trust").and_then(|e| e.set(&t));
+    }
+    Ok(r.codes)
 }
 
 /// The credential id in a new credential's authenticatorData.
@@ -294,7 +302,7 @@ fn cred_id(a: &[u8]) -> Option<Vec<u8>> {
 /// Stop a key being needed to sign in (the last one: none is needed any more),
 /// or replace the recovery codes. Both need the password.
 pub fn change_sign_in(cfg: &Config, s: &S, action: SigninKeyAction, ask: Ask) -> Res<Vec<String>> {
-    Ok(s.change_signin_keys(&password(cfg, ask)?, now_ms(), &action)?)
+    Ok(s.change_signin_keys(&password(cfg, ask)?, now_ms(), &action)?.codes)
 }
 
 /// A USB security key, through `ctap-hid-fido2`. Builds without it (the static
@@ -742,12 +750,19 @@ pub mod tests {
         assert_eq!((codes.len(), yubi.touches), (10, 2));
         assert_eq!(asked.take(), ["Password for alice: ", "Security key PIN: "]);
         let d = derive("correct horse", &sk);
-        // A computer that isn't trusted yet: a touch, no PIN. Then it's remembered.
+        // The computer that added it isn't asked for it.
+        sign_in(&cfg, &d, "test", &mut Soft::default(), &mut ask).unwrap();
+        // Another one: a touch, no PIN. Then it's remembered.
+        state::entry(&cfg, "trust").unwrap().delete().unwrap();
         sign_in(&cfg, &d, "test", &mut yubi, &mut ask).unwrap();
         assert_eq!((yubi.touches, asked.take().len()), (3, 0));
         sign_in(&cfg, &d, "test", &mut Soft::default(), &mut ask).unwrap();
-        // Adding an unlock key signs in too, on this trusted computer.
+        // Adding an unlock key signs in too: on a trusted computer without the key,
+        // on another with the same key that's being added.
         add(&cfg, &mut key, "blue", &mut ask).unwrap();
+        state::entry(&cfg, "trust").unwrap().delete().unwrap();
+        add(&cfg, &mut yubi, "yubi", &mut ask).unwrap();
+        assert_eq!(yubi.touches, 3 + 1 + 3, "one touch to sign in, three to add");
         asked.take();
         // Without the key, a recovery code (the prompt also offers the approval page).
         state::entry(&cfg, "trust").unwrap().delete().unwrap();

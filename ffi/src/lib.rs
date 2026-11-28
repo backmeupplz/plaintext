@@ -1171,6 +1171,9 @@ impl PlaintextApp {
     /// reachable) and delete this device's copies. A locked account's session is
     /// ended with what the keychain kept for it (`stored`), when there is any.
     pub fn sign_out(&self, account: String, server: String, stored: Option<UnlockData>) {
+        if account.len() == 32 && hex::decode(&account).is_ok() {
+            let _ = std::fs::remove_file(self.dir.join("trust").join(&account[..16]));
+        }
         let Ok(a) = self.acct(&account) else {
             if let Some(u) = stored
                 && let Ok(acct) = account_of(&u)

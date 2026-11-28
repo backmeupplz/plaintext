@@ -2018,9 +2018,13 @@ fn security_key_for_sign_in() {
     let other = plaintext_server::SoftKey::new().assert(&rp, &signin_key_add_challenge(&d.account_id, ts), &url);
     let bad = SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof: other };
     assert_eq!(status(alice.change_signin_keys(&d, ts, &bad)), 400);
-    let codes = add(&mut key, &d, "blue").unwrap();
+    let added = add(&mut key, &d, "blue").unwrap();
+    let codes = added.codes;
     assert_eq!(codes.len(), 10);
+    // The device that added it is trusted, as after a sign-in with it.
+    assert!(matches!(Session::sign_in(Http::new(&url), &d, "laptop", added.trust.as_deref()).unwrap(), SignIn::Done(_)));
     assert_eq!(status(add(&mut key, &d, "blue again")), 409);
+    assert_eq!(status(add(&mut plaintext_server::SoftKey::new(), &d, "blue")), 409, "names are unique");
     let listed = alice.signin_keys().unwrap();
     assert_eq!((listed.keys.len(), listed.codes_left, listed.keys[0].name.as_str()), (1, 10, "blue"));
 
@@ -2059,7 +2063,7 @@ fn security_key_for_sign_in() {
     let t = Http::new(&url);
     let page = t.send("GET", "/v1/login/key", None, None).unwrap();
     assert!(page.0 == 200 && String::from_utf8_lossy(&page.1).contains("key.js"));
-    let mut p = pending("extension", None);
+    let p = pending("extension", None);
     let c = hex::encode(&p.needed.challenge.0);
     let (code, body) = t.send("GET", &format!("/v1/login/approve/{c}"), None, None).unwrap();
     let approval: Approval = serde_json::from_slice(&body).unwrap();
@@ -2078,7 +2082,7 @@ fn security_key_for_sign_in() {
     p.finish(None, Some(&codes[0].to_uppercase().replace('-', " "))).unwrap();
     assert_eq!(status(pending("borrowed", None).finish(None, Some(&codes[0]))), 401);
     assert_eq!(alice.signin_keys().unwrap().codes_left, 9);
-    let fresh = alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Codes).unwrap();
+    let fresh = alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Codes).unwrap().codes;
     assert_eq!(status(pending("borrowed", None).finish(None, Some(&codes[1]))), 401, "replaced");
     pending("borrowed", None).finish(None, Some(&fresh[0])).unwrap();
 
@@ -2090,7 +2094,7 @@ fn security_key_for_sign_in() {
 
     // Removing the last key turns it off.
     assert_eq!(status(alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Remove { id: B64(vec![1]) })), 404);
-    assert!(alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Remove { id: B64(key.id.clone()) }).unwrap().is_empty());
+    assert!(alice.change_signin_keys(&d, now_ms(), &SigninKeyAction::Remove { id: B64(key.id.clone()) }).unwrap().codes.is_empty());
     assert!(matches!(Session::sign_in(Http::new(&url), &d, "phone", None).unwrap(), SignIn::Done(_)));
     assert_eq!(alice.signin_keys().unwrap().codes_left, 0);
     let _ = std::fs::remove_file(&path);

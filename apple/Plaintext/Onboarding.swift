@@ -526,7 +526,7 @@ struct PasswordStep: View {
 
     var body: some View {
         StepPage(title: "Enter your password", subtitle: "\(flow.username)@\(flow.server.components(separatedBy: "://").last ?? flow.server)") {
-            if model.keyPage != nil {
+            if model.keyPage != nil && !keySecret.isEmpty {
                 KeyStepView { l in signedIn(l, secretKey: keySecret, since: keyGen) }
             } else {
                 Field(label: "Password") {

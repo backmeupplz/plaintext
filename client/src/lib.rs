@@ -253,6 +253,7 @@ fn find<'a>(name: &str, vaults: impl Iterator<Item = (&'a Hex, &'a Vault)> + Clo
 }
 
 /// The outcome of `Session::sign_in_async`.
+#[allow(clippy::large_enum_variant)] // short-lived, and `Done` is the common case
 pub enum SignIn<T: AsyncTransport> {
     Done(Session<T>),
     /// The account needs a security key (DESIGN "Signing in with a security key").
@@ -268,6 +269,9 @@ pub struct Pending<T: AsyncTransport> {
     account_id: plaintext_core::crypto::Id,
     unlock_key: plaintext_core::crypto::Key,
     pub needed: KeyNeeded,
+    /// The session and trust token, once the server finished the sign-in, so
+    /// opening the account can be retried without the key.
+    done: Option<(String, String)>,
 }
 
 impl<T: AsyncTransport> Pending<T> {
@@ -284,7 +288,7 @@ impl<T: AsyncTransport> Pending<T> {
         let account_id = hex32("account_id").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
         let unlock_key: [u8; 32] = hex32("unlock_key").and_then(|v| v.try_into().ok()).ok_or_else(bad)?;
         let needed = serde_json::from_value(state.get("needed").cloned().ok_or_else(bad)?).map_err(|_| bad())?;
-        Ok(Pending { t: Some(t), account_id, unlock_key: zeroize::Zeroizing::new(unlock_key), needed })
+        Ok(Pending { t: Some(t), account_id, unlock_key: zeroize::Zeroizing::new(unlock_key), needed, done: None })
     }
 
     /// Where the approval page is, after the server's address, for apps that
@@ -304,18 +308,16 @@ impl<T: AsyncTransport> Pending<T> {
     /// can be tried again). Also returns the token that spares this device the
     /// key at later sign-ins (`Session::sign_in_async`'s `trust`): keep it.
     pub async fn finish_async(&mut self, assertion: Option<Assertion>, recovery: Option<&str>) -> Result<(Session<T>, String)> {
-        let t = self.t.take().ok_or_else(|| Error::Refused("this sign-in is finished already".into()))?;
-        let req = LoginFinish { pending: self.needed.pending.clone(), assertion, recovery: recovery.map(String::from) };
-        match call_async::<_, LoginResponse>(&t, "POST", "/v1/login/finish", None, Some(&req)).await {
-            Ok(resp) => {
-                let trust = resp.trust.unwrap_or_default();
-                Ok((Session::open_async(t, &self.account_id, &self.unlock_key, resp.token).await?, trust))
-            }
-            Err(e) => {
-                self.t = Some(t);
-                Err(e)
-            }
+        let t = self.t.as_ref().ok_or_else(|| Error::Refused("this sign-in is finished already".into()))?;
+        if self.done.is_none() {
+            let req = LoginFinish { pending: self.needed.pending.clone(), assertion, recovery: recovery.map(String::from) };
+            let resp: LoginResponse = call_async(t, "POST", "/v1/login/finish", None, Some(&req)).await?;
+            self.done = Some((resp.token, resp.trust.unwrap_or_default()));
         }
+        let (token, trust) = self.done.clone().expect("set above");
+        let (account, keyring, acct) = Session::<T>::fetch_account(t, &self.account_id, &self.unlock_key, &token).await?;
+        let t = self.t.take().expect("checked above");
+        Ok((Session::opened(t, token, account, keyring, &acct), trust))
     }
 }
 
@@ -409,18 +411,26 @@ impl<T: AsyncTransport> Session<T> {
         req.trust = trust.map(String::from);
         let resp: LoginResponse = call_async(&t, "POST", "/v1/login", None, Some(&req)).await?;
         match resp.key {
-            Some(needed) => Ok(SignIn::Key(Pending { t: Some(t), account_id: d.account_id, unlock_key: d.unlock_key.clone(), needed })),
+            Some(needed) => Ok(SignIn::Key(Pending { t: Some(t), account_id: d.account_id, unlock_key: d.unlock_key.clone(), needed, done: None })),
             None => Ok(SignIn::Done(Self::open_async(t, &d.account_id, &d.unlock_key, resp.token).await?)),
         }
     }
 
     async fn open_async(t: T, account_id: &plaintext_core::crypto::Id, unlock_key: &plaintext_core::crypto::Key, token: String) -> Result<Self> {
-        let resp = LoginResponse { token, key: None, trust: None };
-        let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&resp.token), NONE).await?;
+        let (account, keyring, acct) = Self::fetch_account(&t, account_id, unlock_key, &token).await?;
+        Ok(Self::opened(t, token, account, keyring, &acct))
+    }
+
+    async fn fetch_account(t: &T, account_id: &plaintext_core::crypto::Id, unlock_key: &plaintext_core::crypto::Key, token: &str) -> Result<(Account, Keyring, AccountResponse)> {
+        let acct: AccountResponse = call_async(t, "GET", "/v1/account", Some(token), NONE).await?;
         let (account, keyring) = plaintext_core::unlock_with(account_id, unlock_key, &acct)?;
-        Ok(Session {
+        Ok((account, keyring, acct))
+    }
+
+    fn opened(t: T, token: String, account: Account, keyring: Keyring, acct: &AccountResponse) -> Self {
+        Session {
             t,
-            token: resp.token,
+            token,
             account,
             keyring,
             keyring_counter: Some(acct.keyring_counter),
@@ -431,7 +441,7 @@ impl<T: AsyncTransport> Session<T> {
             gone: BTreeMap::new(),
             problems: Vec::new(),
             unsendable: Vec::new(),
-        })
+        }
     }
 
     /// Pick up a stored session (token + Account Key, e.g. from the OS keychain)
@@ -1104,10 +1114,11 @@ impl<T: Transport> Session<T> {
 
     /// Add or remove a security key for sign-in, or replace the recovery codes:
     /// signed by the login key, so the password is needed. Returns new recovery
-    /// codes (adding the first key, or `Codes`) to show once.
-    pub fn change_signin_keys(&self, d: &Derived, ts: u64, action: &SigninKeyAction) -> Result<Vec<String>> {
+    /// codes (adding the first key, or `Codes`) to show once, and after adding a
+    /// key a token that spares this device the key at sign-in.
+    pub fn change_signin_keys(&self, d: &Derived, ts: u64, action: &SigninKeyAction) -> Result<RecoveryCodes> {
         let req = plaintext_core::signin_keys_change(d, ts, &self.t.host(), action);
-        Ok(self.call::<RecoveryCodes>("POST", "/v1/account/signin-keys", Some(&req))?.codes)
+        self.call("POST", "/v1/account/signin-keys", Some(&req))
     }
 
     /// Pick up a stored session (token + Account Key, e.g. from the OS keychain)

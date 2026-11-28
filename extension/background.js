@@ -146,6 +146,7 @@ async function lockIfIdle() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'autolock') serial(lockIfIdle)
+  if (alarm.name === 'signin-expire') serial(awaitingKey)
   if (alarm.name === 'clear-clipboard') clearClipboard()
 })
 
@@ -435,7 +436,8 @@ async function add({ server, secretKey, password }) {
   }
   let added
   try {
-    // Adding an account this browser had before keeps its security-key trust.
+    // Adding again an account this browser has keeps its security-key trust. Which
+    // account the Secret Key names isn't known yet; the server takes only its own token.
     const trust = (await accounts()).find((x) => x.server === base && x.trust)?.trust
     added = await Account.add(send, base, password, secretKey, DEVICE, trust)
   } catch (e) {
@@ -450,8 +452,11 @@ async function add({ server, secretKey, password }) {
 
 async function addAccount(acct, base, sealed, trust) {
   const username = acct.username()
-  const a = { key: `${username}@${hostOf(base)}`, server: base, username, sealed, ...(trust && { trust }) }
-  const rest = (await accounts()).filter((x) => x.key !== a.key)
+  const key = `${username}@${hostOf(base)}`
+  const all = await accounts()
+  trust ||= all.find((x) => x.key === key)?.trust
+  const a = { key, server: base, username, sealed, ...(trust && { trust }) }
+  const rest = all.filter((x) => x.key !== a.key)
   await chrome.storage.local.set({ accounts: [...rest, a] })
   await signOut(a)
   const problems = await settle(a, acct)
@@ -468,6 +473,8 @@ async function awaitKey(key, server, pending, extra = {}) {
   const page = pending.page()
   await chrome.storage.session.set({ [`signin:${key}`]: { server, state: pending.state(), page, at: Date.now(), ...extra } })
   pending.free()
+  // It holds the Account Unlock Key: gone once the server has forgotten it too.
+  chrome.alarms.create('signin-expire', { delayInMinutes: SIGNIN_FOR_MS / 60_000 + 0.1 })
   return { key, server, ok: false, error: 'key_needed', page, message: 'This account needs your security key to sign in on this browser.' }
 }
 

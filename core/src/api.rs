@@ -376,6 +376,10 @@ pub struct SigninKey {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RecoveryCodes {
     pub codes: Vec<String>,
+    /// Adding a key: a token that spares the device that added it the key at
+    /// sign-in, as after a sign-in with it (`LoginResponse::trust`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

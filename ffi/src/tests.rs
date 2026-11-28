@@ -385,7 +385,7 @@ fn security_key_sign_in() {
     let mut key = plaintext_server::SoftKey::new();
     let ts = now_ms();
     let proof = key.assert(&rp, &core::crypto::signin_key_add_challenge(&d.account_id, ts), &url);
-    let codes = cli.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof }).unwrap();
+    let codes = cli.change_signin_keys(&d, ts, &SigninKeyAction::Add { name: "blue".into(), rp_id: rp.clone(), registration: B64(key.register(&rp)), proof }).unwrap().codes;
 
     let (phone, _pdir) = app();
     assert!(matches!(phone.login(url.clone(), r.secret_key.clone(), "pw".into()), Err(PlaintextError::KeyNeeded)));

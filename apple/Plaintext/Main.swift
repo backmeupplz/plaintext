@@ -111,7 +111,8 @@ enum Guard {
         Activity.watch()
         RunLoop.main.add(Timer(timeInterval: 15, repeats: true) { _ in MainActor.assumeIsolated { _ = Activity.check() } }, forMode: .common)
         #if os(iOS)
-        on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 { model.lock() } }
+        // Not while a sign-in waits on the browser's approval page for the security key.
+        on(UIApplication.didEnterBackgroundNotification) { _ in if autoLock == 0 && model.keyPage == nil { model.lock() } }
         // Time away counts as time without use.
         on(UIApplication.willEnterForegroundNotification) { _ in Activity.check() }
         on(UIApplication.protectedDataWillBecomeUnavailableNotification) { _ in model.lock() }
@@ -127,7 +128,7 @@ enum Guard {
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { model.lock() }
         }
-        on(NSApplication.didResignActiveNotification) { _ in if autoLock == 0 { model.lock() } }
+        on(NSApplication.didResignActiveNotification) { _ in if autoLock == 0 && model.keyPage == nil { model.lock() } }
         on(NSApplication.didBecomeActiveNotification) { _ in Activity.check() }
         on(NSApplication.willTerminateNotification) { _ in Clipboard.clear() }
         // Sheets and Settings are windows of their own: hide each one as it appears.
