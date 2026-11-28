@@ -11,6 +11,11 @@ license = "MIT"
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+# Tests push tens of MB through crypto, JSON and SQLite: unoptimized, that alone took minutes.
+[profile.test]
+opt-level = 1
+[profile.test.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = true

@@ -872,6 +872,8 @@ fn signup_and_login_rate_limits() {
     // Successful logins don't count (agents sign in on every run).
     let d = derive("alice pw", &sk);
     for _ in 0..35 {
+        // A login must be signed later than the last one, and timestamps are in milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         Session::login(Http::new(&url), &d, "t").unwrap();
     }
     assert!((0..9).all(|_| post(&url, "/v1/signup", None) != 429));
@@ -1578,7 +1580,11 @@ fn server_hardening() {
     short.ttl = Some(3);
     let token = call::<_, LoginResponse>(&Http::new(&url), "POST", "/v1/login", None, Some(&short)).unwrap().token;
     assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 200);
-    std::thread::sleep(std::time::Duration::from_millis(4100));
+    // Its expiry is 3 s out; move it into the past rather than wait for it.
+    let newest = "rowid = (SELECT MAX(rowid) FROM sessions)";
+    let left = count(&path, &format!("SELECT expires - unixepoch() FROM sessions WHERE {newest}"));
+    assert!((0..=3).contains(&left), "{left}");
+    exec(&path, &format!("UPDATE sessions SET expires = unixepoch() - 1 WHERE {newest}"));
     assert_eq!(status(call::<_, AccountResponse>(&Http::new(&url), "GET", "/v1/account", Some(&token), NONE)), 401);
 
     // Links and messages count against the sender's quota.
