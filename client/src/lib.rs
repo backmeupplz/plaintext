@@ -257,6 +257,9 @@ pub struct Session<T: AsyncTransport> {
     /// verify (kept as last verified, or left out if never verified) and invite
     /// conflicts. One bad vault doesn't stop the rest from syncing.
     pub problems: Vec<String>,
+    /// Vaults whose changes the last `sync` couldn't send because we may only
+    /// read them now; `discard_changes` drops them.
+    pub unsendable: Vec<Hex>,
 }
 
 /// The logic, written once. Browsers call these through an `AsyncTransport`;
@@ -280,6 +283,7 @@ impl<T: AsyncTransport> Session<T> {
             hidden: BTreeMap::new(),
             gone: BTreeMap::new(),
             problems: Vec::new(),
+            unsendable: Vec::new(),
         })
     }
 
@@ -288,7 +292,7 @@ impl<T: AsyncTransport> Session<T> {
     pub async fn resume_async(t: T, token: String, account: Account) -> Result<Self> {
         let acct: AccountResponse = call_async(&t, "GET", "/v1/account", Some(&token), NONE).await?;
         let keyring = Keyring::open(&account, &acct.keyring.0)?;
-        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: Some(acct.keyring_counter), keyring_dirty: false, admin: acct.admin, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     /// Pick up a stored session with no network: the token and Account Key plus
@@ -297,7 +301,7 @@ impl<T: AsyncTransport> Session<T> {
     pub fn restore(t: T, token: String, account: Account, keyring_blob: &[u8]) -> Result<Self> {
         let keyring = Keyring::open(&account, keyring_blob)?;
         // No counter yet: the first sync or keyring save merges, so pins this copy never sent go up.
-        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() })
+        Ok(Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() })
     }
 
     pub async fn call_async<R: DeserializeOwned>(&self, method: &str, path: &str, body: Option<&impl Serialize>) -> Result<R> {
@@ -326,6 +330,7 @@ impl<T: AsyncTransport> Session<T> {
             self.hidden.insert(id, v);
         }
         self.problems.clear();
+        self.unsendable.clear();
         // A vault whose account is out of storage (507) keeps its unpushed changes and
         // reports the error at the end, without holding up the other vaults. So does
         // a member removal another device raced, or one too big to send (413); the next sync retries.
@@ -361,7 +366,14 @@ impl<T: AsyncTransport> Session<T> {
                         // Nor does a change you can't send (you only read the vault) need you to
                         // leave; the vault itself synced, so it's named below if you pay for it.
                         Some((name, creator)) if creator == self.keyring.username || read_only => {
-                            self.problems.push(format!("vault {name} wasn't updated: {e}"))
+                            // Only pending changes make a reader's push fail.
+                            let hint = if read_only {
+                                self.unsendable.push(*id);
+                                ", so this device's changes to it can't be sent"
+                            } else {
+                                ""
+                            };
+                            self.problems.push(format!("vault {name} wasn't updated: {e}{hint}"))
                         }
                         k => {
                             let name = k.map_or_else(|| id.to_string(), |(name, _)| name);
@@ -484,6 +496,35 @@ impl<T: AsyncTransport> Session<T> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Drop this device's changes to a vault that haven't reached the server
+    /// (say, made before we became a reader) by downloading it again. The new copy
+    /// must be the version this device already verified; otherwise, or if the
+    /// download fails, nothing changes. Returns how many changes were dropped.
+    pub async fn discard_changes_async(&mut self, id: &Hex) -> Result<usize> {
+        self.pull_async(id).await?;
+        let n = self.vaults[id].changes();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Edits overwrote, and deletes removed, the server's copies: fetch every item.
+        let mut fresh = Vault::new(*id);
+        let resp: VaultResponse = self.call_async("GET", &format!("/v1/vaults/{id}?{}", fresh.pull_query()), NONE).await?;
+        let mut keyring = self.keyring.clone();
+        let changed = fresh.apply(&resp, &mut keyring, now())?;
+        let old = &self.vaults[id];
+        if !fresh.same_head(old) {
+            // Newer: another device pushed in between. Older, or a different copy
+            // of the same version: the server is lying.
+            return Err(if fresh.counter > old.counter { Error::Refused("the vault changed meanwhile; try again".into()) } else { plaintext_core::Error::Rollback.into() });
+        }
+        // The next sync uploads the keyring, as after any pull.
+        self.keyring = keyring;
+        self.keyring_dirty |= changed;
+        self.vaults.insert(*id, fresh);
+        self.unsendable.retain(|v| v != id);
+        Ok(n)
     }
 
     /// Push pending changes (a pull came just before); on a conflict pull again and retry.
@@ -673,6 +714,10 @@ impl<T: AsyncTransport> Session<T> {
     /// Find a vault by id prefix or name (case-insensitive).
     pub fn vault(&self, name: &str) -> Result<Hex> {
         let n = name.to_lowercase();
+        // A full id wins over a vault someone named like it.
+        if let Some(id) = self.vaults.keys().find(|id| id.to_string() == n) {
+            return Ok(*id);
+        }
         let hits: Vec<Hex> = self
             .vaults
             .iter()
@@ -811,7 +856,7 @@ impl<T: Transport> Session<T> {
     pub fn offline(t: T, token: String, account: Account, dir: &Path) -> Result<Self> {
         let blob = std::fs::read(dir.join("keyring.bin")).map_err(|_| Error::NotFound("this device's saved copy".into()))?;
         let keyring = Keyring::open(&account, &blob)?;
-        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new() };
+        let mut s = Session { t, token, account, keyring, keyring_counter: None, keyring_dirty: false, admin: false, vaults: BTreeMap::new(), hidden: BTreeMap::new(), gone: BTreeMap::new(), problems: Vec::new(), unsendable: Vec::new() };
         s.load_vaults(dir);
         Ok(s)
     }
@@ -882,6 +927,11 @@ impl<T: Transport> Session<T> {
 
     fn pull(&mut self, id: &Hex) -> Result<()> {
         block_on(self.pull_async(id))
+    }
+
+    /// Drop this device's unsent changes to a vault (`discard_changes_async`).
+    pub fn discard_changes(&mut self, id: &Hex) -> Result<usize> {
+        block_on(self.discard_changes_async(id))
     }
 
     fn remove_members(&mut self, id: &Hex, who: Option<&str>) -> Result<()> {

@@ -241,7 +241,32 @@ impl Vault {
     }
 
     pub fn has_changes(&self) -> bool {
-        !self.dirty.is_empty() || !self.deleted.is_empty() || self.meta_dirty
+        self.changes() > 0
+    }
+
+    /// How many changes wait to be pushed: items added, edited or deleted, and the vault's name.
+    pub fn changes(&self) -> usize {
+        self.dirty.len() + self.deleted.len() + usize::from(self.meta_dirty)
+    }
+
+    /// Items added or edited here and not pushed yet.
+    pub fn changed(&self) -> impl Iterator<Item = (&Hex, &Item)> {
+        self.dirty.iter().filter_map(|id| Some((id, self.get(id)?)))
+    }
+
+    /// Items deleted here and not pushed yet.
+    pub fn deleted(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// Whether the vault's name or description changed here and wasn't pushed yet.
+    pub fn meta_changed(&self) -> bool {
+        self.meta_dirty
+    }
+
+    /// Whether both copies verified the same latest manifest.
+    pub fn same_head(&self, other: &Vault) -> bool {
+        self.counter == other.counter && self.last == other.last
     }
 
     fn item_ad(&self, id: &Hex) -> Vec<u8> {
@@ -618,5 +643,22 @@ impl Vault {
     pub fn restore(account: &Account, id: Hex, blob: &[u8]) -> Result<Vault, Error> {
         let raw = open(&account.account_key, &ad("vault-snapshot", &[&account.id, &id.0]), blob)?;
         serde_json::from_slice(&raw).map_err(|_| Error::BadJson)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_head_needs_the_same_counter_and_manifest() {
+        let (a, mut b) = (Vault::new(Hex([7; 16])), Vault::new(Hex([7; 16])));
+        assert!(a.same_head(&b));
+        // A fork: same counter, another manifest.
+        b.last = B64(vec![1]);
+        assert!(!a.same_head(&b));
+        b.last = a.last.clone();
+        b.counter = 1;
+        assert!(!a.same_head(&b));
     }
 }

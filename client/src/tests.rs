@@ -1484,7 +1484,7 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     let (url, _) = server();
     let (_, mut alice) = join(Http::new(&url), "alice", "alice pw", Some("first-run-code"), "laptop");
     let code = alice.invite().unwrap();
-    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default()), "bob", "bob pw", Some(&code), "phone");
+    let (_, mut bob) = join(Flaky(Http::new(&url), Default::default(), Default::default()), "bob", "bob pw", Some(&code), "phone");
     alice.sync().unwrap();
     let fam = alice.create_vault("Family").unwrap();
     let nid = plaintext_core::new_item_id();
@@ -1559,6 +1559,61 @@ fn a_reader_s_writes_are_refused_not_kept_on_the_device() {
     bob.t.1.set(true);
     bob.writable(&fam).unwrap();
     bob.t.1.set(false);
+
+    // He can drop what he can't send: an edit, a delete and a rename.
+    let (keep, gone) = (plaintext_core::new_item_id(), plaintext_core::new_item_id());
+    bob.put_item(&fam, keep, item("Keep", "k")).unwrap();
+    bob.put_item(&fam, gone, item("Gone?", "g")).unwrap();
+    bob.t.1.set(true);
+    assert!(matches!(bob.put_item(&fam, keep, item("Keep", "edited offline")), Err(Error::Network(_))));
+    assert!(matches!(bob.delete_item(&fam, gone), Err(Error::Network(_))));
+    let mut meta = bob.vaults[&fam].meta.clone();
+    meta.name = "Renamed offline".into();
+    assert!(matches!(bob.rename_vault(&fam, meta), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    alice.share_vault(&fam, "bob", Role::Reader, None).unwrap();
+    bob.sync().unwrap();
+    // The apps show problems as they are: no CLI command in them, the id goes in a list.
+    assert!(bob.problems.iter().any(|p| p.ends_with("this device's changes to it can't be sent")), "{:?}", bob.problems);
+    assert_eq!(bob.unsendable, [fam]);
+    // What `vault reset` lists before dropping anything.
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.changed().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(), ["Keep"]);
+    assert_eq!((v.deleted(), v.meta_changed()), (1, true));
+    assert_eq!(bob.vault(&fam.to_string()).unwrap(), fam);
+    // The fresh download must be the version his device verified, not an older one.
+    let from_scratch = format!("/v1/vaults/{fam}?since=0&latest=true");
+    let old = bob.t.0.send("GET", &from_scratch, Some(&bob.token), None).unwrap().1;
+    alice.put_item(&fam, plaintext_core::new_item_id(), item("Newer", "n")).unwrap();
+    *bob.t.2.borrow_mut() = Some((from_scratch, old));
+    let rollback = bob.discard_changes(&fam);
+    assert!(matches!(rollback, Err(Error::Core(plaintext_core::Error::Rollback))), "{rollback:?}");
+    *bob.t.2.borrow_mut() = None;
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    // A download that fails drops nothing.
+    bob.t.1.set(true);
+    assert!(matches!(bob.discard_changes(&fam), Err(Error::Network(_))));
+    bob.t.1.set(false);
+    assert_eq!(bob.vaults[&fam].changes(), 3);
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 3);
+    assert!(bob.unsendable.is_empty());
+    assert_eq!(bob.discard_changes(&fam).unwrap(), 0);
+    let v = &bob.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert_eq!(v.meta.name, "Family");
+    assert_eq!(v.items().count(), alice.vaults[&fam].items().count());
+    bob.sync().unwrap();
+    assert!(bob.problems.is_empty(), "{:?}", bob.problems);
+
+    // Made a writer again, what he pushes keeps every item as the server has it.
+    alice.share_vault(&fam, "bob", Role::Writer, None).unwrap();
+    bob.put_item(&fam, plaintext_core::new_item_id(), item("Later", "l")).unwrap();
+    alice.sync().unwrap();
+    let v = &alice.vaults[&fam];
+    assert_eq!(v.get(&keep).unwrap().password, "k");
+    assert!(v.get(&gone).is_some());
+    assert!(v.items().any(|(_, i)| i.title == "Later"));
 }
 
 #[test]
@@ -1589,13 +1644,19 @@ fn an_edit_or_delete_keeps_another_device_s_newer_change() {
     assert_eq!(netflix, ["alice-v2", "bob-v2"], "alice's edit is kept as a conflict copy");
 }
 
-/// A transport whose network can be switched off.
-struct Flaky(Http, std::cell::Cell<bool>);
+/// A transport whose network can be switched off, or a GET answered with an old reply.
+struct Flaky(Http, std::cell::Cell<bool>, std::cell::RefCell<Option<(String, Vec<u8>)>>);
 
 impl Transport for Flaky {
     fn send(&self, method: &str, path: &str, token: Option<&str>, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
         if self.1.get() {
             return Err(Error::Network("offline".into()));
+        }
+        if let Some((p, bytes)) = &*self.2.borrow()
+            && method == "GET"
+            && path == p
+        {
+            return Ok((200, bytes.clone()));
         }
         self.0.send(method, path, token, body)
     }
